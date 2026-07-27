@@ -93,3 +93,32 @@ name and a working address. A commit without a sign-off cannot be merged.
 
 If your employer owns the copyright in your work, get their permission before
 signing off.
+
+## Using AI tools
+
+Use whatever tools you like. There is no restriction, no disclosure
+requirement, and nobody will ask in review.
+
+What is required is that you understand what you submit. Expect to explain any
+line of it, justify the design, and answer questions about edge cases nobody
+warned you about. If a change cannot survive that, whatever produced it is
+beside the point — it is not ready.
+
+Two places where this bites hardest, and where a patch that merely looks
+correct will be turned down:
+
+- **Concurrency.** Anything touching `SlotPool`, `FifoQueue`, the per-slot RW
+  locks, the peer-table seqlock, atomics or memory ordering. Confident and
+  subtly wrong is the characteristic failure of generated concurrency code, and
+  a wrong memory ordering passes review and a green test suite alike. Bring the
+  reasoning with the patch: which loads and stores are relaxed against
+  acquire/release, what a racing reader can and cannot observe, and worked
+  interleavings for the happy path and the adversarial one. Run it under
+  ThreadSanitizer and say so.
+- **Cryptography.** Do not write new crypto, and do not have anything write it
+  for you. Compose what is already in `common/crypto`. If a change genuinely
+  needs a primitive that is not there, raise it first.
+
+The legal half is already covered by the sign-off: it says you have the right
+to submit the work under Apache-2.0, whatever helped you write it. That does
+not change.
