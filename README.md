@@ -26,8 +26,9 @@ reliability, encryption and connection handling by hand.
 ## What flux does
 
 - **No connect step.** The first send to an unknown address runs the handshake
-  and holds the message until the session is up. There is no connection object
-  to manage, and no callback to wait on.
+  and holds the message until the session is up, so that first message costs two
+  round trips before it lands. Everything after it goes straight out. There is
+  no connection object to manage and no callback to wait on.
 - **Encrypted by default.** XChaCha20-Poly1305 on every packet, with the nonce
   counter masked so an observer cannot follow a peer by its packet sequence.
   Plaintext is available as an explicit opt-out when you want it.
@@ -46,8 +47,9 @@ reliability, encryption and connection handling by hand.
   handshake challenge, so an unverified peer costs it nothing to ignore.
 
 Missing so far, and worth knowing before you adopt it: path MTU discovery
-(packets are a conservative 1200 bytes), NAT traversal, 0-RTT resumption after
-a session is gone, and congestion control beyond plain AIMD.
+(packets are a conservative 1200 bytes), NAT traversal, session resumption (a
+peer whose session has been dropped pays the full handshake again, there is no
+0-RTT), and congestion control beyond plain AIMD.
 
 ## Requirements
 
