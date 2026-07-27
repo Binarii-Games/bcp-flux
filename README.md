@@ -72,11 +72,13 @@ external/  monocypher/         vendored crypto (BSD-2-Clause OR CC0-1.0)
 tests/     unit/ integration/ bench/ + shared harnesses
 ```
 
+[ARCHITECTURE.md](ARCHITECTURE.md) covers the entities, the ownership rules, the
+wire format, and how many ways there are to do each thing.
+
 ## Try it
 
-The examples build with everything else:
-
-Each is one file, two sockets in one process, and runs on its own:
+Each example is one file running two sockets in one process, built with
+everything else:
 
 ```sh
 ./build/send_and_respond          # A sends, B answers
@@ -89,27 +91,16 @@ There is no connect step: the first send to an address Flux has not seen starts
 the handshake and holds the message until the session is up. See
 [examples/](examples/).
 
-## Licensing and commitment
+## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-`flux` and `common` are Apache-2.0 and will stay that way. Binarii Games Inc.
-sells products built on top of these libraries, and a paid tier means new code in
-that tier. It does not mean capabilities withheld from this repository, and it
-does not mean capabilities moved out of it later to be sold.
+`flux` and `common` stay Apache-2.0. Binarii Games sells products built on these
+libraries; a paid tier means extra code in that tier, not features taken out of
+here.
 
-Two things make that checkable instead of merely stated. Nothing published here
-gets taken back out to sell, which the commit history shows or fails to show. And
-the architecture rules out the arrangement that would make hollowing this out
-worthwhile: nothing in `flux` may reference a layer above it, and `flux` plus
-`common` have to be complete and useful to someone who never touches anything
-else we make. That constraint is described in [ARCHITECTURE.md](ARCHITECTURE.md)
-and it is why the open libraries cannot quietly become a funnel.
+Contributions stay yours: no CLA, no copyright assignment, just a Developer
+Certificate of Origin sign-off. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Contributions stay yours. There is no CLA and no copyright assignment — just a
-Developer Certificate of Origin sign-off, so you keep the copyright in your work
-and we gain no right to relicense it. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Found a security problem? Please report it privately rather than in an issue —
-[SECURITY.md](SECURITY.md) has the two ways to do that. Community expectations
-are in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Report security problems privately through [SECURITY.md](SECURITY.md), not an
+issue. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) covers the rest.
