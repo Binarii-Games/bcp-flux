@@ -6,13 +6,17 @@ libraries, each usable on its own:
 - **`common`** — general-purpose systems primitives: error and result types,
   lock-free collections, byte cursors, crypto, platform glue, logging, math.
   Nothing in it knows what a packet or a peer is.
-- **`flux`** — a connectionless, zero-alloc, encrypted transport protocol built
-  with `common`. Handshake, secure packets, address migration, reliable and
-  unreliable flows.
+- **`flux`** — a connectionless, zero-alloc, encrypted UDP transport built with
+  `common`. Handshake, secure packets, address migration, and reliable-ordered,
+  reliable-unordered and unreliable flows over one socket.
 
 C++20, cross-platform (Windows / Linux / macOS, x86-64 and arm64), no exceptions,
 no heap allocation on the packet path. The crypto dependency (Monocypher) is
 vendored — a plain clone is everything you need, no submodules to fetch.
+
+It is aimed at low-latency traffic where per-packet cost matters — games,
+real-time systems, anything that would otherwise reach for raw UDP and rebuild
+reliability, encryption and connection handling by hand.
 
 > Status: pre-1.0. The wire format and API may still change.
 
@@ -90,6 +94,39 @@ everything else:
 There is no connect step: the first send to an address Flux has not seen starts
 the handshake and holds the message until the session is up. See
 [examples/](examples/).
+
+## Benchmarks
+
+What one packet costs, measured on an Apple M3 Max, Release, clang 22. Loopback,
+so treat absolute times as machine-specific; the deltas are the useful part.
+
+**Send path** — Flux against the bare `sendto()` syscall underneath it, median
+of 30,000 sends per variant, interleaved so all three see the same machine
+state:
+
+| payload | bare `sendto` | + Flux framing | + AEAD seal |
+|---|---|---|---|
+| 64 B | 2792 ns | **+125 ns** | +583 ns |
+| 1024 B | 2875 ns | **+167 ns** | +2875 ns |
+
+Framing costs about 5% over the raw syscall. Everything else is the encryption,
+which scales with payload and is the same cost any encrypted transport pays.
+
+**Encryption alone**, no sockets involved — XChaCha20-Poly1305 through vendored
+Monocypher:
+
+| payload | encrypt | decrypt + verify |
+|---|---|---|
+| 64 B | 372 ns | 352 ns |
+| 256 B | 661 ns | 668 ns |
+| 1200 B | 2254 ns | 2252 ns |
+
+Portable C, so roughly 0.5 GB/s. That is the ceiling on a full-size packet
+today, and swapping in a SIMD implementation is the lever if it ever needs
+lifting.
+
+Run them yourself with `ctest --test-dir build -L bench` on a Release build.
+They always exit 0 — they are measurements, not a pass/fail gate.
 
 ## License
 

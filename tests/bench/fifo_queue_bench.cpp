@@ -114,68 +114,74 @@ static void single_thread_round_trip()
     bench::compare("push+pop vs fixed ring", oursNs, ringNs);
 }
 
-// `producers` threads each push `perProducer` values; `consumers` threads each
-// pop an exact share of the total. Returns wall-clock seconds.
-template <typename Queue>
-static double run_contended(Queue& queue, int producers, int consumers, uint64_t perProducer)
+// Unrelated work between operations. The only FifoQueue in flux is the socket's
+// ready queue, and between two of its operations Poll does a recvfrom and an
+// AEAD open — microseconds, not nothing. A queue that is hammered with zero
+// spacing measures a workload no caller produces, so the sweep below reports
+// both that ceiling and the spacing a packet path actually has.
+static uint64_t dependent_work(uint64_t rounds, uint64_t seed)
 {
-    const uint64_t total       = static_cast<uint64_t>(producers) * perProducer;
-    const uint64_t perConsumer = total / static_cast<uint64_t>(consumers);
+    uint64_t x = seed;
+    for (uint64_t i = 0; i < rounds; ++i)
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+    return x;
+}
 
+// Every thread pushes and pops, which is the shape the ready queue has: Poll
+// pass 1 enqueues and pass 2 drains, both on whichever thread called Poll.
+// Nothing polls Empty(): on a mutex queue that is a second lock acquisition per
+// miss, so putting it in the loop would bias the comparison toward the
+// lock-free side. Only Push and Pop are on the clock, for every contender.
+template <typename Queue>
+static double run_contended(Queue& queue, int threads, uint64_t perThread, uint64_t workRounds)
+{
     std::atomic<bool> go{false};
-    std::vector<std::thread> threads;
+    std::vector<std::thread> workers;
 
-    for (int p = 0; p < producers; ++p)
-        threads.emplace_back([&]
+    for (int t = 0; t < threads; ++t)
+        workers.emplace_back([&, t]
         {
+            uint64_t local = static_cast<uint64_t>(t);
             while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
-            for (uint64_t i = 0; i < perProducer; ++i)
-                while (!queue.Push(static_cast<uint32_t>(i))) std::this_thread::yield();
-        });
-
-    for (int c = 0; c < consumers; ++c)
-        threads.emplace_back([&]
-        {
-            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
-            uint64_t local = 0;
-            for (uint64_t i = 0; i < perConsumer; ++i)
+            for (uint64_t i = 0; i < perThread; ++i)
             {
+                if (workRounds) local += dependent_work(workRounds, local);
+                (void)queue.Push(static_cast<uint32_t>(i));
+                if (workRounds) local += dependent_work(workRounds, local);
                 uint32_t value = 0;
-                while (!queue.Pop(value)) std::this_thread::yield();
-                local += value;
+                if (queue.Pop(value)) local += value;
             }
             bench::sink += local;
         });
 
     auto start = std::chrono::steady_clock::now();
     go.store(true, std::memory_order_release);
-    for (auto& t : threads) t.join();
+    for (auto& t : workers) t.join();
     auto end = std::chrono::steady_clock::now();
 
     return std::chrono::duration<double>(end - start).count();
 }
 
-static void contended_throughput()
+static void contended_regime(const char* title, uint64_t workRounds, uint64_t perThread)
 {
-    constexpr uint64_t PER = 400'000;
-
-    for (int perSide : {1, 2, 4, 8})
+    std::printf("  --- %s ---\n", title);
+    for (int threads : {2, 4, 8, 16})
     {
-        uint64_t total = static_cast<uint64_t>(perSide) * PER;
+        const uint64_t total = static_cast<uint64_t>(threads) * perThread;
 
         FifoQueue<uint32_t> ours;
         (void)ours.Init(8192);
-        double oursSeconds = run_contended(ours, perSide, perSide, PER);
-        bench::throughput("fifo_queue", total, oursSeconds, perSide * 2);
+        bench::throughput("fifo_queue", total,
+                          run_contended(ours, threads, perThread, workRounds), threads);
 
         MutexQueue stdQueue;
-        double stdSeconds = run_contended(stdQueue, perSide, perSide, PER);
-        bench::throughput("mutex_std_queue", total, stdSeconds, perSide * 2);
+        bench::throughput("mutex_std_queue", total,
+                          run_contended(stdQueue, threads, perThread, workRounds), threads);
 
         MutexRing ring;
         ring.Init(8192);
-        double ringSeconds = run_contended(ring, perSide, perSide, PER);
-        bench::throughput("mutex_fixed_ring", total, ringSeconds, perSide * 2);
+        bench::throughput("mutex_fixed_ring", total,
+                          run_contended(ring, threads, perThread, workRounds), threads);
     }
 }
 
@@ -183,6 +189,7 @@ int main()
 {
     std::printf("FifoQueue vs std::mutex + std::queue and std::mutex + fixed ring\n");
     single_thread_round_trip();
-    contended_throughput();
+    contended_regime("no work between ops (adversarial hammering)", 0, 300'000);
+    contended_regime("~0.8us dependent work between ops (ready-queue spacing)", 1024, 100'000);
     return 0;
 }
