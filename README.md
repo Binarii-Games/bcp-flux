@@ -18,7 +18,9 @@ It is aimed at low-latency traffic where per-packet cost matters — games,
 real-time systems, anything that would otherwise reach for raw UDP and rebuild
 reliability, encryption and connection handling by hand.
 
-> Status: pre-1.0. The wire format and API may still change.
+> Status: pre-1.0, written and maintained by one person. The wire format and
+> API may still change, and issues and pull requests are read but not always
+> answered quickly.
 
 ## What flux does
 
