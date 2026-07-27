@@ -11,9 +11,7 @@ C++20 libraries, each usable on its own. Two today, more as the project grows:
   math. Transport-agnostic by rule, so nothing in it knows what a packet is.
 
 Cross-platform (Windows / Linux / macOS, x86-64 and arm64), no exceptions, no
-heap allocation on the packet path. The crypto dependency (Monocypher) is
-vendored, so a plain clone is everything you need and there are no submodules
-to fetch.
+heap allocation on the packet path. Monocypher is vendored in `external/`.
 
 It is aimed at low-latency traffic where per-packet cost matters. Games,
 real-time systems, anything that would otherwise reach for raw UDP and rebuild
