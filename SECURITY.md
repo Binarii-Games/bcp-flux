@@ -22,10 +22,10 @@ rest together.
 
 ## What to expect
 
-openbcp is pre-1.0 and maintained by a small team, so no acknowledgement clock
-is promised that cannot be kept. In practice, expect a reply within about a
-week, an assessment once the report is understood, and honest updates if a fix
-takes longer than that.
+openbcp is pre-1.0 and maintained by one person, so no acknowledgement clock is
+promised that cannot be kept. In practice, expect a reply within about a week,
+an assessment once the report is understood, and honest updates if a fix takes
+longer than that.
 
 Credit is given to reporters who want it, and withheld from those who do not.
 Anyone who reports privately and gives us a reasonable window before going
