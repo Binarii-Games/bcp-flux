@@ -1,0 +1,135 @@
+#pragma once
+
+#include <array>
+#include <type_traits>
+
+#include <common/crypto/crypto.h>
+
+#include <flux/address.h>
+#include <flux/internal/constants.h>
+#include <flux/peer/peer_id.h>
+
+namespace bcp::flux
+{
+    /** Rotating migration tag on a peer's secure packets, an address-independent
+        connection handle. Derived from the session key on both ends, never sent.
+        All-zero is reserved. */
+    using PeerTag = std::array<uint8_t, internal::WIRE_PEER_TAG_SIZE>;
+
+    /** Handshake progress. The AWAITING states are initiator-only. The responder
+        stays stateless through the challenge and creates a peer only after it
+        verifies, so responder-side peers start ESTABLISHED. */
+    enum class HandshakeState : uint8_t
+    {
+        AWAITING_CHALLENGE = 0,   ///< HS_INIT sent, waiting for the challenge
+        AWAITING_FINISH    = 1,   ///< HS_RES sent, waiting for the remote's key
+        ESTABLISHED        = 2,   ///< proven and keyed; the peer is valid
+    };
+
+    /** Liveness stamp: monotonic micros shifted to ~1 ms units (SEEN_STAMP_SHIFT),
+        wrapping about every 49.7 days. Compute elapsed with wrapped uint32_t
+        subtraction (now - then). Stays exact for gaps under one wrap. */
+    inline uint32_t SeenStamp(uint64_t micros) noexcept
+    {
+        return static_cast<uint32_t>(micros >> internal::SEEN_STAMP_SHIFT);
+    }
+
+    /** Stored in PeerTable's SlotPool, which hands back raw bytes and runs no
+        constructor or destructor. Must stay trivially copyable: no vector, no
+        atomic, no vtable, nothing that owns heap memory.
+
+        A recycled slot keeps the previous peer's bytes (SlotPool zeroes once, at
+        Init), so registration must write every field. */
+    struct Peer
+    {
+        Address addr;
+        BcpId   id;
+
+        common::crypto::PublicKey  theirPk;   ///< remote's key; id == blake2b(theirPk)
+        common::crypto::SessionKey session;   ///< DH(our secret, theirPk) through the KDF,
+                                              ///< salted per handshake
+
+        /** Masks the counter field of every secure packet, so the counter is
+            not readable on the wire. Split from `session` rather than reused:
+            XChaCha20 derives its own internal subkey the same way, and a
+            separate key keeps the two derivations from ever sharing a domain.
+            Derived with the session, discarded with it. */
+        common::crypto::SessionKey headerKey;
+
+        /** Nonce counter for packets we encrypt to this peer. Travels in each
+            packet, so the remote never tracks it.
+
+            @pre Bumped under the slot write lock, per send. */
+        uint64_t sendCounter;
+
+        /** Migration tag state. myTagStep is the step we stamp on outgoing
+            secure packets; myTag caches that step's tag so the send path copies
+            4 bytes instead of running the KDF. theirTagStep is the base of the
+            remote's bound tag window [base, base + 2]. All of it resets to
+            step 0 on every (re)key, since tags derive from the session key. */
+        uint32_t myTagStep;
+        uint32_t theirTagStep;
+        PeerTag  myTag;
+
+        /** Path validation in flight: the address the peer seems to have moved
+            to, the challenge sent there, and the tag step the mover presented
+            (where the window slides on success). It either completes (the mover
+            answers, the peer rebinds) or never does. An unproven address never
+            tears down the proven session. pathAddr unset means nothing pending.
+
+            @pre Claimed and cleared under the slot write lock, so two workers
+                 cannot finish the same validation. */
+        Address  pathAddr;
+        uint8_t  pathChallenge[16];
+        uint32_t pathStep;
+
+        /** Our salt contribution while the handshake is in flight: saltI on the
+            initiator (held until HS_FINISH arrives), saltR on the responder
+            (held so a duplicate HS_RES resends the same FINISH instead of
+            re-keying). */
+        uint8_t hsSalt[internal::WIRE_HS_SALT_SIZE];
+
+        /** Identity tag the peer announced in HS_FINISH. Opaque to Flux, passed
+            up to the layer above. All zeros for an anonymous peer and on the
+            responder side, which gets no announcement. */
+        uint8_t announcedTag[internal::WIRE_HS_TAG_SIZE];
+
+        /** Packets queued before the handshake finished, as an intrusive list
+            in the socket's pending pool: each slot holds the next index, so the
+            peer keeps only the ends. UINT32_MAX (SlotPool::INVALID) means empty;
+            head == tail is one packet. */
+        uint32_t pendingHead;
+        uint32_t pendingTail;
+
+        /** Liveness, in SeenStamp units. firstSeenAt is set once at
+            registration. lastSeenAt refreshes only on packets RECEIVED from the
+            peer (our own sends say nothing about the remote), lazily on the
+            configured grain, and drives idle eviction. */
+        uint32_t firstSeenAt;
+        uint32_t lastSeenAt;
+
+        /** Per-peer congestion control: the budget of unacked flow bytes we may
+            keep on the path, plus the state that sizes it. None of it goes on
+            the wire, and only flow packets spend the budget (the non-flow tier
+            is untracked).
+
+            @pre Read and written under the slot write lock, like sendCounter. */
+        uint32_t congestionBudget;        ///< ceiling on in-flight flow bytes
+        uint32_t bytesInFlight;           ///< flow bytes sent, not yet resolved
+        uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
+                                          ///< at or above, it grows one packet per round-trip
+        uint32_t pathSrttMicros;          ///< smoothed round-trip time; 0 until the first sample
+        uint64_t lastLossReactionMicros;  ///< last trim, so a loss trims at most once per round-trip
+
+        HandshakeState state;
+        uint8_t attempts;      ///< handshake attempts so far; retry policy is the caller's
+        bool    hasId;         ///< id is only meaningful once the handshake proves it
+        bool    authenticated; ///< announced tag matched a trusted certificate AND the
+                               ///< peer proved it owns that certificate's key
+
+        bool IsValid() const { return state == HandshakeState::ESTABLISHED; }
+    };
+
+    static_assert(std::is_trivially_copyable_v<Peer>,
+                  "Peer is stored in a SlotPool by raw cast, so it must stay trivially copyable");
+}

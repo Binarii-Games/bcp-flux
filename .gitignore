@@ -1,0 +1,51 @@
+# CMake build directories — generated artifacts, never committed.
+build*/
+cmake-build-*/
+CMakeUserPresets.json
+
+# In-source CMake leftovers, for anyone who configures without -B.
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+
+# Compiled output.
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+
+# Sanitizer and coverage output.
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+
+# Generated documentation.
+docs/html/
+docs/latex/
+
+# Tooling caches. compile_commands.json is per build tree, so it stays local
+# rather than pinning one machine's paths into the repo.
+compile_commands.json
+.cache/
+.ccls-cache/
+
+# OS / editor cruft.
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+.vs/
+*.user

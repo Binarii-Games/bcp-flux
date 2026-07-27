@@ -1,0 +1,21 @@
+# Minimal Doxygen config for the openbcp public headers.
+# Run from the repository root:   doxygen docs/Doxyfile
+# Output lands in docs/html/ (gitignored). Doxygen fills every unset option
+# with its default.
+
+PROJECT_NAME      = "openbcp"
+PROJECT_BRIEF     = "A connectionless zero-alloc encrypted transport (flux) and systems primitives (common)"
+OUTPUT_DIRECTORY  = docs
+
+INPUT             = common/include flux/include
+FILE_PATTERNS     = *.h
+RECURSIVE         = YES
+
+EXTRACT_ALL       = YES
+JAVADOC_AUTOBRIEF = YES
+OPTIMIZE_OUTPUT_FOR_C = NO
+
+GENERATE_HTML     = YES
+GENERATE_LATEX    = NO
+HAVE_DOT          = NO
+QUIET             = YES

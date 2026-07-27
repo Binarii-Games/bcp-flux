@@ -1,0 +1,16 @@
+openbcp
+Copyright 2026 Binarii Games Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+these files except in compliance with the License. A copy of the License is in
+the LICENSE file, and at http://www.apache.org/licenses/LICENSE-2.0.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+Monocypher 4.0.3  (external/monocypher/)
+  Copyright (c) 2017-2019 Loup Vaillant
+  Dual-licensed: BSD-2-Clause OR CC0-1.0
+  SPDX-License-Identifier: BSD-2-Clause OR CC0-1.0
+  Full text: external/monocypher/LICENSE and the monocypher source headers.
