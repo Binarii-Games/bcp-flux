@@ -1,17 +1,17 @@
 # openbcp
 
-Open primitives from the BCP (Binarii Core Primitives) project. Two independent
-libraries, each usable on its own:
+The open networking libraries of BCP (Binarii Core Primitives). Independent
+C++20 libraries, each usable on its own — two today, more as the project grows:
 
-- **`common`** — general-purpose systems primitives: error and result types,
-  lock-free collections, byte cursors, crypto, platform glue, logging, math.
-  Nothing in it knows what a packet or a peer is.
-- **`flux`** — a connectionless, zero-alloc, encrypted UDP transport built with
-  `common`. Handshake, secure packets, address migration, and reliable-ordered,
+- **`flux`** — the transport. A connectionless, zero-alloc, encrypted UDP
+  protocol: handshake, secure packets, address migration, and reliable-ordered,
   reliable-unordered and unreliable flows over one socket.
+- **`common`** — the systems primitives it is written with: error and result
+  types, lock-free collections, byte cursors, crypto, platform glue, logging,
+  math. Transport-agnostic by rule, so nothing in it knows what a packet is.
 
-C++20, cross-platform (Windows / Linux / macOS, x86-64 and arm64), no exceptions,
-no heap allocation on the packet path. The crypto dependency (Monocypher) is
+Cross-platform (Windows / Linux / macOS, x86-64 and arm64), no exceptions, no
+heap allocation on the packet path. The crypto dependency (Monocypher) is
 vendored — a plain clone is everything you need, no submodules to fetch.
 
 It is aimed at low-latency traffic where per-packet cost matters — games,
@@ -19,6 +19,32 @@ real-time systems, anything that would otherwise reach for raw UDP and rebuild
 reliability, encryption and connection handling by hand.
 
 > Status: pre-1.0. The wire format and API may still change.
+
+## What flux does
+
+- **No connect step.** The first send to an unknown address runs the handshake
+  and holds the message until the session is up. There is no connection object
+  to manage, and no callback to wait on.
+- **Encrypted by default.** XChaCha20-Poly1305 on every packet, with the nonce
+  counter masked so an observer cannot follow a peer by its packet sequence.
+  Plaintext is available as an explicit opt-out when you want it.
+- **Three delivery modes on one socket.** Reliable-ordered, reliable-unordered,
+  and unreliable — all numbered and acknowledged, so loss is visible to
+  congestion control even when nothing is retransmitted.
+- **Survives address changes.** A peer that moves keeps its session: no
+  re-handshake, and the rotating tag that identifies it is derived at both ends
+  rather than sent, so a move is not linkable on the wire.
+- **Identity by pinned certificate.** Trust comes from how a certificate was
+  delivered, not from a signature chain, and the handshake proves the peer owns
+  the matching key.
+- **Owns no thread.** `Poll` and `Update` run on threads you choose, as often as
+  you choose. Both are safe to call concurrently.
+- **Stateless until proven.** The responder holds no state through the
+  handshake challenge, so an unverified peer costs it nothing to ignore.
+
+Not there yet, and worth knowing before you adopt it: path MTU discovery
+(packets are a conservative 1200 bytes), NAT traversal, 0-RTT resumption after
+a session is gone, and congestion control beyond plain AIMD.
 
 ## Requirements
 
