@@ -14,26 +14,28 @@ namespace bcp::flux
     class FlowHandle;
 }
 
-// TODO: Packet builder should be reusable
 namespace bcp::flux::wire
 {
-    class PacketContentStage 
+    class PacketContentStage
     {
     private:
-        SocketSender& sender_; 
+        SocketSender* sender_ = nullptr;
         PacketSlotWriter writer_;
+
+        Address respondTo_{};   ///< Reply target; set only on a PrepareResponse chain.
 
         common::Error failReason_{common::Error::Ok}; ///< Set only if construction or an action failed.
         bool failed_{false};
 
     public:
-        explicit PacketContentStage(SocketSender& sender, PacketSlotWriter writer) :
-                sender_(sender), writer_(std::move(writer)) {}
+        explicit PacketContentStage(SocketSender& sender, PacketSlotWriter writer,
+                                    Address respondTo = {}) :
+                sender_(&sender), writer_(std::move(writer)), respondTo_(respondTo) {}
 
         /** The stage a failed builder hands back: holds no slot, refuses to
             send, and reports why. */
-        explicit PacketContentStage(SocketSender& sender, common::Error failReason) :
-                sender_(sender), writer_(PacketSlotHandle::Invalid()),
+        explicit PacketContentStage(common::Error failReason) :
+                writer_(PacketSlotHandle::Invalid()),
                 failReason_(failReason), failed_(true) {}
 
         PacketContentStage& PutU8(uint8_t in);
@@ -59,6 +61,17 @@ namespace bcp::flux::wire
             unauthenticated; a packet parked behind a fresh handshake is
             dropped at flush time unless the peer comes out authenticated. */
         common::Error SendSecured(Address address);
+
+        /** Sends to the source of the packet this chain replies to, with the
+            same contract as Send(Address). The address rides the chain from
+            PacketSlotHandle::PrepareResponse, so a reply never rebuilds the
+            pairing by hand. InvalidState on a chain that did not start
+            there. */
+        common::Error Respond();
+
+        /** Respond(), delivered only to an authenticated peer: the
+            SendSecured(Address) contract on the carried address. */
+        common::Error RespondSecured();
     };
 
     /** Declares what kind of packet this is, then hands over a writer for the
@@ -74,9 +87,16 @@ namespace bcp::flux::wire
         until NoFlow/WithFlow says which of the two this is. */
     class PacketBuilder
     {
+        /** PrepareResponse aims the builder it mints at the received packet's
+            source. Private, so aiming stays that path's job alone and every
+            other chain ends in Send(Address) as it always has. */
+        friend class bcp::flux::PacketSlotHandle;
+
     private:
-        Socket&       socket_;
-        SocketSender& sender_;
+        Socket*       socket_ = nullptr;
+        SocketSender* sender_ = nullptr;
+
+        Address respondTo_{};  ///< Reply target on a PrepareResponse chain.
 
         common::Error failReason_;
         bool secure_{true};
@@ -85,11 +105,18 @@ namespace bcp::flux::wire
         bool spent_{false};    ///< NoFlow/WithFlow are one-shot: the second
                                ///< call has no slot to give.
 
+        void Aim(const Address& target) { respondTo_ = target; }
+
     public:
         explicit PacketBuilder(Socket& socket, SocketSender& sender,
                                bool tagged = false)
-        : socket_(socket), sender_(sender),
+        : socket_(&socket), sender_(&sender),
           failReason_(common::Error::Ok), tagged_(tagged) {}
+
+        /** The builder a handle without a socket hands back: NoFlow and
+            WithFlow yield a stage that refuses to send, carrying the reason. */
+        explicit PacketBuilder(common::Error failReason)
+        : failReason_(failReason) {}
 
         /** Opts this packet out of encryption and authentication: it goes on
             the wire in plaintext with no tag, and any party can forge or

@@ -115,6 +115,7 @@ everything else:
 
 ```sh
 ./build/send_and_respond          # A sends, B answers
+./build/respond                   # B answers through the packet itself, no address named
 ./build/simultaneous_handshake    # both send first, the handshake collision resolves itself
 ./build/reliable_flow             # RELIABLE_ORDERED flow, numbered burst
 ./build/unreliable_flow           # the same burst on an UNRELIABLE flow

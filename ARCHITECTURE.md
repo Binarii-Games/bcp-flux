@@ -473,6 +473,17 @@ it is the retransmit source, so it goes to a retained staging slot; everything
 else goes to a kernel send slot, is encrypted in place, and is released once it
 is on the wire.
 
+Replying starts from the received packet instead of the socket:
+`PacketSlotHandle::PrepareResponse()` returns the same `PacketBuilder` as
+`BuildPacket`, aimed at that packet's source, and the chain ends with
+`Respond()` or `RespondSecured()` in place of `Send(Address)`. The address is
+taken from the packet because a reply is the one case where the destination is
+already known exactly, so rebuilding the pairing by hand would only add a way
+to get it wrong. `Poll` stamps its socket into every handle it delivers, which
+is what lets the handle mint the builder; any other handle yields one whose
+stages refuse to send. Kind, content and terminal are the unchanged origin 1
+and 2 path.
+
 `Send` is best-effort. `SendSecured` delivers only to a peer authenticated
 against a trusted certificate.
 

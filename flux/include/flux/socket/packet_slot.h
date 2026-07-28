@@ -14,6 +14,9 @@
 
 namespace bcp::flux
 {
+    class Socket;
+    namespace wire { class PacketBuilder; }
+
     /** The packet as it sits in a pool slot: a small header followed by the raw
         wire bytes as a flexible array. PacketSlotHandle/Writer/Reader below are
         the RAII accessors that lock, read, and write one of these.
@@ -71,18 +74,27 @@ namespace bcp::flux
     class PacketSlotHandle
     {
     // Automatically manages socket slot lifetime and locks.
+
+        /** Poll stamps the delivering socket into the handles it hands out, so
+            a reply can be built from the packet alone. */
+        friend class Socket;
+
     private:
         const PacketSlot* pktR_ = nullptr;
               PacketSlot* pktW_ = nullptr;
 
         uint32_t idx_{common::collections::SlotPool::INVALID};
         common::collections::SlotPool* pool_ = nullptr;
-     
+
+        Socket* socket_ = nullptr;   ///< Set only on handles Poll delivers.
+
         enum class LockMode : uint8_t {NONE, READ, WRITE};
         LockMode lm_{LockMode::NONE};
-     
+
         common::Error failReason_{common::Error::InvalidState};
         bool valid_{false};
+
+        void BindSocket(Socket* socket) noexcept { socket_ = socket; }
 
     public:
         PacketSlotHandle() = default;
@@ -109,6 +121,14 @@ namespace bcp::flux
 
         [[nodiscard]]const PacketSlot* Read() noexcept;
         [[nodiscard]]      PacketSlot* Write() noexcept;
+
+        /** A builder for the reply to this packet, aimed at its source address
+            so the caller never rebuilds the pairing by hand. The chain is the
+            ordinary one (NoFlow/WithFlow, the puts) ended with Respond() or
+            RespondSecured() instead of Send(Address). Only a packet delivered
+            by Poll can build one; any other handle yields a builder whose
+            stages refuse to send. */
+        [[nodiscard]] wire::PacketBuilder PrepareResponse() noexcept;
 
         bool Failed();
         common::Error FailReason();

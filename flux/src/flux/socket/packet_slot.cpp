@@ -4,6 +4,7 @@
 
 #include <flux/socket/socket.h>          // Controls / ToByte
 #include <flux/internal/constants.h>
+#include <flux/wire/packet_builder.h>
 #include <common/wire/bytes_reader.h>
 
 namespace bcp::flux
@@ -224,6 +225,23 @@ namespace bcp::flux
         return pktW_;
     }
 
+    wire::PacketBuilder PacketSlotHandle::PrepareResponse() noexcept
+    {
+        // Only Poll stamps a socket, so anything else (moved-from, detached,
+        // internal) refuses here rather than sending through a socket it was
+        // never given.
+        if (!valid_ || !socket_)
+            return wire::PacketBuilder{common::Error::InvalidState};
+
+        const PacketSlot* packet = Read();
+        if (!packet || !packet->address.IsSet())
+            return wire::PacketBuilder{common::Error::InvalidParam};
+
+        wire::PacketBuilder builder = socket_->BuildPacket();
+        builder.Aim(packet->address);
+        return builder;
+    }
+
     bool PacketSlotHandle::Failed()
     {
         return failReason_ != common::Error::Ok;
@@ -285,6 +303,7 @@ namespace bcp::flux
         pktR_ = o.pktR_;
         idx_ = o.idx_;
         pool_ = o.pool_;
+        socket_ = o.socket_;
         lm_ = o.lm_;
 
         o.Invalidate();
@@ -293,6 +312,7 @@ namespace bcp::flux
     void PacketSlotHandle::Invalidate() noexcept
     {
         valid_ = false;
+        socket_ = nullptr;
     }
 
     void PacketSlotHandle::Release() noexcept

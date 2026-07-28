@@ -1215,11 +1215,17 @@ namespace bcp::flux
 
         // Pass 2: drain the ready queue into the caller's array, up to max. A
         // packet's slot stayed leased in the recv pool while queued; rebuild a
-        // handle over it. Leftovers stay queued for the next Poll.
+        // handle over it. Leftovers stay queued for the next Poll. Delivered
+        // handles are stamped with this socket, which is what lets
+        // PrepareResponse build a reply from the packet alone.
         size_t delivered = 0;
         uint32_t idx = 0;
         while (delivered < max && readyQueue_.Pop(idx))
-            outPackets[delivered++] = PacketSlotHandle{ idx, recvPool_ };
+        {
+            outPackets[delivered] = PacketSlotHandle{ idx, recvPool_ };
+            outPackets[delivered].BindSocket(this);
+            ++delivered;
+        }
 
         return static_cast<uint32_t>(delivered);
     }

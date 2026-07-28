@@ -48,52 +48,56 @@ namespace bcp::flux::wire
 
     PacketContentStage PacketBuilder::NoFlow()
     {
+        if (!socket_)
+            return PacketContentStage(failReason_);
         if (spent_)
-            return PacketContentStage(sender_, common::Error::InvalidState);
+            return PacketContentStage(common::Error::InvalidState);
         spent_ = true;
 
-        common::Result<PacketSlotWriter> result = socket_.AcquireKernelWriter();
+        common::Result<PacketSlotWriter> result = socket_->AcquireKernelWriter();
         if (result.isErr())
-            return PacketContentStage(sender_, result.error);
+            return PacketContentStage(result.error);
         PacketSlotWriter writer = result.Take();
 
         // User traffic: the internal bit stays clear, or Poll would consume
         // the packet as protocol traffic instead of delivering it.
         if (!WriteCommonHeader(writer, secure_, secure_ && tagged_, false))
-            return PacketContentStage(sender_, common::Error::BufferFull);
+            return PacketContentStage(common::Error::BufferFull);
 
-        return PacketContentStage(sender_, std::move(writer));
+        return PacketContentStage(*sender_, std::move(writer), respondTo_);
     }
 
     PacketContentStage PacketBuilder::WithFlow(const FlowHandle& flow)
     {
+        if (!socket_)
+            return PacketContentStage(failReason_);
         if (spent_)
-            return PacketContentStage(sender_, common::Error::InvalidState);
+            return PacketContentStage(common::Error::InvalidState);
         spent_ = true;
 
         // The pool depends on the flow's mode: a reliable flow's body is its own
         // retransmit source and must outlive the send, so the socket resolves
         // the flow and hands back a writer over the right slot.
-        common::Result<PacketSlotWriter> result = socket_.AcquireFlowWriter(flow);
+        common::Result<PacketSlotWriter> result = socket_->AcquireFlowWriter(flow);
         if (result.isErr())
-            return PacketContentStage(sender_, result.error);
+            return PacketContentStage(result.error);
         PacketSlotWriter writer = result.Take();
 
         // Flow traffic is always secure: the id and sequence number are Flux's
         // own framing and belong under the encryption with the rest.
         if (!secure_)
-            return PacketContentStage(sender_, common::Error::InvalidParam);
+            return PacketContentStage(common::Error::InvalidParam);
 
         if (!WriteCommonHeader(writer, true, tagged_, true))
-            return PacketContentStage(sender_, common::Error::BufferFull);
+            return PacketContentStage(common::Error::BufferFull);
 
         // The id and sequence number follow the channel byte. The id is known
         // now; the sequence number is assigned at send time, under the flow's
         // lock, so packets leave in the order their numbers were handed out.
         if (!writer.PutU16(flow.Id()) || !writer.PutU32(0))
-            return PacketContentStage(sender_, common::Error::BufferFull);
+            return PacketContentStage(common::Error::BufferFull);
 
-        return PacketContentStage(sender_, std::move(writer));
+        return PacketContentStage(*sender_, std::move(writer), respondTo_);
     }
 
     // --- Content stage ---
@@ -131,13 +135,27 @@ namespace bcp::flux::wire
     {
         if (failed_) return failReason_;
         writer_.WriteAddress(address);
-        return sender_.Send(std::move(writer_).ExtractHandle());
+        return sender_->Send(std::move(writer_).ExtractHandle());
     }
 
     common::Error PacketContentStage::SendSecured(Address address)
     {
         if (failed_) return failReason_;
         writer_.WriteAddress(address);
-        return sender_.Send(std::move(writer_).ExtractHandle(), true);
+        return sender_->Send(std::move(writer_).ExtractHandle(), true);
+    }
+
+    common::Error PacketContentStage::Respond()
+    {
+        if (failed_) return failReason_;
+        if (!respondTo_.IsSet()) return common::Error::InvalidState;
+        return Send(respondTo_);
+    }
+
+    common::Error PacketContentStage::RespondSecured()
+    {
+        if (failed_) return failReason_;
+        if (!respondTo_.IsSet()) return common::Error::InvalidState;
+        return SendSecured(respondTo_);
     }
 }
