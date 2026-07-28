@@ -1,9 +1,10 @@
 // A opens a RELIABLE_ORDERED flow to B and sends a numbered burst on it.
 //
-// A flow is a wire exchange, not a local object: OpenFlow returns immediately
-// with the flow OPENING and it turns OPEN when the remote's ack lands, so both
-// sides have to pump for that to happen. Flow storage is off by default, so
-// Config::flows has to be given a pool on both directions.
+// Opening a flow is local and costs nothing on the wire: OpenFlow returns a
+// flow that is already OPEN and can be sent on immediately. B has never heard
+// of it and registers its receiving half from the first packet that arrives.
+// Flow storage is off by default, so Config::flows has to be given a pool on
+// both directions.
 //
 // RELIABLE_ORDERED means every packet arrives and arrives in send order. Lost
 // ones are retransmitted from a retained copy, and one that overtakes a gap is
@@ -85,16 +86,12 @@ int main()
 
     std::thread responder(Tick, std::ref(b));
 
-    // Unknown address, so this handshakes first, then sends FLOW_OPEN.
+    // Local and immediate: no wire exchange, nothing to wait for. The peer
+    // handshake still happens underneath on first send, and the packets park
+    // behind it.
     flux::FlowHandle flow = a.OpenFlow(addrB, FLOW_ID, flux::FlowMode::RELIABLE_ORDERED);
 
     flux::PacketSlotHandle sink[8];
-    while (a.GetFlowState(flow) != flux::FlowLifecycle::OPEN)
-    {
-        a.Update();
-        a.Poll(sink, 8);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
 
     // WithFlow instead of NoFlow: the packet gets the flow's id and its next
     // sequence number, which is what makes acking, ordering and resending

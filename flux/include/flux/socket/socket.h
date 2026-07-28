@@ -178,13 +178,16 @@ namespace bcp::flux
                 uint32_t outCount          = 0;    ///< socket-wide out-flow pool
                 uint32_t inCount           = 0;    ///< socket-wide in-flow pool
                 uint32_t maxOutPerPeer     = 8;    ///< out-directory width per peer
-                uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: opens one remote may hold
+                uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: flows one remote may register
 
-                /** Both roles at once: the out-flow ring capacity (and the
-                    window asked for in FLOW_OPEN) and the in-flow seen-bitmap
-                    width (the window granted to openers). FLOW_OPEN exchanges
-                    the two sides' values, both clamp to the min. Power of two,
-                    floor 64. */
+                /** Both roles at once: the out-flow ring capacity, which is the
+                    window this socket declares on every flow packet, and the
+                    in-flow seen-bitmap width, which is the widest window it
+                    will register from a remote. A flow declaring more than the
+                    receiver's bitmap covers is rejected, since a retransmit
+                    could then arrive older than anything still remembered.
+                    Power of two, floor 64, and it must be one of the widths
+                    the flow data byte can encode (32 through 32768). */
                 uint32_t inFlightCount     = 256;
                 /** How far ahead of a gap an ordered in-flow buffers (beyond
                     it: dropped, a resend fills it later). Power of two, or 0. */
@@ -307,11 +310,15 @@ namespace bcp::flux
             or complete. Progress is observable via GetPeer. */
         [[nodiscard]] common::Error Connect(const Address& addr);
 
-        /** Opens a flow to the peer (leases this side, tells the remote via
-            FLOW_OPEN). Returns immediately OPENING; sends park until the ack
-            turns it OPEN. Unknown address handshakes first, like Send. The id is
-            the app's to choose and must be free with this peer; the failed
-            handle says why otherwise. */
+        /** Opens a flow to the peer. Local and immediate: nothing goes on the
+            wire, the flow comes back OPEN, and it can be sent on straight
+            away, including before the peer handshake has finished (those
+            packets park behind it like any other). The remote registers its
+            receiving half from the first packet that arrives, and refuses only
+            when it is at its caps, which fails the flow rather than the send.
+            Unknown address handshakes first, like Send. The id is the app's to
+            choose and must be free with this peer; the failed handle says why
+            otherwise. */
         [[nodiscard]] FlowHandle OpenFlow(const Address& peer, uint16_t flowId, FlowMode mode);
 
         /** Begins closing: no new sends, tell the remote (FLOW_CLOSE), recycle
@@ -461,6 +468,12 @@ namespace bcp::flux
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireKernelWriter();
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireFlowWriter(const FlowHandle& flow);
 
+        /** A writer over a retained staging slot, the pool a reliable flow's
+            plaintext lives in until its sequence resolves. Shared by the flow
+            send path and the pending flush, so both put a retained body in the
+            one pool the in-flight ring releases into. */
+        [[nodiscard]] common::Result<PacketSlotWriter> AcquireStagingWriter();
+
         /** The outbound gate (called by SocketSender for every packet). Internal
             packets pass through; established peers seal and fly; unknown or
             mid-handshake peers park. Thin: validate -> gather -> stamp ->
@@ -570,9 +583,8 @@ namespace bcp::flux
             one writer factory for the handshake senders. */
         [[nodiscard]] common::Result<PacketSlotWriter> BuildInternal(SocketOpCode op);
         void FlushPending(const Address& addr);
-        void FlushFlowOpens(const Address& addr);
 
-        // --- Flow control-plane (open/close wire exchange) ---
+        // --- Flow directory and control plane ---
         // Directory helpers over the FlowDirEntry[] segment: three scan idioms.
         [[nodiscard]] FlowDirEntry* OutFlowDirFor(uint32_t peerSlot) noexcept;
         [[nodiscard]] FlowDirEntry* InFlowDirFor(uint32_t peerSlot) noexcept;
@@ -580,8 +592,7 @@ namespace bcp::flux
         [[nodiscard]] static uint32_t InsertFlowSlot(FlowDirEntry* dir, uint32_t width, uint16_t flowId, uint32_t flowSlot) noexcept;
         static void EraseFlowSlot(FlowDirEntry* dir, uint32_t width, uint32_t flowSlot) noexcept;
 
-        void Flow_Open(const Address& from, const uint8_t* payload, size_t len);
-        void Flow_OpenAck(const Address& from, const uint8_t* payload, size_t len);
+        void Flow_Reject(const Address& from, const uint8_t* payload, size_t len);
         void Flow_Close(const Address& from, const uint8_t* payload, size_t len);
         void Flow_CloseAck(const Address& from, const uint8_t* payload, size_t len);
         void Flow_Ack(const Address& from, const uint8_t* payload, size_t len);
@@ -593,6 +604,25 @@ namespace bcp::flux
 
             @param refundTo null when the peer itself is being freed. */
         void FreeOutFlow(uint32_t flowSlot, Peer* refundTo) noexcept;
+
+        /** Marks an out-flow FAILED and gives back everything it holds: the
+            in-flight ring's leases and their congestion bytes, and the waiting
+            ring's parked packets. The slot itself stays leased so the app can
+            still observe the failure through its handle; CloseFlow recycles it.
+
+            @pre Caller holds the peer's write lock (the refund's guard). */
+        void FailOutFlow(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept;
+
+        /** Registers a remote's flow on first sight, from the flow header of a
+            data packet. Caps-only refusal: a dry pool, a full per-peer
+            directory, or a declared window wider than this socket's dedupe
+            bitmap yields Rejected, and the sender is told so it can stop.
+
+            @pre Caller holds the peer's write lock. */
+        enum class FlowAdmit : uint8_t { Registered, Existing, Rejected };
+        [[nodiscard]] FlowAdmit AdmitInFlow(uint32_t peerSlot, const Address& from,
+                                            const BcpId& peerId, uint16_t flowId,
+                                            uint8_t flowData) noexcept;
         [[nodiscard]] uint32_t DrainOutInflight(OutFlowState* flow) noexcept;
         void DrainOutWaiting(OutFlowState* flow) noexcept;
         void DrainInHoldback(InFlowState* flow) noexcept;
@@ -618,9 +648,10 @@ namespace bcp::flux
         // lifecycle-retry step and a retransmit step; each reads the clock once
         // at entry, for that flow.
         void UpdateOutFlow(const Address& addr, PeerHandle peer, uint32_t dirIndex, uint64_t nowOverride);
-        void RetryOpenClose(OutFlowState& flow, uint64_t now, /*out*/ bool& giveUp);
+        void RetryClose(OutFlowState& flow, uint64_t now, /*out*/ bool& giveUp);
         void RetransmitInflight(OutFlowState& flow, uint64_t now, CongestionDelta& delta,
-                                /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots, uint32_t& resendCount);
+                                /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots,
+                                uint32_t& resendCount, /*out*/ bool& exhausted);
 
         /** The waiting-ring drain, one peer per call: while the gate passes,
             send the packet that has waited longest across the peer's flows,

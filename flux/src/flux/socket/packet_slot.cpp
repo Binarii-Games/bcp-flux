@@ -50,10 +50,10 @@ namespace bcp::flux
         return (Controller()[0] & ToByte(Controls::CTRL_TAGGED)) != 0;
     }
 
-    uint16_t PacketSlot::FlowId() const
+    size_t PacketSlot::FlowHeaderOffset() const
     {
         if (!HasFlow())
-            return internal::INVALID_FLOW_ID;
+            return dataSize;
 
         size_t offset = internal::WIRE_CONTROLLER_SIZE;
         if (IsSecure())
@@ -62,60 +62,40 @@ namespace bcp::flux
             offset += internal::WIRE_PEER_TAG_SIZE;
         if (IsSecure())
             offset += internal::WIRE_SECURE_CHANNEL_SIZE;   // flow fields follow the channel byte
-        if (offset + internal::WIRE_FLOW_ID_SIZE > dataSize)
+
+        return offset + internal::WIRE_FLOW_HEADER_SIZE <= dataSize ? offset : dataSize;
+    }
+
+    uint16_t PacketSlot::FlowId() const
+    {
+        const size_t offset = FlowHeaderOffset();
+        if (offset == dataSize)
             return internal::INVALID_FLOW_ID;
 
-        common::BytesReader r
-        {
-            .p = data + offset,
-            .r = internal::WIRE_FLOW_ID_SIZE
-        };
-
+        common::BytesReader reader{ .p = data + offset, .r = internal::WIRE_FLOW_ID_SIZE };
         uint16_t flowId{};
-        bool res = r.TakeU16(flowId);
-        if (!res)
-            return internal::INVALID_FLOW_ID;
-
-        return flowId;
+        return reader.TakeU16(flowId) ? flowId : internal::INVALID_FLOW_ID;
     }
 
     uint32_t PacketSlot::FlowSeq() const
     {
-        if (!HasFlow())
+        const size_t offset = FlowHeaderOffset();
+        if (offset == dataSize)
             return 0;
 
-        // The seq sits right after the flow id, at ContentOffset minus its
-        // own width, the slot StampFlowPacket wrote it into.
-        const size_t contentOffset = ContentOffset();
-        if (contentOffset < internal::WIRE_FLOW_SEQ_SIZE)
-            return 0;
-        const size_t offset = contentOffset - internal::WIRE_FLOW_SEQ_SIZE;
-        if (offset + internal::WIRE_FLOW_SEQ_SIZE > dataSize)
-            return 0;
-
-        common::BytesReader r{ .p = data + offset, .r = internal::WIRE_FLOW_SEQ_SIZE };
+        common::BytesReader reader{ .p = data + offset + internal::WIRE_FLOW_ID_SIZE,
+                                    .r = internal::WIRE_FLOW_SEQ_SIZE };
         uint32_t seq{};
-        if (!r.TakeU32(seq))
-            return 0;
-        return seq;
+        return reader.TakeU32(seq) ? seq : 0;
     }
 
-    uint64_t PacketSlot::NonceCounter() const
+    uint8_t PacketSlot::FlowData() const
     {
-        if (!IsSecure() || dataSize < internal::MIN_SECURE_WIRE_SIZE)
+        const size_t offset = FlowHeaderOffset();
+        if (offset == dataSize)
             return 0;
 
-        common::BytesReader r
-        {
-            .p = data + internal::WIRE_CONTROLLER_SIZE + internal::WIRE_TAG_SIZE,
-            .r = internal::WIRE_NONCE_SIZE
-        };
-
-        uint64_t counter{};
-        if (!r.TakeU64(counter))
-            return 0;
-
-        return counter;
+        return data[offset + internal::WIRE_FLOW_ID_SIZE + internal::WIRE_FLOW_SEQ_SIZE];
     }
 
     const uint8_t* PacketSlot::PeerTagField() const
@@ -152,7 +132,7 @@ namespace bcp::flux
         if (IsSecure())
             contentOffset += internal::WIRE_SECURE_CHANNEL_SIZE;   // in-band channel byte
         if (HasFlow())
-            contentOffset += internal::WIRE_FLOW_ID_SIZE + internal::WIRE_FLOW_SEQ_SIZE;
+            contentOffset += internal::WIRE_FLOW_HEADER_SIZE;
         return contentOffset;
     }
 

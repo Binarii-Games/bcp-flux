@@ -127,10 +127,11 @@ namespace bcp::flux
                           const BcpId* peerId, uint16_t flowId, FlowMode mode,
                           uint16_t inflightCap, uint16_t waitingCap) noexcept
         {
+            // Born OPEN: opening is local, and the remote registers its
+            // receiving half from whichever data packet reaches it first.
             ResetFlowCore(flow->core, peerSlot, peerAddr, peerId, flowId, mode,
-                          FlowLifecycle::OPENING);
+                          FlowLifecycle::OPEN);
             flow->nextSeq       = 1;
-            flow->grantedWindow = 0;   // no sends until the FLOW_OPEN_ACK grants one
             flow->unresolved    = 0;
             flow->srttMicros    = 0;
             flow->rttvarMicros  = 0;
@@ -141,7 +142,7 @@ namespace bcp::flux
 
             InFlightEntry* inFlight = flow->InFlight();
             for (uint32_t i = 0; i < inflightCap; ++i)
-                inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID, 0 };
+                inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID, 0, 0 };
             WaitingEntry* waiting = flow->Waiting();
             for (uint32_t i = 0; i < waitingCap; ++i)
                 waiting[i] = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };
@@ -152,7 +153,7 @@ namespace bcp::flux
                          uint16_t windowBits, uint16_t reorderCap) noexcept
         {
             ResetFlowCore(flow->core, peerSlot, peerAddr, peerId, flowId, mode,
-                          FlowLifecycle::OPEN);   // born OPEN: our ack un-OPENINGs the opener
+                          FlowLifecycle::OPEN);   // born OPEN: registration is what the first packet does
             flow->recvNext      = 1;
             flow->recvHighest   = 0;
             flow->newSinceFlush = 0;
@@ -747,6 +748,11 @@ namespace bcp::flux
         if (mode == FlowMode::UNRELIABLE)
             return kernel_->Write();
 
+        return AcquireStagingWriter();
+    }
+
+    common::Result<PacketSlotWriter> Socket::AcquireStagingWriter()
+    {
         const uint32_t slot = stagingPool_.Acquire();
         if (slot == common::collections::SlotPool::INVALID)
             return common::Result<PacketSlotWriter>::Fail(common::Error::PoolExhausted);
@@ -765,7 +771,7 @@ namespace bcp::flux
     bool Socket::CanSend(const OutFlowState& flow, const Peer& peer,
                           uint16_t wireSize, bool windowed) noexcept
     {
-        if (windowed && flow.unresolved >= flow.grantedWindow)
+        if (windowed && flow.unresolved >= flow.inflightCap)
             return false;
         if (static_cast<uint64_t>(peer.bytesInFlight) + wireSize > peer.congestionBudget)
             return false;
@@ -786,14 +792,17 @@ namespace bcp::flux
         entry.sentAtMicros = common::MonotonicMicros();
         entry.packetSlot   = stagingSlot;   // INVALID for an unreliable flow
         entry.wireSize     = wireSize;
+        entry.retries      = 0;
 
         flow.unresolved += 1;
         peer.bytesInFlight += wireSize;      // congestion spend
         flow.nextSeq = seq + 1;
         if (flow.nextSeq == 0) flow.nextSeq = 1;   // 0 is the never-sent sentinel
 
-        const size_t seqOffset = packet.ContentOffset() - internal::WIRE_FLOW_SEQ_SIZE;
-        uint8_t* seqField = packet.data + seqOffset;
+        // Measured forward from the flow header, not backward from the
+        // payload: the sequence is no longer the last field of the header.
+        uint8_t* seqField = packet.data + packet.FlowHeaderOffset()
+                          + internal::WIRE_FLOW_ID_SIZE;
         seqField[0] = static_cast<uint8_t>(seq >> 0);
         seqField[1] = static_cast<uint8_t>(seq >> 8);
         seqField[2] = static_cast<uint8_t>(seq >> 16);
@@ -929,8 +938,12 @@ namespace bcp::flux
                 }
                 if (!peer->IsValid())
                 {
-                    // Handshake in flight: park behind it.
-                    status = pending::Push(pendingPool_, peerHandle, *packet, requireAuth);
+                    // Handshake in flight: park behind it. `retained` travels
+                    // with the packet so the flush can put a reliable flow's
+                    // body back into a staging slot, which is where the
+                    // in-flight ring will later release it from.
+                    status = pending::Push(pendingPool_, peerHandle, *packet,
+                                           requireAuth, retained);
                     return PacketSlotHandle::Invalid();
                 }
                 if (requireAuth && !peer->authenticated)
@@ -1063,7 +1076,8 @@ namespace bcp::flux
                 status = common::Error::PeerNotFound;
                 return PacketSlotHandle::Invalid();
             }
-            status = pending::Push(pendingPool_, peerHandle, *packet, requireAuth);
+            status = pending::Push(pendingPool_, peerHandle, *packet,
+                                   requireAuth, retained);
         }
         return PacketSlotHandle::Invalid();
     }
@@ -1371,8 +1385,7 @@ namespace bcp::flux
         {
             case internal::SECURE_CHANNEL_PATH_CHLG:      PathChallenge_Respond(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_PATH_RESP:      PathChallenge_Complete(from, buf, plen); break;
-            case internal::SECURE_CHANNEL_FLOW_OPEN:      Flow_Open(from, buf, plen);      break;
-            case internal::SECURE_CHANNEL_FLOW_OPEN_ACK:  Flow_OpenAck(from, buf, plen);   break;
+            case internal::SECURE_CHANNEL_FLOW_REJECT:    Flow_Reject(from, buf, plen);    break;
             case internal::SECURE_CHANNEL_FLOW_CLOSE:     Flow_Close(from, buf, plen);     break;
             case internal::SECURE_CHANNEL_FLOW_CLOSE_ACK: Flow_CloseAck(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_FLOW_ACK:       Flow_Ack(from, buf, plen);       break;
@@ -1395,20 +1408,54 @@ namespace bcp::flux
         const PacketSlot* packet = incoming.Read();
         if (!packet) return 0;
 
-        const uint16_t flowId = packet->FlowId();
-        const uint32_t seq    = packet->FlowSeq();
-        const Address  from   = packet->address;
+        const uint16_t flowId   = packet->FlowId();
+        const uint32_t seq      = packet->FlowSeq();
+        const uint8_t  flowData = packet->FlowData();
+        const Address  from     = packet->address;
         if (flowId == internal::INVALID_FLOW_ID || seq == 0) return 0;
 
-        // Resolve the in-flow under the peer's read lock (keeps its directory
-        // from being swept), then work under the in-flow's own lock.
+        // Resolve the in-flow, registering it if this is the first packet of a
+        // flow we have not seen. Opening takes no round trip, so the data
+        // packet itself is what creates the receiving half, and the flow data
+        // byte on it carries everything registration needs.
         uint32_t flowSlot = common::collections::SlotPool::INVALID;
+        bool     reject   = false;
+        PeerSendMaterials rejectMaterials;
         {
             PeerHandle peerHandle = peers_.GetPeer(from);
-            if (peerHandle.Failed() || !peerHandle.Read()) return 0;
-            flowSlot = FindFlowSlot(InFlowDirFor(peerHandle.GetSlotIndex()),
-                                    maxInFlowsPerPeer_, flowId);
+            if (peerHandle.Failed()) return 0;
+
+            // Write, not read: registration mutates the peer's directory, and
+            // the lock has to cover the lookup that decided it was absent.
+            Peer* peer = peerHandle.Write();
+            if (!peer || !peer->IsValid()) return 0;
+
+            const uint32_t peerSlot = peerHandle.GetSlotIndex();
+            switch (AdmitInFlow(peerSlot, from, peer->id, flowId, flowData))
+            {
+            case FlowAdmit::Rejected:
+                // Caps, or a window this socket cannot dedupe. Tell the sender
+                // so it stops rather than retransmitting into silence.
+                rejectMaterials = GatherSendMaterials(*peer);
+                reject = true;
+                break;
+            case FlowAdmit::Registered:
+            case FlowAdmit::Existing:
+                flowSlot = FindFlowSlot(InFlowDirFor(peerSlot), maxInFlowsPerPeer_, flowId);
+                break;
+            }
         }
+
+        if (reject)
+        {
+            const uint8_t payload[2] = { static_cast<uint8_t>(flowId),
+                                         static_cast<uint8_t>(flowId >> 8) };
+            SendSecureControl(from, rejectMaterials, internal::SECURE_CHANNEL_FLOW_REJECT,
+                              payload, sizeof(payload));
+            common::crypto::Wipe(rejectMaterials.key.data(), rejectMaterials.key.size());
+            return 0;
+        }
+
         if (flowSlot == common::collections::SlotPool::INVALID) return 0;
 
         InFlowState* flow = reinterpret_cast<InFlowState*>(inFlowPool_.WriteLock(flowSlot));
@@ -2020,7 +2067,6 @@ namespace bcp::flux
 
         // Only a simultaneous handshake has anything parked on this side.
         FlushPending(from);
-        FlushFlowOpens(from);
     }
 
     void Socket::Handshake_Complete(const Address& from, PacketSlotReader& reader)
@@ -2106,7 +2152,6 @@ namespace bcp::flux
         common::crypto::Wipe(session.data(), session.size());
 
         FlushPending(from);
-        FlushFlowOpens(from);
     }
 
     void Socket::CommitSession(Peer& peer, const common::crypto::PublicKey& theirPk,
@@ -2187,7 +2232,16 @@ namespace bcp::flux
                     continue;
                 }
 
-                common::Result<PacketSlotWriter> result = kernel_->Write();
+                // A reliable flow's body goes back to STAGING, everything else
+                // to a kernel send slot. The pool is not cosmetic: the send
+                // path infers `retained` from which pool the plaintext sits
+                // in, and the in-flight ring both keeps that slot as its
+                // retransmit source and releases it into stagingPool_ when the
+                // packet resolves. Re-materialising a reliable body into a
+                // kernel slot would hand the ring an index from the wrong pool.
+                common::Result<PacketSlotWriter> result = pending->retained
+                    ? AcquireStagingWriter()
+                    : kernel_->Write();
                 if (result.isOk())
                 {
                     PacketSlotWriter writer = result.Take();
@@ -2195,65 +2249,12 @@ namespace bcp::flux
                     writer.PutBytes(pending->data, pending->dataSize);
                     sender_.Send(std::move(writer).ExtractHandle(), pending->requireAuth != 0);
                 }
-                // Kernel pool dry: the packet drops, which is all an unreliable
-                // send promises; flows make this survivable later.
+                // Pool dry: the packet drops, which is all an unreliable send
+                // promises; a reliable flow's retransmit covers the rest.
                 pendingPool_.Release(batch[i]);
             }
 
             if (count < 32) return;
-        }
-    }
-
-    void Socket::FlushFlowOpens(const Address& addr)
-    {
-        if (!outFlowDir_) return;
-
-        // One directory slot per pass, each under a fresh peer acquisition:
-        // sends must not run with any handle held. Establish is rare; the
-        // re-lookups cost nothing that matters.
-        for (uint32_t i = 0; i < maxOutFlowsPerPeer_; ++i)
-        {
-            bool send = false;
-            uint16_t flowId = 0;
-            FlowMode mode{};
-            PeerSendMaterials materials;
-            {
-                PeerHandle peerHandle = peers_.GetPeer(addr);
-                if (peerHandle.Failed()) return;
-                Peer* peer = peerHandle.Write();
-                if (!peer || !peer->IsValid()) return;
-
-                FlowDirEntry* dir = OutFlowDirFor(peerHandle.GetSlotIndex());
-                const uint32_t flowSlot = dir[i].flowSlot;
-                if (flowSlot == common::collections::SlotPool::INVALID) continue;
-
-                OutFlowState* flow = reinterpret_cast<OutFlowState*>(
-                    outFlowPool_.WriteLock(flowSlot));
-                if (flow->core.life == FlowLifecycle::OPENING)
-                {
-                    flow->core.peerId = peer->id;   // proven by the handshake just now
-                    flowId = flow->core.flowId;
-                    mode   = flow->core.mode;
-                    send   = true;
-                }
-                outFlowPool_.UnlockWrite(flowSlot);
-
-                if (send)
-                    materials = GatherSendMaterials(*peer);
-            }
-
-            if (send)
-            {
-                const uint8_t payload[5] = { static_cast<uint8_t>(flowId),
-                                             static_cast<uint8_t>(flowId >> 8),
-                                             static_cast<uint8_t>(mode),
-                                             static_cast<uint8_t>(outInflightCap_),
-                                             static_cast<uint8_t>(outInflightCap_ >> 8) };
-                SendSecureControl(addr, materials,
-                                  internal::SECURE_CHANNEL_FLOW_OPEN,
-                                  payload, sizeof(payload));
-                common::crypto::Wipe(materials.key.data(), materials.key.size());
-            }
         }
     }
 
@@ -2337,6 +2338,14 @@ namespace bcp::flux
             mode != FlowMode::UNRELIABLE)
             return FlowHandle{common::Error::InvalidParam};
 
+        // The declared window is this socket's ring capacity, and it rides
+        // every packet. A capacity the byte cannot encode is a config error,
+        // not a runtime one: refuse rather than silently declaring a
+        // different width than the ring enforces.
+        const uint8_t flowData = EncodeFlowData(mode, outInflightCap_);
+        if (flowData == 0)
+            return FlowHandle{common::Error::InvalidParam};
+
         const common::Error connect = Connect(peer);
         if (connect != common::Error::Ok)
             return FlowHandle{connect};
@@ -2358,8 +2367,6 @@ namespace bcp::flux
             outFlowPool_.UnlockWrite(flowSlot);
         }
 
-        bool sendOpen = false;
-        PeerSendMaterials materials;
         {
             PeerHandle peerHandle = peers_.GetPeer(peer);
             if (peerHandle.Failed())
@@ -2374,7 +2381,6 @@ namespace bcp::flux
                 return FlowHandle{common::Error::InvalidState};
             }
             const uint32_t peerSlot = peerHandle.GetSlotIndex();
-            const bool established = owner->IsValid();
 
             // Stamp the owner into the flow while it is still unpublished, so
             // publication reveals a complete flow.
@@ -2382,7 +2388,7 @@ namespace bcp::flux
                 OutFlowState* flow = reinterpret_cast<OutFlowState*>(
                     outFlowPool_.WriteLock(flowSlot));
                 flow->core.peerSlot = peerSlot;
-                if (established)
+                if (owner->IsValid())
                     flow->core.peerId = owner->id;
                 outFlowPool_.UnlockWrite(flowSlot);
             }
@@ -2399,30 +2405,9 @@ namespace bcp::flux
                 outFlowPool_.Release(flowSlot);
                 return FlowHandle{common::Error::LimitReached};
             }
-
-            if (established)
-            {
-                materials = GatherSendMaterials(*owner);
-                sendOpen  = true;
-            }
-            // Not established: the open rides FlushFlowOpens once the
-            // handshake completes.
         }
 
-        if (sendOpen)
-        {
-            // [flowId][mode][desired window]: the window we ask for is our ring
-            // capacity; the ack returns what the receiver's bitmap can cover.
-            const uint8_t payload[5] = { static_cast<uint8_t>(flowId),
-                                         static_cast<uint8_t>(flowId >> 8),
-                                         static_cast<uint8_t>(mode),
-                                         static_cast<uint8_t>(outInflightCap_),
-                                         static_cast<uint8_t>(outInflightCap_ >> 8) };
-            SendSecureControl(peer, materials, internal::SECURE_CHANNEL_FLOW_OPEN,
-                              payload, sizeof(payload));
-            common::crypto::Wipe(materials.key.data(), materials.key.size());
-        }
-        return FlowHandle{flowSlot, epoch, flowId};
+        return FlowHandle{flowSlot, epoch, flowId, flowData};
     }
 
     common::Error Socket::CloseFlow(const FlowHandle& flow)
@@ -2536,114 +2521,25 @@ namespace bcp::flux
         return life;
     }
 
-    void Socket::Flow_Open(const Address& from, const uint8_t* payload, size_t len)
+    void Socket::Flow_Reject(const Address& from, const uint8_t* payload, size_t len)
     {
-        // [flowId(2)][mode(1)][desired window(2)]: a remote is opening a flow
-        // with us, so everything resolves against the IN side.
-        if (!inFlowDir_ || len < 5) return;
+        // The remote refused to register one of OUR flows: it is at its caps,
+        // and retrying the same flow would only ask again. Fail it so the app
+        // sees the outcome through its handle, and drain what it was holding.
+        if (!outFlowDir_ || len < 2) return;
         const uint16_t flowId = static_cast<uint16_t>(payload[0])
                               | static_cast<uint16_t>(payload[1]) << 8;
-        if (flowId == internal::INVALID_FLOW_ID) return;
-        if (payload[2] > static_cast<uint8_t>(FlowMode::UNRELIABLE)) return;
-        const FlowMode mode = static_cast<FlowMode>(payload[2]);
-        const uint16_t desired = static_cast<uint16_t>(payload[3])
-                               | static_cast<uint16_t>(payload[4]) << 8;
-
-        // The window this socket grants: what the opener asked, capped by what
-        // our bitmap can dedupe. The opener clamps to this, which is the
-        // invariant that keeps our seen window from ever being outrun.
-        const uint16_t granted = desired < inWindowBits_ ? desired : inWindowBits_;
-
-        bool ack = false;
-        PeerSendMaterials materials;
-        {
-            PeerHandle peerHandle = peers_.GetPeer(from);
-            if (peerHandle.Failed()) return;
-            Peer* peer = peerHandle.Write();
-            if (!peer || !peer->IsValid()) return;
-            const uint32_t peerSlot = peerHandle.GetSlotIndex();
-
-            FlowDirEntry* dir = InFlowDirFor(peerSlot);
-            if (FindFlowSlot(dir, maxInFlowsPerPeer_, flowId)
-                == common::collections::SlotPool::INVALID)
-            {
-                // Not yet present: this is the one path where a REMOTE makes
-                // this socket allocate. A dry pool or a full directory drops
-                // the open unanswered; the opener's retry may find room freed.
-                const uint32_t flowSlot = inFlowPool_.Acquire();
-                if (flowSlot == common::collections::SlotPool::INVALID) return;
-
-                // Nested peer->flow: build, then publish. The receiver has no
-                // OPENING period; our ack un-OPENINGs the opener.
-                {
-                    InFlowState* flow = reinterpret_cast<InFlowState*>(
-                        inFlowPool_.WriteLock(flowSlot));
-                    ResetInFlow(flow, peerSlot, from, &peer->id, flowId, mode,
-                                inWindowBits_, inReorderCap_);
-                    inFlowPool_.UnlockWrite(flowSlot);
-                }
-                if (InsertFlowSlot(dir, maxInFlowsPerPeer_, flowId, flowSlot)
-                    == maxInFlowsPerPeer_)
-                {
-                    inFlowPool_.Release(flowSlot);   // directory full: drop unanswered
-                    return;
-                }
-            }
-
-            materials = GatherSendMaterials(*peer);
-            ack       = true;
-        }
-
-        if (ack)
-        {
-            // [flowId(2)][granted window(2)]: idempotent, since a duplicate open
-            // gets the same grant (both sides compute the same min).
-            const uint8_t reply[4] = { static_cast<uint8_t>(flowId),
-                                       static_cast<uint8_t>(flowId >> 8),
-                                       static_cast<uint8_t>(granted),
-                                       static_cast<uint8_t>(granted >> 8) };
-            SendSecureControl(from, materials, internal::SECURE_CHANNEL_FLOW_OPEN_ACK,
-                              reply, sizeof(reply));
-            common::crypto::Wipe(materials.key.data(), materials.key.size());
-        }
-    }
-
-    void Socket::Flow_OpenAck(const Address& from, const uint8_t* payload, size_t len)
-    {
-        // [flowId(2)][granted window(2)]: answers one of OUR opens, OUT side.
-        if (!outFlowDir_ || len < 4) return;
-        const uint16_t flowId = static_cast<uint16_t>(payload[0])
-                              | static_cast<uint16_t>(payload[1]) << 8;
-        const uint16_t grant  = static_cast<uint16_t>(payload[2])
-                              | static_cast<uint16_t>(payload[3]) << 8;
-        if (grant == 0) return;   // a windowless flow could never send
 
         PeerHandle peerHandle = peers_.GetPeer(from);
         if (peerHandle.Failed()) return;
-        const Peer* peer = peerHandle.Read();
+        Peer* peer = peerHandle.Write();
         if (!peer || !peer->IsValid()) return;
-        const uint32_t peerSlot = peerHandle.GetSlotIndex();
 
-        FlowDirEntry* dir = OutFlowDirFor(peerSlot);
-        const uint32_t flowSlot = FindFlowSlot(dir, maxOutFlowsPerPeer_, flowId);
-        if (flowSlot == common::collections::SlotPool::INVALID)
-            return;   // no match: the close raced this ack, nothing to do
+        const uint32_t flowSlot = FindFlowSlot(OutFlowDirFor(peerHandle.GetSlotIndex()),
+                                               maxOutFlowsPerPeer_, flowId);
+        if (flowSlot == common::collections::SlotPool::INVALID) return;
 
-        // Nested peer->flow, still under the peer's read lock so a concurrent
-        // sweep cannot free the slot mid-step.
-        OutFlowState* flow = reinterpret_cast<OutFlowState*>(
-            outFlowPool_.WriteLock(flowSlot));
-        if (flow->core.life == FlowLifecycle::OPENING && flow->core.flowId == flowId)
-        {
-            flow->core.life = FlowLifecycle::OPEN;
-            flow->core.attempts = 0;
-            flow->core.peerId = peer->id;
-
-            // Clamp to what the receiver can dedupe, never above our own ring.
-            // This is the number the send gate enforces.
-            flow->grantedWindow = grant < flow->inflightCap ? grant : flow->inflightCap;
-        }
-        outFlowPool_.UnlockWrite(flowSlot);
+        FailOutFlow(flowSlot, flowId, peer);
     }
 
     void Socket::Flow_Close(const Address& from, const uint8_t* payload, size_t len)
@@ -2746,6 +2642,76 @@ namespace bcp::flux
             refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
                 ? drained : refundTo->bytesInFlight;
         outFlowPool_.Release(flowSlot);
+    }
+
+    void Socket::FailOutFlow(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept
+    {
+        // FAILED, not freed: the app has a handle on this flow and has to be
+        // able to see what happened to it, so the slot stays leased until
+        // CloseFlow. Everything the flow was holding goes back now, though,
+        // because a dead flow pinning staging slots and congestion budget
+        // would tax every other flow to the same peer.
+        OutFlowState* flow = reinterpret_cast<OutFlowState*>(
+            outFlowPool_.WriteLock(flowSlot));
+
+        uint32_t drained = 0;
+        if (flow->core.flowId == flowId && flow->core.life != FlowLifecycle::CLOSED)
+        {
+            drained = DrainOutInflight(flow);
+            DrainOutWaiting(flow);
+            flow->core.life = FlowLifecycle::FAILED;
+        }
+        outFlowPool_.UnlockWrite(flowSlot);
+
+        if (refundTo && drained)
+            refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
+                ? drained : refundTo->bytesInFlight;
+    }
+
+    Socket::FlowAdmit Socket::AdmitInFlow(uint32_t peerSlot, const Address& from,
+                                          const BcpId& peerId, uint16_t flowId,
+                                          uint8_t flowData) noexcept
+    {
+        FlowDirEntry* dir = InFlowDirFor(peerSlot);
+        if (FindFlowSlot(dir, maxInFlowsPerPeer_, flowId)
+            != common::collections::SlotPool::INVALID)
+            return FlowAdmit::Existing;
+
+        FlowMode mode{};
+        uint32_t declaredWindow = 0;
+        if (!DecodeFlowData(flowData, mode, declaredWindow))
+            return FlowAdmit::Rejected;
+
+        // The declared window is what the sender will keep in flight, and the
+        // seen bitmap is what this socket can dedupe. Registering a flow wider
+        // than the bitmap would let a retransmit arrive older than anything
+        // still remembered, and the same message would be delivered twice.
+        if (declaredWindow > inWindowBits_)
+            return FlowAdmit::Rejected;
+
+        // This is the one path where a REMOTE makes this socket allocate, so
+        // it is caps-only: a dry pool or a full directory refuses, and the
+        // sender is told rather than left retransmitting into silence.
+        const uint32_t flowSlot = inFlowPool_.Acquire();
+        if (flowSlot == common::collections::SlotPool::INVALID)
+            return FlowAdmit::Rejected;
+
+        // Build, then publish: no lookup can reach a half-built flow.
+        {
+            InFlowState* flow = reinterpret_cast<InFlowState*>(
+                inFlowPool_.WriteLock(flowSlot));
+            ResetInFlow(flow, peerSlot, from, &peerId, flowId, mode,
+                        inWindowBits_, inReorderCap_);
+            inFlowPool_.UnlockWrite(flowSlot);
+        }
+        if (InsertFlowSlot(dir, maxInFlowsPerPeer_, flowId, flowSlot)
+            == maxInFlowsPerPeer_)
+        {
+            inFlowPool_.Release(flowSlot);
+            return FlowAdmit::Rejected;
+        }
+
+        return FlowAdmit::Registered;
     }
 
     uint32_t Socket::DrainOutInflight(OutFlowState* flow) noexcept
@@ -3283,46 +3249,32 @@ namespace bcp::flux
         }
     }
 
-    void Socket::RetryOpenClose(OutFlowState& flow, uint64_t now, bool& giveUp)
+    void Socket::RetryClose(OutFlowState& flow, uint64_t now, bool& giveUp)
     {
-        // OPENING / CLOSING lifecycle retry. When the retry interval has elapsed:
-        // OPENING gives up to FAILED (the app observes it); CLOSING gives up by
-        // asking the caller to finish the close locally (giveUp). Otherwise a
-        // retry is armed (attempts bumped, lastCtrlSentMicros stamped to `now`)
-        // and the caller reads the armed control back off the attempts bump.
+        // CLOSING is the only lifecycle still negotiated on the wire, so it is
+        // the only one with a retry. When the interval has elapsed: give up by
+        // asking the caller to finish the close locally (the remote is
+        // unreachable and the slot should stop being pinned), or arm a resend,
+        // which the caller reads back off the attempts bump.
         giveUp = false;
+        if (flow.core.life != FlowLifecycle::CLOSING)
+            return;
         if (now - flow.core.lastCtrlSentMicros < flowRetryIntervalMicros_)
             return;
 
-        switch (flow.core.life)
+        if (flow.core.attempts >= flowMaxAttempts_)
         {
-        case FlowLifecycle::OPENING:
-            if (flow.core.attempts >= flowMaxAttempts_)
-                flow.core.life = FlowLifecycle::FAILED;   // give up; app observes
-            else
-            {
-                ++flow.core.attempts;
-                flow.core.lastCtrlSentMicros = now;
-            }
-            break;
-
-        case FlowLifecycle::CLOSING:
-            if (flow.core.attempts >= flowMaxAttempts_)
-                giveUp = true;   // unreachable: stop pinning the slot
-            else
-            {
-                ++flow.core.attempts;
-                flow.core.lastCtrlSentMicros = now;
-            }
-            break;
-
-        default: break;
+            giveUp = true;
+            return;
         }
+
+        ++flow.core.attempts;
+        flow.core.lastCtrlSentMicros = now;
     }
 
     void Socket::RetransmitInflight(OutFlowState& flow, uint64_t now, CongestionDelta& delta,
                                      uint32_t* resendSeqs, uint32_t* resendSlots,
-                                     uint32_t& resendCount)
+                                     uint32_t& resendCount, bool& exhausted)
     {
         // Scan the in-flight ring for entries past their RTO. Reliable ones are
         // collected for retransmit (refresh sentAt, keep them in flight);
@@ -3348,12 +3300,24 @@ namespace bcp::flux
             else
             {
                 delta.sawLoss = true;   // reliable: trim the budget, keep it in flight
+
+                // Out of attempts: the remote has stopped answering this flow
+                // entirely. Retrying further only burns budget, so the caller
+                // fails the flow and the app reads it off the handle. This is
+                // the only give-up left now that opening takes no round trip.
+                if (entry.retries >= flowMaxAttempts_)
+                {
+                    exhausted = true;
+                    continue;
+                }
+
                 if (entry.packetSlot != common::collections::SlotPool::INVALID
                     && resendCount < RESENDS_PER_FLOW_PER_TICK)
                 {
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
                     entry.sentAtMicros = now;   // don't re-fire before next RTO
+                    ++entry.retries;
                 }
             }
         }
@@ -3370,10 +3334,9 @@ namespace bcp::flux
 
         // Gather what to do (and the peer materials) under the transferred
         // handle, then send after it drops: nothing locked across a send.
-        enum class Ctrl : uint8_t { None, ResendOpen, ResendClose } ctrl = Ctrl::None;
+        enum class Ctrl : uint8_t { None, ResendClose } ctrl = Ctrl::None;
+        bool exhausted = false;   // a reliable packet ran out of retransmits
         uint16_t flowId = 0;
-        FlowMode mode{};
-        uint16_t window = 0;
         uint32_t resendSlots[RESENDS_PER_FLOW_PER_TICK];
         uint32_t resendSeqs[RESENDS_PER_FLOW_PER_TICK];
         uint32_t resendN = 0;
@@ -3399,37 +3362,42 @@ namespace bcp::flux
             OutFlowState* flow = reinterpret_cast<OutFlowState*>(
                 outFlowPool_.WriteLock(flowSlot));
             flowId = flow->core.flowId;
-            mode   = flow->core.mode;
 
             const uint8_t attemptsBefore = flow->core.attempts;
             switch (flow->core.life)
             {
-            case FlowLifecycle::OPENING:
             case FlowLifecycle::CLOSING:
-                RetryOpenClose(*flow, now, finishClose);
+                RetryClose(*flow, now, finishClose);
                 break;
             case FlowLifecycle::OPEN:
-                RetransmitInflight(*flow, now, ccDelta, resendSeqs, resendSlots, resendN);
+                RetransmitInflight(*flow, now, ccDelta, resendSeqs, resendSlots, resendN,
+                                   exhausted);
                 break;
             default: break;
             }
 
-            // RetryOpenClose signals a control resend by bumping attempts while
-            // leaving the life unchanged (still OPENING / CLOSING). A give-up
-            // (FAILED / finishClose) never bumps attempts.
+            // RetryClose signals a resend by bumping attempts while leaving the
+            // life unchanged. A give-up (finishClose) never bumps attempts.
             if (!finishClose && flow->core.attempts > attemptsBefore)
+                ctrl = Ctrl::ResendClose;
+
+            outFlowPool_.UnlockWrite(flowSlot);
+
+            // A packet that ran out of retransmits means the remote stopped
+            // answering this flow: it is dead, and the app learns that from
+            // its handle. FailOutFlow gives back the rings and the congestion
+            // bytes, which is why it runs here, under the peer write lock it
+            // needs for the refund, and after the flow lock dropped so the two
+            // never nest the wrong way. Nothing else this pass matters once
+            // the flow is failed, so the resends are abandoned with it.
+            if (exhausted)
             {
-                if (flow->core.life == FlowLifecycle::OPENING)
+                if (Peer* dying = peerHandle.Write())
                 {
-                    ctrl   = Ctrl::ResendOpen;
-                    window = flow->inflightCap;
-                }
-                else if (flow->core.life == FlowLifecycle::CLOSING)
-                {
-                    ctrl = Ctrl::ResendClose;
+                    FailOutFlow(flowSlot, flowId, dying);
+                    return;
                 }
             }
-            outFlowPool_.UnlockWrite(flowSlot);
 
             // Local finish for a given-up close: unpublish then free, no wire
             // op. Upgrading to write revalidates on the other side of the gap
@@ -3493,17 +3461,7 @@ namespace bcp::flux
             common::crypto::Wipe(base.key.data(), base.key.size());
         }
 
-        if (ctrl == Ctrl::ResendOpen)
-        {
-            const uint8_t payload[5] = { static_cast<uint8_t>(flowId),
-                                         static_cast<uint8_t>(flowId >> 8),
-                                         static_cast<uint8_t>(mode),
-                                         static_cast<uint8_t>(window),
-                                         static_cast<uint8_t>(window >> 8) };
-            SendSecureControl(addr, ctrlMaterials, internal::SECURE_CHANNEL_FLOW_OPEN,
-                              payload, sizeof(payload));
-        }
-        else if (ctrl == Ctrl::ResendClose)
+        if (ctrl == Ctrl::ResendClose)
         {
             const uint8_t payload[2] = { static_cast<uint8_t>(flowId),
                                          static_cast<uint8_t>(flowId >> 8) };
@@ -3705,8 +3663,7 @@ namespace bcp::flux
                         if (dir[i].flowSlot == common::collections::SlotPool::INVALID) continue;
                         const OutFlowState* flow = reinterpret_cast<const OutFlowState*>(
                             outFlowPool_.ReadLock(dir[i].flowSlot));
-                        if (flow->core.life == FlowLifecycle::OPENING ||
-                            flow->core.life == FlowLifecycle::CLOSING)
+                        if (flow->core.life == FlowLifecycle::CLOSING)
                             consider(flow->core.lastCtrlSentMicros + flowRetryIntervalMicros_);
                         else if (flow->core.life == FlowLifecycle::OPEN && flow->unresolved > 0)
                         {

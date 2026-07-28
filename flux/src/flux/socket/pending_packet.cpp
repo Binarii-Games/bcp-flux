@@ -9,7 +9,8 @@ namespace bcp::flux::pending
 {
     using common::collections::SlotPool;
 
-    common::Error Push(SlotPool& pool, PeerHandle& peer, const PacketSlot& packet, bool requireAuth)
+    common::Error Push(SlotPool& pool, PeerHandle& peer, const PacketSlot& packet,
+                       bool requireAuth, bool retained)
     {
         if (packet.dataSize > internal::MAX_WIRE_PACKET_SIZE)
             return common::Error::PacketTooLarge;
@@ -26,6 +27,7 @@ namespace bcp::flux::pending
         assert(slot->active == 0);
         slot->next        = SlotPool::INVALID;
         slot->requireAuth = requireAuth ? 1 : 0;
+        slot->retained    = retained ? 1 : 0;
         slot->address     = packet.address;
         slot->dataSize    = packet.dataSize;
         std::memcpy(slot->data, packet.data, packet.dataSize);

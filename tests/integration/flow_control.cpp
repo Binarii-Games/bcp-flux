@@ -1,6 +1,6 @@
-// Reliable ordered flow, end to end over real UDP. A flow is opened with a wire
-// exchange (it sits OPENING until the remote acks), then a burst of numbered
-// packets is sent on it. A RELIABLE_ORDERED flow must deliver every one, in the
+// Reliable ordered flow, end to end over real UDP. A flow is opened locally,
+// with nothing on the wire, and the receiver registers its half from the first
+// packet that arrives; then a burst of numbered packets is sent on it. A RELIABLE_ORDERED flow must deliver every one, in the
 // order they were sent.
 //
 // Ordering is the whole point, so the test induces disorder: the burst is
@@ -139,21 +139,12 @@ static void reliable_ordered_flow_delivers_in_order()
     }
     CHECK(established);
 
-    // Open the flow and pump (still in order) until the server's ack makes it OPEN.
+    // Opening is local: the flow is OPEN and sendable the instant it exists,
+    // with nothing on the wire and nothing to wait for. The server has never
+    // heard of flow 7 and will register it from the first packet that arrives.
     flux::FlowHandle flow = client.OpenFlow(relayAddr, 7, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!flow.Failed());
-    bool open = false;
-    for (int i = 0; i < 300 && !open; ++i)
-    {
-        relay.Pump();
-        client.Poll(sink, 64);
-        server.Poll(sink, 64);
-        client.Update();
-        server.Update();
-        open = client.GetFlowState(flow) == flux::FlowLifecycle::OPEN;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK(open);
+    CHECK(client.GetFlowState(flow) == flux::FlowLifecycle::OPEN);
 
     // Now shuffle the wire, and send a numbered burst.
     relay.reorderActive = true;

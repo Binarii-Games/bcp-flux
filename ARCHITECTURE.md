@@ -605,21 +605,38 @@ connection across an address change the user made in order to break that link.
 
 #### Flows
 
-Opening is a wire exchange, so a fresh out-flow sits `OPENING` until the remote
-confirms and sends park meanwhile. Closing mirrors it. `FAILED` is terminal:
-retries ran out, and the slot waits for the application to observe the failure
-before being recycled. An in-flow skips `OPENING` and is born `OPEN`, because
-this side's ack is what clears the opener's `OPENING`.
+Opening is local and costs nothing on the wire. A flow is born `OPEN` and can
+be sent on the instant `OpenFlow` returns, including before the peer handshake
+has completed, and the receiver builds its half from whichever packet reaches
+it first. Closing is still a wire exchange. `FAILED` is terminal, reached when
+the remote rejects the flow or a packet exhausts its retransmits; the rings are
+drained and the congestion bytes refunded immediately, but the slot waits for
+the application to observe the failure through its handle before being
+recycled.
 
-`FLOW_OPEN` exchanges each side's window and both clamp to the minimum, so the
-sender's in-flight is bounded by what the receiver's bitmap can dedupe, whatever
-either socket's configuration claims.
+Every flow packet carries a flow data byte alongside the id and sequence: three
+bits of mode, five bits of window exponent. It rides every packet rather than
+only the first so that a lost or reordered opener costs nothing, and it is what
+registration reads. The receiver refuses a flow whose declared window exceeds
+its own seen bitmap, because a sender outrunning that bitmap could have a
+retransmit arrive older than anything still remembered and be delivered twice.
+
+Registration is caps-only: a dry pool, a full per-peer directory, or a window
+too wide yields `FLOW_REJECT`, and the sender fails that one flow rather than
+retransmitting into silence. Every other flow to the same peer is unaffected.
+This is the one path on which a remote makes this socket allocate, and it is
+reachable only after that peer completed a handshake.
 
 The per-peer flow directory is split in two so that "my flow 3 to you" and "your
 flow 3 to me" cannot collide. Which directory a message resolves against follows
-from who opened the flow: data, `FLOW_OPEN` and `FLOW_CLOSE` name the sender's
-out-flow and land in the in directory, while the `_ACK` replies answer our own
-opens and land in the out directory.
+from who opened the flow: data and `FLOW_CLOSE` name the sender's out-flow and
+land in the in directory, while `FLOW_REJECT` and `FLOW_CLOSE_ACK` answer our
+own flows and land in the out directory.
+
+A reliable flow's plaintext is its retransmit source and lives in the staging
+pool until its sequence resolves. That is why a packet parked behind an
+unfinished handshake records which pool it came from: the flush must put a
+retained body back into staging, since the in-flight ring releases it there.
 
 #### Congestion control
 

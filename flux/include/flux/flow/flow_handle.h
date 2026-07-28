@@ -26,12 +26,13 @@ namespace bcp::flux
         uint32_t slot_{UINT32_MAX};
         uint32_t epoch_{0};
         uint16_t flowId_{internal::INVALID_FLOW_ID};
+        uint8_t  flowData_{0};   ///< the wire byte: mode + window, fixed at open
         common::Error failReason_{common::Error::InvalidState};
 
     public:
         FlowHandle() = default;
-        FlowHandle(uint32_t slot, uint32_t epoch, uint16_t flowId)
-            : slot_(slot), epoch_(epoch), flowId_(flowId),
+        FlowHandle(uint32_t slot, uint32_t epoch, uint16_t flowId, uint8_t flowData)
+            : slot_(slot), epoch_(epoch), flowId_(flowId), flowData_(flowData),
               failReason_(common::Error::Ok) {}
         explicit FlowHandle(common::Error failReason)
             : failReason_(failReason) {}
@@ -50,6 +51,10 @@ namespace bcp::flux
         [[nodiscard]] common::Error FailReason() const { return failReason_; }
 
         [[nodiscard]] uint16_t Id() const { return flowId_; }
+        /** The encoded mode and window this flow declares on every packet.
+            Carried here because it is fixed for the flow's whole life, so the
+            builder can stamp it without taking the flow's lock. */
+        [[nodiscard]] uint8_t FlowData() const { return flowData_; }
         [[nodiscard]] uint32_t Slot() const { return slot_; }
         [[nodiscard]] uint32_t Epoch() const { return epoch_; }
 
@@ -57,6 +62,7 @@ namespace bcp::flux
         void Steal(FlowHandle& o) noexcept
         {
             slot_ = o.slot_; epoch_ = o.epoch_; flowId_ = o.flowId_;
+            flowData_ = o.flowData_;
             failReason_ = o.failReason_;
             o.slot_ = UINT32_MAX; o.epoch_ = 0;
             o.flowId_ = internal::INVALID_FLOW_ID;

@@ -80,15 +80,10 @@ int main()
 
     std::thread responder(Tick, std::ref(b));
 
+    // Local and immediate, same as the reliable case.
     flux::FlowHandle flow = a.OpenFlow(addrB, FLOW_ID, flux::FlowMode::UNRELIABLE);
 
     flux::PacketSlotHandle sink[8];
-    while (a.GetFlowState(flow) != flux::FlowLifecycle::OPEN)
-    {
-        a.Update();
-        a.Poll(sink, 8);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
 
     for (uint32_t seq = 0; seq < BURST; ++seq)
         a.BuildPacket().WithFlow(flow).PutU32(seq).Send(addrB);

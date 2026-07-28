@@ -22,20 +22,63 @@ namespace bcp::flux
         UNRELIABLE         = 2,  ///< numbered + acked for loss visibility, never retransmitted
     };
 
-    /** A flow's lifecycle. Opening a flow is a wire exchange (FLOW_OPEN /
-        FLOW_OPEN_ACK), so a fresh out-flow sits in OPENING until the remote
-        confirms; sends park meanwhile. Closing mirrors it. FAILED is terminal:
-        the open or close ran out of retries, and the slot waits for the app to
-        observe the failure before it is recycled. An in-flow skips OPENING; it
-        is born OPEN, because our ack clears the opener's OPENING.
+    /** The flow data byte, after the sequence number in every flow packet:
+        bits 0-2 the mode (values 3-7 reserved for modes to come), bits 3-7 the
+        window exponent, window = 16 << exponent, so 1 is 32 and 11 is 32768.
+
+        It rides every packet rather than only the first so the receiver can
+        register the flow from whichever packet arrives first: a lost or
+        reordered opener costs nothing. Encode returns 0, never a valid
+        encoding, when the mode or window cannot be expressed; Decode refuses
+        the same values coming in, because they arrive from the network. */
+    [[nodiscard]] inline uint8_t EncodeFlowData(FlowMode mode, uint32_t window) noexcept
+    {
+        if (static_cast<uint8_t>(mode) > 2)
+            return 0;
+
+        uint8_t exponent = 0;
+        for (uint8_t e = 1; e <= 11; ++e)
+        {
+            if (window == (16u << e))
+            {
+                exponent = e;
+                break;
+            }
+        }
+        if (exponent == 0)
+            return 0;
+
+        return static_cast<uint8_t>(static_cast<uint8_t>(mode) | (exponent << 3));
+    }
+
+    [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode,
+                                             uint32_t& outWindow) noexcept
+    {
+        const uint8_t modeBits = data & 0x07;
+        const uint8_t exponent = data >> 3;
+
+        if (modeBits > 2 || exponent < 1 || exponent > 11)
+            return false;
+
+        outMode   = static_cast<FlowMode>(modeBits);
+        outWindow = 16u << exponent;
+        return true;
+    }
+
+    /** A flow's lifecycle. A flow is born OPEN and usable immediately: opening
+        is local, and the remote registers its receiving side from whichever
+        data packet reaches it first. Closing is still a wire exchange. FAILED
+        is terminal, entered when the remote rejects the flow or a packet runs
+        out of retransmit attempts; the flow stops sending, its rings are
+        drained, and the slot waits for the app to observe the failure through
+        its handle before CloseFlow recycles it.
     */
     enum class FlowLifecycle : uint8_t
     {
-        OPENING = 0,
-        OPEN    = 1,
-        CLOSING = 2,
-        CLOSED  = 3,
-        FAILED  = 4,
+        OPEN    = 0,
+        CLOSING = 1,
+        CLOSED  = 2,
+        FAILED  = 3,
     };
 
     /** The identity and lifecycle every flow carries regardless of direction,
@@ -62,8 +105,8 @@ namespace bcp::flux
         FlowMode mode;
         FlowLifecycle life;
 
-        uint8_t  attempts;              ///< FLOW_OPEN / FLOW_CLOSE retries so far
-        uint64_t lastCtrlSentMicros;    ///< last open/close send, for retry pacing
+        uint8_t  attempts;              ///< FLOW_CLOSE retries so far
+        uint64_t lastCtrlSentMicros;    ///< last close send, for retry pacing
     };
 
     /** One packet this side sent and still awaits an ack for. Lives in the
@@ -84,6 +127,7 @@ namespace bcp::flux
         uint32_t seq;
         uint32_t packetSlot;
         uint16_t wireSize;     ///< budget spent on this packet, refunded on resolve
+        uint8_t  retries;      ///< retransmits so far; the give-up counter
     };
 
     /** One packet received ahead of order on a RELIABLE_ORDERED in-flow, held
@@ -133,9 +177,9 @@ namespace bcp::flux
         lock. The split lets the remote's opens be bounded and pooled
         independently of our own, and keeps "my flow 3 to you" and "your flow 3
         to me" from colliding: every message type resolves against one side
-        (data / FLOW_OPEN / FLOW_CLOSE name the sender's out-flow, so they land in
-        the IN directory; the _ACK replies answer our own opens, so they land in
-        the OUT directory). flowSlot == INVALID marks a free entry; pad is the
+        (data and FLOW_CLOSE name the sender's out-flow, so they land in the IN
+        directory; FLOW_REJECT and FLOW_CLOSE_ACK answer our own flows, so they
+        land in the OUT directory). flowSlot == INVALID marks a free entry; pad is the
         alignment gap, named and zeroed rather than implicit.
     */
     struct FlowDirEntry
@@ -162,21 +206,20 @@ namespace bcp::flux
         Seqs count packets ("the Nth packet of this flow") starting at 1; 0 is
         the never-sent sentinel, so a zeroed field reads as "nothing yet".
 
-        grantedWindow is the receiver's answer from the FLOW_OPEN handshake:
-        min(what we asked, what its bitmap covers). The flow keeps at most this
-        many packets unresolved; the clamp guarantees the receiver's dedupe
-        window can never be outrun, whatever either socket's config says. Always
-        <= inflightCap; 0 until the ack lands (no sends fly before OPEN anyway).
+        The flow keeps at most inflightCap packets unresolved, which is also
+        the window it declares on the wire: the receiver checks the declared
+        width against its own bitmap at registration and rejects a flow it
+        could not dedupe, so the window can never outrun the receiver's memory
+        whatever either socket's config says.
     */
     struct OutFlowState
     {
         FlowCore core;
 
         uint32_t nextSeq;
-        uint32_t grantedWindow;
 
         /** Packets stamped and not yet resolved (acked or declared lost). The
-            send gate: a stamp is refused while unresolved == grantedWindow,
+            send gate: a stamp is refused while unresolved == inflightCap,
             which enforces the receiver's grant. The ring's own wrap check bounds
             only inflightCap, which may be larger than what the receiver can
             dedupe.
