@@ -23,8 +23,8 @@ the job. "You are an idiot" is not.
 
 ## Scope
 
-Applies anywhere the project lives — issues, pull requests, discussions, commit
-messages — and to anyone representing the project elsewhere.
+Applies anywhere the project lives (issues, pull requests, discussions, commit
+messages) and to anyone representing the project elsewhere.
 
 ## Enforcement
 
