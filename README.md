@@ -1,80 +1,204 @@
-# openbcp
+# Flux
 
-The open networking libraries of BCP (Binarii Core Primitives). Independent
-C++20 libraries, each usable on its own. Two today, more as the project grows:
+A connectionless, encrypted UDP transport in C++20. There is no connection
+object, nothing allocates on the packet path, and one socket carries reliable
+and unreliable traffic at the same time.
 
-- **`flux`** is the transport. A connectionless, zero-alloc, encrypted UDP
-  protocol: handshake, secure packets, address migration, and reliable-ordered,
-  reliable-unordered and unreliable flows over one socket.
-- **`common`** is the systems primitives it is written with: error and result
-  types, lock-free collections, byte cursors, crypto, platform glue, logging,
-  math. Transport-agnostic by rule, so nothing in it knows what a packet is.
+Flux builds on `common`, a standalone systems library that knows nothing about
+transports, vendored in `external/common` at a pinned version. Monocypher is
+vendored the same way. Both are Apache-2.0.
 
-Cross-platform (Windows / Linux / macOS, x86-64 and arm64), no exceptions, no
-heap allocation on the packet path. Monocypher is vendored in `external/`.
-
-It is aimed at low-latency traffic where per-packet cost matters. Games,
-real-time systems, anything that would otherwise reach for raw UDP and rebuild
-reliability, encryption and connection handling by hand.
-
-> Status: pre-1.0, written and maintained by one person. The wire format and
-> API may still change, and issues and pull requests are read but not always
-> answered quickly.
-
-## What flux does
-
-- **No connect step.** The first send to an unknown address runs the handshake
-  and holds the message until the session is up, so that first message costs two
-  round trips before it lands. Everything after it goes straight out. There is
-  no connection object to manage and no callback to wait on.
-- **Encrypted by default.** XChaCha20-Poly1305 on every packet, with the nonce
-  counter masked so an observer cannot follow a peer by its packet sequence.
-  Plaintext is available as an explicit opt-out when you want it.
-- **Three delivery modes on one socket.** Reliable-ordered, reliable-unordered,
-  and unreliable. All three are numbered and acknowledged, so loss stays visible
-  to congestion control even when nothing is retransmitted.
-- **Flows are not tied to a peer.** One flow serves every address you send it
-  to, each target getting its own sequence, its own retransmits and its own
-  failures, so a dead peer never affects the others. Opening one is local and
-  puts nothing on the wire.
-- **Survives address changes.** A peer that moves keeps its session with no
-  re-handshake. The rotating tag identifying it is derived at both ends rather
-  than sent, so a move leaves nothing on the wire to follow.
-- **Identity by pinned certificate.** Trust comes from how a certificate was
-  delivered rather than from a signature chain, and the handshake proves the
-  peer owns the matching key.
-- **Owns no thread.** `Poll` and `Update` run on threads you choose, as often as
-  you choose. Both are safe to call concurrently.
-- **Stateless until proven.** The responder holds no state through the
-  handshake challenge, so an unverified peer costs it nothing to ignore.
-
-Missing so far, and worth knowing before you adopt it: path MTU discovery
-(packets are a conservative 1200 bytes), NAT traversal, session resumption (a
-peer whose session has been dropped pays the full handshake again, there is no
-0-RTT), and congestion control beyond plain AIMD.
-
-## Requirements
-
-- **CMake** 3.25 or newer
-- **A C++20 compiler**: MSVC, GCC, or Clang
-- **Ninja**, used in the commands below. Any CMake generator works.
+Windows, Linux and macOS, on x86-64 and arm64. No exceptions.
 
 ## Build
+
+CMake 3.25 or newer and a C++20 compiler (MSVC, GCC, or Clang). Ninja is used
+below, any generator works.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
+## Guide
+
+Everything below is running code, and the same steps live as full programs in
+[examples/](examples/).
+
+```cpp
+#include <flux/socket/socket.h>
+#include <flux/wire/packet_builder.h>
+
+namespace flux   = bcp::flux;
+namespace common = bcp::common;
+```
+
+### Create a socket
+
+Configure, then `Init`. Nothing allocates after this call.
+
+```cpp
+flux::Socket socket;
+
+flux::Socket::Config config;
+config.type = flux::Socket::BackendType::STD_UNX;   // STD_WIN on Windows, after WSAStartup
+config.port = 9500;
+
+if (socket.Init(config) != common::Error::Ok)
+    return 1;
+```
+
+### Run it
+
+Flux owns no thread, so the socket only works when you call it. `Update` runs
+the timers (acks, retransmits, handshake retries), `Poll` hands you what
+arrived. Call them from any threads, at any cadence, both are safe concurrently.
+
+```cpp
+flux::PacketSlotHandle inbox[8];
+
+for (;;)
+{
+    socket.Update();
+
+    const uint32_t count = socket.Poll(inbox, 8);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const flux::PacketSlot* packet  = inbox[i].Read();
+        const size_t            offset  = packet->ContentOffset();
+        const uint8_t*          payload = packet->Content(offset);
+        const size_t            length  = packet->dataSize - offset;
+        // read the payload here, the handle frees its slot when it dies
+    }
+}
+```
+
+The payload is never copied out. A handle points into the socket's receive
+pool and returns its slot when it goes out of scope.
+
+### Send
+
+There is no connect call. The first send to an address Flux has not seen runs
+the handshake and parks the message until the session is up, which costs two
+round trips. Everything after goes straight out, encrypted.
+
+```cpp
+const flux::Address addr = flux::Address::From("::1", 9501).Take();
+
+const uint8_t msg[] = "hello";
+socket.BuildPacket().NoFlow().PutBytes(msg, sizeof(msg) - 1).Send(addr);
+```
+
+`NoFlow` is fire-and-forget: no sequence, no ack, no retransmission, the
+cheapest thing Flux sends. Delivery guarantees come from flows, below.
+
+### Reply
+
+A received packet builds its own response, aimed at its sender. No address
+needed.
+
+```cpp
+inbox[i].PrepareResponse().NoFlow().PutBytes(msg, sizeof(msg) - 1).Respond();
+```
+
+### Open a flow
+
+A flow is a numbered channel with a delivery guarantee. Give the socket flow
+pools at `Init`:
+
+```cpp
+config.flows.outCount = 16;   // sending associations, socket-wide
+config.flows.inCount  = 16;   // receiving associations, socket-wide
+```
+
+`OpenFlow` is local. It puts nothing on the wire, and the flow is sendable the
+moment it returns, even before any handshake. The receiver needs no setup
+either, it registers the flow from the first packet that arrives.
+
+```cpp
+flux::FlowHandle flow = socket.OpenFlow(7, flux::FlowMode::RELIABLE_ORDERED);
+
+socket.BuildPacket().WithFlow(flow).PutU32(value).Send(addr);
+```
+
+Three modes:
+
+| Mode | Retransmitted | Delivered |
+|---|---|---|
+| `RELIABLE_ORDERED` | yes | in sequence, gaps held back until filled |
+| `RELIABLE_UNORDERED` | yes | on arrival |
+| `UNRELIABLE` | no | newest only, stale packets dropped |
+
+All three number and acknowledge every packet, so loss feeds congestion
+control even when nothing is resent.
+
+### One flow, many peers
+
+A flow is not bound to a peer. The same handle serves every address you send
+it to, and each target gets its own sequence, its own retransmits and its own
+failures, so a dead peer never affects the others.
+
+```cpp
+socket.BuildPacket().WithFlow(flow).PutU32(value).Send(addrB);
+socket.BuildPacket().WithFlow(flow).PutU32(value).Send(addrC);   // independent sequence
+```
+
+Closing is local too. It frees the flow and everything it held, and sends
+nothing:
+
+```cpp
+socket.CloseFlow(flow);
+```
+
+### Authenticated and plaintext sends
+
+`Send` is best-effort: encrypted always, authenticated when the peer is.
+`SendSecured` refuses any peer not authenticated against a pinned certificate,
+loaded with `socket.LoadCertificate(cert)`. `Unsecured` is the explicit opt-out
+that skips encryption entirely.
+
+```cpp
+socket.BuildPacket().NoFlow().PutBytes(msg, len).SendSecured(addr);
+socket.BuildPacket().Unsecured().NoFlow().PutBytes(msg, len).Send(addr);
+```
+
+## Underneath
+
+A session belongs to the peer, not its address. When a peer moves (NAT rebind,
+VPN reconnect, network handoff) the session continues with no re-handshake:
+secure packets carry a small rotating tag both ends derive from the session
+key, so a mover is recognised without any exchange. Rotating it unlinks a
+deliberate address change from everything sent before. Peers are named by
+`blake2b(publicKey)`, so proving the key proves the name and no registry is
+involved.
+
+Packets are little-endian and capped at 1200 bytes, under the IPv6 minimum MTU
+with margin for tunnels. Every secure packet is sealed with XChaCha20-Poly1305,
+and the nonce counter is masked so an observer cannot follow a peer by watching
+a serial number climb. Control packets are indistinguishable from data on the
+wire. The full layout is in [ARCHITECTURE.md](ARCHITECTURE.md), along with the
+entities, the ownership rules, and how many ways there are to do each thing.
+
+The wire format is not frozen before 1.0. It can change between versions, and a
+security fix is allowed to change it.
+
+Not there yet: path MTU discovery, NAT traversal, session resumption, and
+congestion control beyond AIMD. There is no 0-RTT. A certificate authenticates
+a peer, it does not shorten the handshake.
+
 ## Test
 
-The suite is split into three categories, one executable per file:
+Three categories, one executable per file:
 
 | Directory            | Runs                              | CTest label   |
 |----------------------|-----------------------------------|---------------|
 | `tests/unit/`        | data-structure integrity          | `unit`        |
 | `tests/integration/` | full processes and edge cases     | `integration` |
 | `tests/bench/`       | performance against a baseline    | `bench`       |
+
+Those cover Flux. The vendored `common` keeps its own under
+`external/common/tests/`, and they link `common` alone, so it is tested
+without the transport.
 
 ```sh
 # Fast suite, unit plus integration. This is the commit gate:
@@ -84,9 +208,10 @@ ctest --test-dir build -LE bench --output-on-failure
 ctest --test-dir build -L bench --output-on-failure
 ```
 
-Non-release builds are instrumented with **AddressSanitizer + UndefinedBehaviorSanitizer**
-by default. To run the concurrency tests under **ThreadSanitizer** instead
-(mutually exclusive with ASan), configure a separate build:
+Non-release builds are instrumented with AddressSanitizer and
+UndefinedBehaviorSanitizer by default. To run the concurrency tests under
+ThreadSanitizer instead (mutually exclusive with ASan), configure a separate
+build:
 
 ```sh
 cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBCP_SANITIZE=thread
@@ -102,20 +227,17 @@ binaries that fail to start.
 ## Layout
 
 ```
-common/    include/ + src/     systems primitives
 flux/      include/ + src/     the transport
-examples/  runnable programs written against the public API
-external/  monocypher/         vendored crypto (BSD-2-Clause OR CC0-1.0)
 tests/     unit/ integration/ bench/ + shared harnesses
+examples/  runnable programs written against the public API
+external/  common/             standalone systems library, vendored, own tests
+           monocypher/         vendored crypto (BSD-2-Clause OR CC0-1.0)
 ```
 
-[ARCHITECTURE.md](ARCHITECTURE.md) covers the entities, the ownership rules, the
-wire format, and how many ways there are to do each thing.
+## Examples
 
-## Try it
-
-Each example is one file running several sockets in one process, built with
-everything else:
+One file each, running several sockets in one process, built with everything
+else:
 
 ```sh
 ./build/send_and_respond          # A sends, B answers
@@ -125,29 +247,25 @@ everything else:
 ./build/unreliable_flow           # the same burst on an UNRELIABLE flow
 ```
 
-There is no connect step. The first send to an address Flux has not seen starts
-the handshake and holds the message until the session is up. See
-[examples/](examples/).
-
 ## Benchmarks
 
 What one packet costs, measured on an Apple M3 Max, Release, clang 22. These run
 over loopback, so treat the absolute times as machine-specific. The deltas are
 the useful part.
 
-**Send path.** Flux against the bare `sendto()` syscall underneath it, median of
+Send path, Flux against the bare `sendto()` syscall underneath it, median of
 30,000 sends per variant, interleaved so all three see the same machine state:
 
 | payload | bare `sendto` | + Flux framing | + AEAD seal |
 |---|---|---|---|
-| 64 B | 2792 ns | **+125 ns** | +583 ns |
-| 1024 B | 2875 ns | **+167 ns** | +2875 ns |
+| 64 B | 2792 ns | +125 ns | +583 ns |
+| 1024 B | 2875 ns | +167 ns | +2875 ns |
 
 Framing costs about 5% over the raw syscall. Everything else is the encryption,
 which scales with payload and is the same cost any encrypted transport pays.
 
-**Encryption alone**, with no sockets involved. XChaCha20-Poly1305 through
-vendored Monocypher:
+Encryption alone, no sockets involved. XChaCha20-Poly1305 through vendored
+Monocypher:
 
 | payload | encrypt | decrypt + verify |
 |---|---|---|
@@ -155,9 +273,8 @@ vendored Monocypher:
 | 256 B | 661 ns | 668 ns |
 | 1200 B | 2254 ns | 2252 ns |
 
-Portable C, so roughly 0.5 GB/s. That is the ceiling on a full-size packet
-today, and swapping in a SIMD implementation is the lever if it ever needs
-lifting.
+Monocypher is portable C with no SIMD, so encryption tops out around 0.5 GB/s.
+A SIMD implementation would raise that if it ever matters.
 
 Run them on a Release build with `ctest --test-dir build -L bench`. They print
 numbers and always exit 0.
@@ -166,7 +283,7 @@ numbers and always exit 0.
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-`flux` and `common` stay Apache-2.0. Binarii Games sells products built on these
+Flux and `common` stay Apache-2.0. Binarii Games sells products built on these
 libraries. A paid tier means extra code in that tier, not features taken out of
 here.
 
