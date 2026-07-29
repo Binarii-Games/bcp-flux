@@ -91,11 +91,7 @@ namespace bcp::flux::wire
         if (!WriteCommonHeader(writer, true, tagged_, true))
             return PacketContentStage(common::Error::BufferFull);
 
-        // The id, sequence and data byte follow the channel byte. Id and data
-        // are known now; the sequence number is assigned at send time, under
-        // the flow's lock, so packets leave in the order their numbers were
-        // handed out. The data byte rides every packet so the receiver can
-        // register this flow from whichever one reaches it first.
+        // PutU32(0) reserves the sequence bytes; PreProcessOut stamps them.
         if (!writer.PutU16(flow.Id()) || !writer.PutU32(0) || !writer.PutU8(flow.FlowData()))
             return PacketContentStage(common::Error::BufferFull);
 
