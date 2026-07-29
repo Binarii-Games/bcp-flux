@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(openbcp VERSION 0.1.0 LANGUAGES C CXX)
+project(flux VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -98,23 +98,26 @@ add_library(monocypher STATIC external/monocypher/monocypher.c)
 target_include_directories(monocypher PUBLIC external/monocypher)
 
 # --------------------------------------------------------
-# common — the generic, transport-agnostic floor
+# common - a standalone library, vendored in external/ the same way monocypher
+# is. The copy here is a pinned snapshot that flux re-vendors when it wants a
+# newer version, so a change to common does not reach flux until flux chooses
+# to take it.
 # --------------------------------------------------------
 add_library(common STATIC)
 
-file(GLOB_RECURSE COMMON_HEADERS CONFIGURE_DEPENDS "common/include/*.h")
-file(GLOB_RECURSE COMMON_SOURCES CONFIGURE_DEPENDS "common/src/*.cpp")
+file(GLOB_RECURSE COMMON_HEADERS CONFIGURE_DEPENDS "external/common/include/*.h")
+file(GLOB_RECURSE COMMON_SOURCES CONFIGURE_DEPENDS "external/common/src/*.cpp")
 target_sources(common PRIVATE ${COMMON_HEADERS} ${COMMON_SOURCES})
 
 target_include_directories(common
-    PUBLIC  common/include
-    PRIVATE common/src
+    PUBLIC  external/common/include
+    PRIVATE external/common/src
 )
 
-# crypto.h is a HEADER-ONLY wrapper (all functions inline) in common/include
-# that calls monocypher + BCryptGenRandom directly in the header. Those symbols
-# are therefore instantiated in EVERY consumer's TU, not inside common's .cpp,
-# so the deps must be PUBLIC to propagate down the link graph.
+# crypto.h is a HEADER-ONLY wrapper (all functions inline) that calls monocypher
+# + BCryptGenRandom directly in the header. Those symbols are therefore
+# instantiated in EVERY consumer's TU, not inside common's .cpp, so the deps
+# must be PUBLIC to propagate down the link graph.
 
 # monocypher: crypto.h calls crypto_* inline -> consumers need it -> PUBLIC.
 target_link_libraries(common PUBLIC monocypher)
@@ -178,30 +181,37 @@ endif()
 # Tests — one plain executable per .cpp, registered with CTest and sanitized
 # like everything else. Three categories, split by directory:
 #
-#   tests/unit/         data-structure integrity          label: unit
-#   tests/integration/  full processes and edge cases      label: integration
-#   tests/bench/        performance against a baseline      label: bench
+#   unit/         data-structure integrity          label: unit
+#   integration/  full processes and edge cases      label: integration
+#   bench/        performance against a baseline      label: bench
 #
 # Fast CI runs unit + integration on every commit:  ctest -LE bench
 # The benches are heavier and run on demand or nightly:  ctest -L bench
 #
-# Serial on purpose: the socket tests bind real UDP ports. Every test includes
-# "harness.h" (or "bench_harness.h") from tests/, so that dir is on the path.
+# Each library owns its tests: flux's are in tests/, the vendored common's
+# travel with it in external/common/tests/ and link common alone, which is what
+# keeps the floor provably free of flux. Each tree carries the harness header
+# its tests include, so common stays buildable outside this repo.
+#
+# Serial on purpose: the socket tests bind real UDP ports.
 # --------------------------------------------------------
 enable_testing()
 
-function(register_tests glob label timeout)
+function(register_tests glob label timeout link_target harness_dir)
     file(GLOB test_sources CONFIGURE_DEPENDS "${glob}")
     foreach(test_src ${test_sources})
         get_filename_component(test_name ${test_src} NAME_WE)
         add_executable(${test_name} ${test_src})
-        target_link_libraries(${test_name} PRIVATE flux)
-        target_include_directories(${test_name} PRIVATE tests)
+        target_link_libraries(${test_name} PRIVATE ${link_target})
+        target_include_directories(${test_name} PRIVATE ${harness_dir})
         add_test(NAME ${test_name} COMMAND ${test_name})
         set_tests_properties(${test_name} PROPERTIES LABELS ${label} TIMEOUT ${timeout})
     endforeach()
 endfunction()
 
-register_tests("tests/unit/*.cpp"        unit        240)
-register_tests("tests/integration/*.cpp" integration 240)
-register_tests("tests/bench/*.cpp"       bench       600)
+register_tests("tests/unit/*.cpp"        unit        240 flux tests)
+register_tests("tests/integration/*.cpp" integration 240 flux tests)
+register_tests("tests/bench/*.cpp"       bench       600 flux tests)
+
+register_tests("external/common/tests/unit/*.cpp"  unit  240 common external/common/tests)
+register_tests("external/common/tests/bench/*.cpp" bench 600 common external/common/tests)
