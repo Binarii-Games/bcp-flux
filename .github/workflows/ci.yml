@@ -31,12 +31,12 @@ jobs:
           - name: debian-12
             os: ubuntu-latest
             container: debian:12
-            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y g++ cmake make git
+            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y g++ cmake make git libubsan1
             cmake: -DBCP_SANITIZE=undefined
           - name: rocky-9
             os: ubuntu-latest
             container: rockylinux:9
-            setup: dnf install -y gcc-c++ cmake make git
+            setup: dnf install -y gcc-c++ cmake make git libubsan
             cmake: -DBCP_SANITIZE=undefined
           - name: macos
             os: macos-latest
