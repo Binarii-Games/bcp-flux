@@ -119,9 +119,7 @@ namespace bcp::flux
             assoc->flowSlot   = common::collections::SlotPool::INVALID;
             assoc->nextInFlow = common::collections::SlotPool::INVALID;
             assoc->flowId     = flowId;
-            assoc->window     = inflightCap;
             assoc->mode       = mode;
-            assoc->flowData   = 0;   // stamped by the caller, which holds the flow
             assoc->epoch      = assoc->epoch + 1;
             assoc->life       = FlowLifecycle::OPEN;
             assoc->attempts   = 0;
@@ -824,8 +822,7 @@ namespace bcp::flux
         flow.nextSeq = seq + 1;
         if (flow.nextSeq == 0) flow.nextSeq = 1;   // 0 is the never-sent sentinel
 
-        // Measured forward from the flow header, not backward from the
-        // payload: the sequence is no longer the last field of the header.
+        // Forward from the flow header: the sequence is not the last field.
         uint8_t* seqField = packet.data + packet.FlowHeaderOffset()
                           + internal::WIRE_FLOW_ID_SIZE;
         seqField[0] = static_cast<uint8_t>(seq >> 0);
@@ -848,13 +845,7 @@ namespace bcp::flux
         flow.waitingCount += 1;
     }
 
-    /** Decides and mutates under peer-write plus flow-write: stamp on a pass,
-        route to the waiting ring on a refusal. Sequence numbers are handed out
-        in the order packets actually leave, so a non-empty ring forces even a
-        passing packet to queue; stamping it now would give newer data a lower
-        seq than the packets in front of it.
-
-        @pre Caller holds the peer write lock (the peer is lent in). */
+    /** @pre Caller holds the peer write lock; the peer is lent in. */
     uint32_t Socket::CreateAssociation(const Peer& peer, uint32_t peerSlot,
                                        uint16_t flowId) noexcept
     {
@@ -863,14 +854,12 @@ namespace bcp::flux
             return common::collections::SlotPool::INVALID;   // no such flow open here
 
         FlowMode mode{};
-        uint16_t window   = 0;
-        uint8_t  flowData = 0;
+        uint16_t window = 0;
         {
             const Flow* flow = reinterpret_cast<const Flow*>(flowPool_.ReadLock(flowSlot));
             const bool open = flow->life == FlowLifecycle::OPEN;
-            mode     = flow->mode;
-            window   = flow->window;
-            flowData = flow->flowData;
+            mode   = flow->mode;
+            window = flow->window;
             flowPool_.UnlockRead(flowSlot);
             if (!open)
                 return common::collections::SlotPool::INVALID;
@@ -881,9 +870,8 @@ namespace bcp::flux
             return common::collections::SlotPool::INVALID;
 
         // Build, then publish, so no lookup reaches a half-built association.
-        // mode, window and the wire byte are copied once here and never read
-        // from the flow again; that is what keeps the packet paths one lock
-        // deep.
+        // mode is copied once here and never read from the flow again, which is
+        // what keeps the packet paths one lock deep.
         {
             OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
                 outAssocPool_.WriteLock(assocSlot));
@@ -891,7 +879,6 @@ namespace bcp::flux
                          window,
                          mode == FlowMode::UNRELIABLE ? outUnreliableWaitCap_
                                                       : outReliableWaitCap_);
-            assoc->flowData   = flowData;
             assoc->flowSlot   = common::collections::SlotPool::INVALID;
             assoc->nextInFlow = common::collections::SlotPool::INVALID;
             outAssocPool_.UnlockWrite(assocSlot);
@@ -908,6 +895,13 @@ namespace bcp::flux
         return assocSlot;
     }
 
+    /** Decides and mutates under peer-write plus association-write: stamp on a
+        pass, route to the waiting ring on a refusal. Sequence numbers are handed
+        out in the order packets actually leave, so a non-empty ring forces even
+        a passing packet to queue; stamping it now would give newer data a lower
+        seq than the packets in front of it.
+
+        @pre Caller holds the peer write lock; the peer is lent in. */
     SendAdmission Socket::AdmitFlowPacket(Peer& peer, uint32_t peerSlot, PacketSlot& packet,
                                            uint32_t packetSlot, uint16_t wireSize)
     {
@@ -917,37 +911,38 @@ namespace bcp::flux
         const uint16_t flowId = packet.FlowId();
         if (flowId == internal::INVALID_FLOW_ID) return SendAdmission::Dead;
 
-        uint32_t flowSlot = FindFlowSlot(OutAssocDirFor(peerSlot),
+        uint32_t assocSlot = FindFlowSlot(OutAssocDirFor(peerSlot),
                                          maxOutAssocPerPeer_, flowId);
-        if (flowSlot == common::collections::SlotPool::INVALID)
+        if (assocSlot == common::collections::SlotPool::INVALID)
         {
             // First send to this peer: OpenFlow knew no address, so the
             // association is created here.
-            flowSlot = CreateAssociation(peer, peerSlot, flowId);
-            if (flowSlot == common::collections::SlotPool::INVALID)
+            assocSlot = CreateAssociation(peer, peerSlot, flowId);
+            if (assocSlot == common::collections::SlotPool::INVALID)
                 return SendAdmission::Dead;
         }
 
-        OutAssociation* flow = reinterpret_cast<OutAssociation*>(outAssocPool_.WriteLock(flowSlot));
+        OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
+            outAssocPool_.WriteLock(assocSlot));
         SendAdmission result;
-        if (flow->life != FlowLifecycle::OPEN || flow->flowId != flowId)
+        if (assoc->life != FlowLifecycle::OPEN || assoc->flowId != flowId)
         {
             result = SendAdmission::Dead;
         }
         else
         {
-            const bool unreliable = flow->mode == FlowMode::UNRELIABLE;
-            if (flow->waitingCount == 0 && CanSend(*flow, peer, wireSize, !unreliable))
+            const bool unreliable = assoc->mode == FlowMode::UNRELIABLE;
+            if (assoc->waitingCount == 0 && CanSend(*assoc, peer, wireSize, !unreliable))
             {
-                StampFlowPacket(*flow, peer, packet,
+                StampFlowPacket(*assoc, peer, packet,
                                 unreliable ? common::collections::SlotPool::INVALID
                                            : packetSlot,
                                 wireSize);
                 result = SendAdmission::Sent;
             }
-            else if (flow->waitingCount < flow->waitingCap)
+            else if (assoc->waitingCount < assoc->waitingCap)
             {
-                EnqueueWaiting(*flow, packetSlot, wireSize);
+                EnqueueWaiting(*assoc, packetSlot, wireSize);
                 result = SendAdmission::Queued;
             }
             else if (!unreliable)
@@ -956,17 +951,17 @@ namespace bcp::flux
                 // the NEWEST send is refused, the app's backpressure signal.
                 result = SendAdmission::Rejected;
             }
-            else if (flow->waitingCap > 0)
+            else if (assoc->waitingCap > 0)
             {
                 // Unreliable seats the newest by evicting the oldest waiter;
                 // never retransmitted, so nothing downstream misses the slot.
                 WaitingEntry& oldest =
-                    flow->Waiting()[flow->waitingHead & (flow->waitingCap - 1u)];
+                    assoc->Waiting()[assoc->waitingHead & (assoc->waitingCap - 1u)];
                 sendPool_->Release(oldest.packetSlot);
                 oldest = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };
-                flow->waitingHead  += 1;
-                flow->waitingCount -= 1;
-                EnqueueWaiting(*flow, packetSlot, wireSize);
+                assoc->waitingHead  += 1;
+                assoc->waitingCount -= 1;
+                EnqueueWaiting(*assoc, packetSlot, wireSize);
                 result = SendAdmission::Queued;
             }
             else
@@ -974,7 +969,7 @@ namespace bcp::flux
                 result = SendAdmission::Dropped;   // no buffer configured
             }
         }
-        outAssocPool_.UnlockWrite(flowSlot);
+        outAssocPool_.UnlockWrite(assocSlot);
         return result;
     }
 
@@ -3414,8 +3409,6 @@ namespace bcp::flux
         // collected for retransmit (refresh sentAt, keep them in flight);
         // unreliable ones are declared lost and resolved. Loss feedback goes into
         // `delta`, never the peer: the caller applies it under the peer lock.
-        constexpr uint32_t RESENDS_PER_FLOW_PER_TICK = 16;
-
         const uint64_t rto  = RetransmitTimeout(&flow, flowRetryIntervalMicros_);
         const uint32_t cap  = flow.inflightCap;
         const FlowMode mode = flow.mode;
@@ -3446,7 +3439,7 @@ namespace bcp::flux
                 }
 
                 if (entry.packetSlot != common::collections::SlotPool::INVALID
-                    && resendCount < RESENDS_PER_FLOW_PER_TICK)
+                    && resendCount < RESENDS_PER_ASSOC_PER_TICK)
                 {
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
@@ -3464,15 +3457,14 @@ namespace bcp::flux
         // through an Update pass fires now, not a tick late.
         const uint64_t now = Now(nowOverride);
 
-        constexpr uint32_t RESENDS_PER_FLOW_PER_TICK = 16;
 
         // Gather what to do (and the peer materials) under the transferred
         // handle, then send after it drops: nothing locked across a send.
         enum class Ctrl : uint8_t { None, ResendClose } ctrl = Ctrl::None;
         bool exhausted = false;   // a reliable packet ran out of retransmits
         uint16_t flowId = 0;
-        uint32_t resendSlots[RESENDS_PER_FLOW_PER_TICK];
-        uint32_t resendSeqs[RESENDS_PER_FLOW_PER_TICK];
+        uint32_t resendSlots[RESENDS_PER_ASSOC_PER_TICK];
+        uint32_t resendSeqs[RESENDS_PER_ASSOC_PER_TICK];
         uint32_t resendN = 0;
         bool finishClose = false;   // CLOSING gave up: unpublish + free locally
 
@@ -3481,7 +3473,7 @@ namespace bcp::flux
         // One control materials + one per resend, each carrying its own fresh
         // counter; built under the peer write lock, sent (and wiped) after it drops.
         PeerSendMaterials ctrlMaterials;
-        PeerSendMaterials resendMaterials[RESENDS_PER_FLOW_PER_TICK];
+        PeerSendMaterials resendMaterials[RESENDS_PER_ASSOC_PER_TICK];
 
         uint32_t flowSlot = common::collections::SlotPool::INVALID;
         {

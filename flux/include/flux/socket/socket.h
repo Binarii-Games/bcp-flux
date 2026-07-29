@@ -1,20 +1,16 @@
 #pragma once
 
-// Socket, the connectionless, zero-alloc, encrypted transport. Uniform
-// behaviour and lock discipline throughout; the structure keeps each concern
-// legible:
-//   - the seal (encrypt/decrypt) lives in ONE place, not six copies;
-//   - session materials travel as a PeerSendMaterials value, not 8 loose args;
-//   - the god-functions (PreProcessOut, TryMigrate, Handshake_Validate,
-//     UpdateOutFlow, ProcessFlowIn, Init) are thin dispatchers over named
-//     helpers, none more than a couple of levels deep;
-//   - the send gate is a decision (CanSend) then a mutation (StampFlowPacket),
-//     returning a status the caller switches on; the congestion budget gates
-//     it, and refused packets wait on per-flow rings drained oldest-first by
-//     the tick.
-// It stays ONE class: a flow/CC engine would own storage but not the peer
-// state its operations mutate (lines saved, clarity lost), so it fails the
-// "do not over-abstract" bar. See ARCHITECTURE.md.
+// Socket: the connectionless, zero-alloc, encrypted transport.
+//
+// One seal and one open serve every secure packet. Session materials travel as
+// a PeerSendMaterials value, gathered under the peer lock and carried past it,
+// so no lock is held across an encrypt or a send. The send gate is a predicate
+// (CanSend) followed by a mutation (StampFlowPacket), and a packet the budget
+// refuses waits on its association's ring until the tick drains it oldest
+// first.
+//
+// Flows and peers are separate: a flow is what the application opens, an
+// association is what a flow keeps with one peer. See ARCHITECTURE.md.
 
 #include <cstdint>
 #include <cstddef>
@@ -119,6 +115,11 @@ namespace bcp::flux
 
     public:
         static constexpr uint32_t MAX_PACKET_SLOTS = 2048;
+
+        /** Retransmits one association contributes to one tick. RetransmitInflight
+            fills the caller's arrays up to this, and UpdateOutFlow sizes them by
+            it, so the two must be one number. */
+        static constexpr uint32_t RESENDS_PER_ASSOC_PER_TICK = 16;
 
         enum class BackendType : uint8_t
         {
@@ -336,9 +337,8 @@ namespace bcp::flux
             InvalidState on a stale handle or one already closing. */
         [[nodiscard]] common::Error CloseFlow(const FlowHandle& flow);
 
-        /** Where the flow stands. CLOSED for a stale handle (epoch check). */
         /** The flow's own state: OPEN until closed, whatever any one target is
-            doing. */
+            doing. CLOSED for a stale handle. */
         [[nodiscard]] FlowLifecycle GetFlowState(const FlowHandle& flow);
 
         /** This flow's state with ONE peer, which is where failure lives. A
@@ -506,7 +506,7 @@ namespace bcp::flux
 
         /** The send gate as decision-then-mutation. CanSend is a pure predicate
             over the (already-locked) flow and peer: ring slot free, unresolved
-            < grantedWindow (reliable only), and the peer's congestion budget
+            < inflightCap (reliable only), and the peer's congestion budget
             covers wireSize. A caller it passes runs to the wire without
             re-checking. StampFlowPacket assumes it passed and only mutates:
             assign seq, take the ring entry, spend bytesInFlight, write the seq.

@@ -13,10 +13,10 @@
 // flow serves every peer it is sent to, and the first packet to each address
 // creates that peer's association.
 //
-// Everything a packet path reads per packet lives on the association. Mode,
-// window and the wire byte are copied there at creation rather than read back
-// from the flow: they never change, and reaching the flow would mean a second
-// lock on the send gate, the waiting drain and the retransmit scan.
+// Everything a packet path reads per packet lives on the association. Mode is
+// copied there at creation rather than read back from the flow: it never
+// changes, and reaching the flow would mean a second lock on the send gate,
+// the waiting drain and the retransmit scan.
 
 namespace bcp::flux
 {
@@ -195,11 +195,11 @@ namespace bcp::flux
         uint32_t flowSlot;
         uint32_t nextInFlow;
 
-        // Copied from the flow at creation, immutable after.
+        // Copied from the flow at creation, immutable after. mode is read for
+        // every packet by the send gate, the drain and the retransmit scan, so
+        // it lives here rather than behind a second lock on the flow.
         uint16_t flowId;
-        uint16_t window;
         FlowMode mode;
-        uint8_t  flowData;
 
         uint32_t epoch;         ///< revalidates the drain's peek against its claim
         FlowLifecycle life;     ///< per target: FAILED here leaves the flow open
@@ -283,7 +283,7 @@ namespace bcp::flux
         uint32_t newSinceFlush; ///< seqs first seen since the last ack; 0 means none owed
 
         /** When this association first owed an ack. The deadline is this plus
-            Config::flowAckDelay, and 0 means nothing is owed. */
+            Config::timers::ackDelayMicros; 0 means nothing is owed. */
         uint64_t ackArmedMicros;
 
         uint16_t windowBits;    ///< seen-bitmap width, from the declared window

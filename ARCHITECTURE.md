@@ -491,7 +491,7 @@ against a trusted certificate.
 
 The gate is split into a decision and a mutation. `CanSend` is a pure predicate
 over the already-locked flow and peer: is a ring slot free, is
-`unresolved < grantedWindow` (reliable only), does the peer's congestion budget
+`unresolved < inflightCap` (reliable only), does the peer's congestion budget
 cover this packet. `StampFlowPacket` assumes the predicate passed and only
 mutates: assign the sequence number, take the ring entry, spend the budget,
 write the seq.
