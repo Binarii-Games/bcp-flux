@@ -8,29 +8,49 @@
 #include <flux/internal/constants.h>
 #include <flux/peer/peer_id.h>
 
+// A flow is what the application opens; an association is the state a flow
+// keeps with one peer. OpenFlow creates the flow and takes no address, so one
+// flow serves every peer it is sent to, and the first packet to each address
+// creates that peer's association.
+//
+// Everything a packet path reads per packet lives on the association. Mode,
+// window and the wire byte are copied there at creation rather than read back
+// from the flow: they never change, and reaching the flow would mean a second
+// lock on the send gate, the waiting drain and the retransmit scan.
+
 namespace bcp::flux
 {
-    /** What the flow type controls: whether lost data is retransmitted, and
-        whether delivery waits for order. Every flow packet is numbered and
-        acknowledged regardless of mode. UNRELIABLE means never retransmitted,
-        not invisible to the transport.
-    */
+    /** Whether lost data is retransmitted, and whether delivery waits for
+        order. Every flow packet is numbered and acknowledged whatever the mode,
+        so UNRELIABLE means never resent, not invisible to congestion control. */
     enum class FlowMode : uint8_t
     {
-        RELIABLE_ORDERED   = 0,  ///< sequenced byte-stream: retransmit, deliver in order
-        RELIABLE_UNORDERED = 1,  ///< independent messages: retransmit, deliver on arrival
-        UNRELIABLE         = 2,  ///< numbered + acked for loss visibility, never retransmitted
+        RELIABLE_ORDERED   = 0,
+        RELIABLE_UNORDERED = 1,
+        UNRELIABLE         = 2,
     };
 
-    /** The flow data byte, after the sequence number in every flow packet:
-        bits 0-2 the mode (values 3-7 reserved for modes to come), bits 3-7 the
-        window exponent, window = 16 << exponent, so 1 is 32 and 11 is 32768.
+    /** Lifecycle, used at both scopes with different meanings. A flow is OPEN
+        until the application closes it. An association is OPEN until that one
+        target rejects it or stops answering, and FAILED there leaves the flow
+        open for every other peer. */
+    enum class FlowLifecycle : uint8_t
+    {
+        OPEN    = 0,
+        CLOSING = 1,
+        CLOSED  = 2,
+        FAILED  = 3,
+    };
 
-        It rides every packet rather than only the first so the receiver can
-        register the flow from whichever packet arrives first: a lost or
-        reordered opener costs nothing. Encode returns 0, never a valid
-        encoding, when the mode or window cannot be expressed; Decode refuses
-        the same values coming in, because they arrive from the network. */
+    /** The flow data byte carried after the sequence in every flow packet:
+        mode in bits 0-2 (3-7 reserved), window exponent in bits 3-7, where
+        window = 16 << exponent.
+
+        It rides every packet, not just the first, so a receiver can register
+        the flow from whichever packet arrives first.
+
+        @return 0 when the mode or window cannot be encoded. 0 is never a valid
+                encoding, so it doubles as the failure value. */
     [[nodiscard]] inline uint8_t EncodeFlowData(FlowMode mode, uint32_t window) noexcept
     {
         if (static_cast<uint8_t>(mode) > 2)
@@ -51,6 +71,8 @@ namespace bcp::flux
         return static_cast<uint8_t>(static_cast<uint8_t>(mode) | (exponent << 3));
     }
 
+    /** Reads a flow data byte off the wire. Refuses reserved modes and window
+        exponents out of range, because this input is attacker-chosen. */
     [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode,
                                              uint32_t& outWindow) noexcept
     {
@@ -65,125 +87,51 @@ namespace bcp::flux
         return true;
     }
 
-    /** A flow's lifecycle. A flow is born OPEN and usable immediately: opening
-        is local, and the remote registers its receiving side from whichever
-        data packet reaches it first. Closing is still a wire exchange. FAILED
-        is terminal, entered when the remote rejects the flow or a packet runs
-        out of retransmit attempts; the flow stops sending, its rings are
-        drained, and the slot waits for the app to observe the failure through
-        its handle before CloseFlow recycles it.
-    */
-    enum class FlowLifecycle : uint8_t
-    {
-        OPEN    = 0,
-        CLOSING = 1,
-        CLOSED  = 2,
-        FAILED  = 3,
-    };
-
-    /** A flow the application opened: what it IS, independent of who it talks
-        to. One per OpenFlow, socket-wide, and what a FlowHandle points at.
-
-        A flow is not bound to a peer. Sending on it to an address creates an
-        association for that (flow, peer) pair on first use, and the flow keeps
-        a list of them so closing it can reach every one. Talking to fifty
-        peers is one flow and fifty associations, each numbering its own
-        sequences, so a slow peer never stalls the others.
-
-        mode, window and the encoded wire byte are copied into every
-        association at creation. That is deliberate duplication of immutable
-        values, not state to keep in sync: the send gate, the waiting-ring
-        drain and the retransmit scan all read them per packet, and reaching
-        back here would mean a second lock on the packet path purely to answer
-        "is this reliable?". The receiving side already does the same, copying
-        mode and window out of each arriving flow byte.
-
-        `life` here is the flow's own: OPEN until the app closes it. An
-        association carries its own life, which is per target and can reach
-        FAILED while the flow stays open for every other peer. The two are
-        different scopes and neither replaces the other. */
+    /** A flow the application opened. Socket-wide, one per flow id, and what a
+        FlowHandle points at. Holds no per-peer state and knows no address. */
     struct Flow
     {
-        uint32_t epoch;         ///< bumped on every lease; stale handles miss
-        uint32_t firstAssoc;    ///< head of the association list, INVALID when none
-        uint16_t flowId;
-        uint16_t window;        ///< declared in-flight cap, what the wire byte encodes
+        uint32_t epoch;         ///< survives the lease and advances; stale handles miss
+        uint32_t firstAssoc;    ///< association list head, INVALID when none
+        uint16_t flowId;        ///< INVALID_FLOW_ID marks the slot free
+        uint16_t window;        ///< declared in-flight cap
         FlowMode mode;
         uint8_t  flowData;      ///< the wire byte, encoded once at open
-        FlowLifecycle life;     ///< OPEN / CLOSING / CLOSED, socket-wide
-    };
-
-    /** The identity and lifecycle every flow carries regardless of direction,
-        embedded as the FIRST member of both flow types so shared machinery
-        (open/close retries, epoch checks, the peer-removal sweep) can operate
-        on either pool's slots through this one shape.
-
-        How a flow operation finds its peer: peerSlot is the direct route. It
-        cannot go stale, because RemovePeer closes and frees every flow a peer
-        owns before releasing the peer's slot, so a flow never outlives the peer
-        it indexes. peerAddr/peerId are the verified routes for hand-over-hand
-        crossings (flow lock released before the peer is approached): by id once
-        the peer is established (stable across address migration), by address
-        before then, safe because a peer cannot migrate before it has a session.
-    */
-    struct FlowCore
-    {
-        uint32_t peerSlot;
-        Address  peerAddr;      ///< address at open time, not maintained after
-        BcpId    peerId;        ///< all-zero until the peer proves one
-
-        uint32_t epoch;         ///< bumped on every lease; stale handles miss
-        uint16_t flowId;
-        FlowMode mode;
         FlowLifecycle life;
-
-        uint8_t  attempts;              ///< FLOW_CLOSE retries so far
-        uint64_t lastCtrlSentMicros;    ///< last close send, for retry pacing
     };
 
-    /** One packet this side sent and still awaits an ack for. Lives in the
-        out-flow's in-flight ring, indexed by seq & (cap - 1): the slot for a
-        seq is computed, never searched. Free is seq == 0 (the never-sent
-        sentinel; resolution zeroes it). packetSlot cannot mark freedom, because
-        an unreliable flow's entries never hold one. An occupied entry under a
-        new seq is the ring wrapping onto an unresolved packet: the flow is at
-        its window and must not send until something resolves.
+    /** One packet sent and not yet acknowledged. Indexed by seq & (cap - 1), so
+        an entry is computed rather than searched. seq == 0 marks it free, since
+        an unreliable flow's entries never hold a packet slot to mark it with.
 
-        packetSlot is the retained plaintext in the socket's staging pool, the
+        packetSlot is the retained plaintext in the staging pool, this packet's
         retransmit source, released when the seq resolves. INVALID on an
-        unreliable flow, whose entries track loss and budget only.
-    */
+        unreliable flow, whose entries track loss and budget only. */
     struct InFlightEntry
     {
         uint64_t sentAtMicros;
         uint32_t seq;
         uint32_t packetSlot;
-        uint16_t wireSize;     ///< budget spent on this packet, refunded on resolve
-        uint8_t  retries;      ///< retransmits so far; the give-up counter
+        uint16_t wireSize;     ///< refunded to the congestion budget on resolve
+        uint8_t  retries;      ///< give-up counter; the flow fails at the cap
     };
 
-    /** One packet received ahead of order on a RELIABLE_ORDERED in-flow, held
-        until the gap before it fills. Same ring indexing as InFlightEntry.
-        packetSlot == INVALID means free.
-    */
+    /** One packet received ahead of order, held until the gap before it fills.
+        packetSlot == INVALID means free. */
     struct HoldbackEntry
     {
         uint32_t seq;
         uint32_t packetSlot;
     };
 
-    /** One packet accepted by Send but not yet admitted to the wire (the flow's
-        window or the peer's congestion budget was full). Lives in the out-flow's
-        waiting ring, a strict FIFO walked head-first (unlike the seq-indexed
-        rings above): entries occupy [waitingHead, waitingHead + waitingCount).
+    /** One packet accepted by Send but refused the wire, because the window or
+        the peer's congestion budget was full. A strict FIFO over
+        [waitingHead, waitingHead + waitingCount), unlike the seq-indexed rings.
 
-        packetSlot is where the still-plaintext body waits: the socket's staging
-        pool on a reliable flow (the same retained body the in-flight ring takes
-        over once stamped), the kernel's send pool on an unreliable one. wireSize
-        is recorded at enqueue so the drain can query the budget without touching
-        the slot; a packet slot's lock must never be taken under the peer or flow
-        lock. waitingSince orders the drain across a peer's flows, oldest first.
-    */
+        wireSize is recorded at enqueue so the drain can test the budget without
+        locking the slot: a packet slot's lock must never be taken under the
+        peer or association lock. waitingSince orders the drain across a peer's
+        associations, oldest first. */
     struct WaitingEntry
     {
         uint64_t waitingSince;
@@ -191,29 +139,23 @@ namespace bcp::flux
         uint16_t wireSize;
     };
 
-    /** A contiguous range of received seqs, inclusive on both ends. The wire
-        representation inside a FLOW_ACK body. Acks are cumulative state reports
-        generated from the in-flow's seen bitmap at flush time, never a stored
-        delta: a lost FLOW_ACK is fully covered by the next one.
-    */
+    /** A contiguous run of received seqs, inclusive. Acks are generated from the
+        seen bitmap at flush time and are cumulative, never a stored delta, so a
+        lost ack is fully covered by the next one. */
     struct AckRange
     {
         uint32_t first;
         uint32_t last;
     };
 
-    /** One entry of a peer's flow directory: the per-peer map from wire flowId
-        to the flow's slot in the matching pool. Each peer has TWO directory
-        segments, out-flows (opened by this socket) and in-flows (opened by the
-        remote), in separate socket-owned blocks, each guarded by the peer's slot
-        lock. The split lets the remote's opens be bounded and pooled
-        independently of our own, and keeps "my flow 3 to you" and "your flow 3
-        to me" from colliding: every message type resolves against one side
-        (data and FLOW_CLOSE name the sender's out-flow, so they land in the IN
-        directory; FLOW_REJECT and FLOW_CLOSE_ACK answer our own flows, so they
-        land in the OUT directory). flowSlot == INVALID marks a free entry; pad is the
-        alignment gap, named and zeroed rather than implicit.
-    */
+    /** One peer's map from wire flow id to association slot. Each peer owns two
+        fixed strips, one per direction, so "my flow 3 to you" and "your flow 3
+        to me" cannot collide. Data and FLOW_CLOSE name the sender's flow and
+        resolve against the IN strip; FLOW_REJECT and FLOW_CLOSE_ACK answer our
+        own and resolve against the OUT strip.
+
+        flowSlot == INVALID marks a free entry. pad is the alignment gap, named
+        so it is zeroed rather than left indeterminate. */
     struct FlowDirEntry
     {
         uint16_t flowId;
@@ -221,177 +163,167 @@ namespace bcp::flux
         uint32_t flowSlot;
     };
 
-    /** A flow this socket opened: the SENDING half. One slot in the out-flow
-        pool. The pool hands out raw bytes and never runs constructors, so this
-        must stay trivially copyable, and whoever leases a slot writes every
-        field except core.epoch, which survives and advances.
+    /** What a flow keeps with one peer, sending side. Created by the first
+        packet sent to that address.
 
-        The slot is larger than the struct; the in-flight and waiting rings
-        follow it:
-          [OutFlowState][InFlightEntry x inflightCap][WaitingEntry x waitingCap]
-        Both caps are powers of two fixed at Init (in-flight slots are
-        seq & (cap - 1); waiting is a head + count FIFO) and stamped here so
-        slots self-describe. waitingCap differs by mode (reliable and unreliable
-        flows take their own Config knob), while the pool stride is sized for the
-        larger of the two.
+        The slot is larger than the struct; both rings follow it:
+          [OutAssociation][InFlightEntry x inflightCap][WaitingEntry x waitingCap]
+        Caps are powers of two fixed at Init and stamped here so a slot
+        self-describes. waitingCap differs by mode, while the pool stride covers
+        the larger.
 
-        Seqs count packets ("the Nth packet of this flow") starting at 1; 0 is
-        the never-sent sentinel, so a zeroed field reads as "nothing yet".
+        Seqs start at 1, so a zeroed field reads as "nothing sent yet".
 
-        The flow keeps at most inflightCap packets unresolved, which is also
-        the window it declares on the wire: the receiver checks the declared
-        width against its own bitmap at registration and rejects a flow it
-        could not dedupe, so the window can never outrun the receiver's memory
-        whatever either socket's config says.
-    */
-    struct OutFlowState
+        The pool hands out raw bytes and runs no constructor, so this must stay
+        trivially copyable and a lease writes every field except epoch, which
+        survives and advances. */
+    struct OutAssociation
     {
-        FlowCore core;
+        // Which peer. peerSlot is the direct route and cannot go stale, because
+        // RemovePeer frees a peer's associations before releasing its slot.
+        // peerAddr and peerId are for hand-over-hand crossings, where the
+        // association lock is dropped before the peer is approached: by id once
+        // the peer is established, since that survives migration, by address
+        // before then, when it cannot yet have migrated.
+        uint32_t peerSlot;
+        Address  peerAddr;
+        BcpId    peerId;        ///< all-zero until the peer proves one
 
-        /** The Flow this association belongs to, and the next association under
-            that same Flow. An intrusive list, so CloseFlow reaches every target
-            without walking the peer table: the directories index peer to
-            association, and this is the one direction they cannot answer.
-            Same shape as the pending-packet list a peer holds. */
+        // Which flow, and the next association under it. The directories index
+        // peer to association; this list is the only thing that answers the
+        // reverse, which is what CloseFlow needs.
         uint32_t flowSlot;
         uint32_t nextInFlow;
 
-        /** The wire byte, copied from the Flow at creation so stamping a packet
-            never has to lock the Flow. Immutable for the flow's life. */
+        // Copied from the flow at creation, immutable after.
+        uint16_t flowId;
+        uint16_t window;
+        FlowMode mode;
         uint8_t  flowData;
 
+        uint32_t epoch;         ///< revalidates the drain's peek against its claim
+        FlowLifecycle life;     ///< per target: FAILED here leaves the flow open
+
+        uint8_t  attempts;              ///< FLOW_CLOSE retries
+        uint64_t lastCtrlSentMicros;    ///< paces those retries
+
         uint32_t nextSeq;
+        uint32_t unresolved;    ///< stamped and unacked; the send gate refuses at inflightCap
 
-        /** Packets stamped and not yet resolved (acked or declared lost). The
-            send gate: a stamp is refused while unresolved == inflightCap,
-            which enforces the receiver's grant. The ring's own wrap check bounds
-            only inflightCap, which may be larger than what the receiver can
-            dedupe.
-        */
-        uint32_t unresolved;
-
-        /** Smoothed RTT state for this flow's retransmit timeout, in
-            microseconds; 0 until the first sample.
-        */
-        uint32_t srttMicros;
+        uint32_t srttMicros;    ///< 0 until the first sample
         uint32_t rttvarMicros;
 
-        uint16_t inflightCap;   ///< power of two, from Config; sizes the in-flight ring
-        uint16_t waitingCap;    ///< power of two or 0, by mode from Config; sizes the waiting ring
+        uint16_t inflightCap;
+        uint16_t waitingCap;
 
-        /** The waiting FIFO's cursors: waitingHead indexes the oldest entry
-            (masked by waitingCap - 1; it only ever advances), waitingCount how
-            many are queued. The head entry is the only one the drain considers;
-            within a flow, packets leave in the order Send accepted them.
-        */
-        uint32_t waitingHead;
+        uint32_t waitingHead;   ///< masked by waitingCap - 1; only advances
         uint32_t waitingCount;
 
         InFlightEntry* InFlight()
         {
             return reinterpret_cast<InFlightEntry*>(
-                reinterpret_cast<uint8_t*>(this) + sizeof(OutFlowState));
+                reinterpret_cast<uint8_t*>(this) + sizeof(OutAssociation));
         }
         const InFlightEntry* InFlight() const
         {
             return reinterpret_cast<const InFlightEntry*>(
-                reinterpret_cast<const uint8_t*>(this) + sizeof(OutFlowState));
+                reinterpret_cast<const uint8_t*>(this) + sizeof(OutAssociation));
         }
         WaitingEntry* Waiting()
         {
             return reinterpret_cast<WaitingEntry*>(
-                reinterpret_cast<uint8_t*>(this) + sizeof(OutFlowState)
+                reinterpret_cast<uint8_t*>(this) + sizeof(OutAssociation)
                 + inflightCap * sizeof(InFlightEntry));
         }
         const WaitingEntry* Waiting() const
         {
             return reinterpret_cast<const WaitingEntry*>(
-                reinterpret_cast<const uint8_t*>(this) + sizeof(OutFlowState)
+                reinterpret_cast<const uint8_t*>(this) + sizeof(OutAssociation)
                 + inflightCap * sizeof(InFlightEntry));
         }
 
         static constexpr size_t StrideFor(uint16_t inflightCap, uint16_t waitingCap)
         {
-            return sizeof(OutFlowState)
+            return sizeof(OutAssociation)
                  + inflightCap * sizeof(InFlightEntry)
                  + waitingCap * sizeof(WaitingEntry);
         }
     };
 
-    /** A flow the remote opened with this socket: the RECEIVING half. One slot
-        in the in-flow pool, an order of magnitude smaller than an out slot,
-        because this is the side a REMOTE can make us allocate. Same pool rules
-        as OutFlowState: trivially copyable, every field written on lease, epoch
-        survives.
+    /** What a remote's flow leaves with this socket, receiving side. Created by
+        the first packet that arrives on it, which is the one path where a
+        REMOTE makes this socket allocate, so it is an order of magnitude
+        smaller than the sending half and capped per peer.
 
         The slot layout:
-          [InFlowState][seen bitmap][HoldbackEntry x reorderCap]
+          [InAssociation][seen bitmap][HoldbackEntry x reorderCap]
 
-        The seen bitmap is this side's memory of which seqs arrived: one bit per
-        seq in a sliding window below recvHighest, the anti-replay-window shape
-        one layer up. It exists because a retransmitted flow packet wears a fresh
-        nonce and sails through the replay window; only this can tell "seq 6,
-        again" from "seq 6, finally". Its width (windowBits) is what this socket
-        granted the opener: the sender clamps its in-flight to the grant, so a
-        seq below the window floor is provably resolved and an arrival there can
-        only be a stale duplicate. Acks are emitted from this bitmap as
-        cumulative reports; nothing is cleared on flush.
-    */
-    struct InFlowState
+        The seen bitmap is this side's memory of which seqs arrived. It exists
+        because a retransmit wears a fresh nonce and passes the replay window
+        looking new, so only this can tell "seq 6 again" from "seq 6 finally".
+        Its width is the window the sender declared, which registration refused
+        unless this socket's bitmap could cover it, so a seq below the floor is
+        provably resolved and can only be a stale duplicate.
+
+        Same pool rules as the sending half. */
+    struct InAssociation
     {
-        FlowCore core;
+        uint32_t peerSlot;
+        Address  peerAddr;
+        BcpId    peerId;
 
-        /** recvNext is the ordered-delivery cursor (the seq the app is owed
-            next); recvHighest the highest seq seen, so a packet landing above
-            recvHighest + 1 is a gap, the loss signal. newSinceFlush counts seqs
-            first-seen since the last ack flush: 0 means nothing is owed, and
-            crossing the fill threshold forces a flush early.
-        */
-        uint32_t recvNext;
-        uint32_t recvHighest;
-        uint32_t newSinceFlush;
-        uint64_t ackArmedMicros;  ///< when this flow first owed an ack since the
-                                  ///< last flush; the deadline is ackArmedMicros
-                                  ///< + Config::flowAckDelay. 0 when none owed.
+        uint16_t flowId;        ///< the REMOTE's flow id, from the wire
+        FlowMode mode;          ///< decoded from the flow data byte
+        FlowLifecycle life;
 
-        uint16_t windowBits;    ///< seen-bitmap width; the window this socket grants
-        uint16_t reorderCap;    ///< power of two or 0, from Config
+        uint32_t epoch;
+
+        uint32_t recvNext;      ///< ordered delivery cursor: the seq the app is owed
+        uint32_t recvHighest;   ///< anything above this + 1 is a gap, the loss signal
+        uint32_t newSinceFlush; ///< seqs first seen since the last ack; 0 means none owed
+
+        /** When this association first owed an ack. The deadline is this plus
+            Config::flowAckDelay, and 0 means nothing is owed. */
+        uint64_t ackArmedMicros;
+
+        uint16_t windowBits;    ///< seen-bitmap width, from the declared window
+        uint16_t reorderCap;
 
         uint64_t* Seen()
         {
             return reinterpret_cast<uint64_t*>(
-                reinterpret_cast<uint8_t*>(this) + sizeof(InFlowState));
+                reinterpret_cast<uint8_t*>(this) + sizeof(InAssociation));
         }
         const uint64_t* Seen() const
         {
             return reinterpret_cast<const uint64_t*>(
-                reinterpret_cast<const uint8_t*>(this) + sizeof(InFlowState));
+                reinterpret_cast<const uint8_t*>(this) + sizeof(InAssociation));
         }
         HoldbackEntry* Holdback()
         {
             return reinterpret_cast<HoldbackEntry*>(
-                reinterpret_cast<uint8_t*>(this) + sizeof(InFlowState)
+                reinterpret_cast<uint8_t*>(this) + sizeof(InAssociation)
                 + (windowBits / 8));
         }
         const HoldbackEntry* Holdback() const
         {
             return reinterpret_cast<const HoldbackEntry*>(
-                reinterpret_cast<const uint8_t*>(this) + sizeof(InFlowState)
+                reinterpret_cast<const uint8_t*>(this) + sizeof(InAssociation)
                 + (windowBits / 8));
         }
 
         static constexpr size_t StrideFor(uint16_t windowBits, uint16_t reorderCap)
         {
-            return sizeof(InFlowState)
+            return sizeof(InAssociation)
                  + (windowBits / 8)
                  + reorderCap * sizeof(HoldbackEntry);
         }
     };
 
-    static_assert(std::is_trivially_copyable_v<OutFlowState>,
-                  "OutFlowState lives in a SlotPool by raw cast, so it must stay trivially copyable");
-    static_assert(std::is_trivially_copyable_v<InFlowState>,
-                  "InFlowState lives in a SlotPool by raw cast, so it must stay trivially copyable");
-    static_assert(offsetof(OutFlowState, core) == 0 && offsetof(InFlowState, core) == 0,
-                  "FlowCore must sit at offset 0 so shared lifecycle code can address either type");
+    static_assert(std::is_trivially_copyable_v<Flow>,
+                  "Flow lives in a SlotPool by raw cast");
+    static_assert(std::is_trivially_copyable_v<OutAssociation>,
+                  "OutAssociation lives in a SlotPool by raw cast");
+    static_assert(std::is_trivially_copyable_v<InAssociation>,
+                  "InAssociation lives in a SlotPool by raw cast");
 }

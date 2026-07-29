@@ -166,11 +166,12 @@ namespace bcp::flux
                 x this. 0 disables the migration receive path. */
             uint32_t    migrateBudgetPerPoll = internal::MIGRATE_BUDGET_PER_POLL;
 
-            /** Flow storage, split by direction because the two sides are
-                different commitments. OUT-flows are the ones this socket opens
-                (self-budgeting, each costs the in-flight ring); IN-flows are
-                the ones remotes open (defensive bounds, each costs only the
-                small receive half). Separate pools mean a hostile peer's opens
+            /** Association storage, split by direction because the two sides are
+                different commitments. Outbound ones this socket creates by
+                sending (self-budgeting, each costs the in-flight ring);
+                inbound ones a remote creates by sending to us (defensive
+                bounds, each costs only the small receive half). Separate pools
+                mean a hostile peer's traffic
                 can never starve this socket's own. A zero count disables that
                 direction. */
             struct Flows
@@ -179,22 +180,21 @@ namespace bcp::flux
                     A flow is small (id, mode, window, lifecycle); the per-peer
                     state it spawns is sized by outCount below. */
                 uint32_t flowCount         = 64;
-                uint32_t outCount          = 0;    ///< socket-wide out-ASSOCIATION pool
-                uint32_t inCount           = 0;    ///< socket-wide in-flow pool
-                uint32_t maxOutPerPeer     = 8;    ///< out-directory width per peer
-                uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: flows one remote may register
+                uint32_t outCount          = 0;    ///< sending associations, socket-wide
+                uint32_t inCount           = 0;    ///< receiving associations, socket-wide
+                uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
+                uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: what one remote may create
 
-                /** Both roles at once: the out-flow ring capacity, which is the
-                    window this socket declares on every flow packet, and the
-                    in-flow seen-bitmap width, which is the widest window it
-                    will register from a remote. A flow declaring more than the
-                    receiver's bitmap covers is rejected, since a retransmit
-                    could then arrive older than anything still remembered.
-                    Power of two, floor 64, and it must be one of the widths
-                    the flow data byte can encode (32 through 32768). */
+                /** Both roles at once: the in-flight ring capacity, which is the
+                    window this socket declares by default, and the seen-bitmap
+                    width, which is the widest window it will register from a
+                    remote. A wider declaration is rejected, since a retransmit
+                    could then arrive older than the bitmap remembers. Power of
+                    two, and one the flow data byte can encode (32 to 32768). */
                 uint32_t inFlightCount     = 256;
-                /** How far ahead of a gap an ordered in-flow buffers (beyond
-                    it: dropped, a resend fills it later). Power of two, or 0. */
+                /** How far ahead of a gap ordered delivery buffers; past it a
+                    packet is dropped and a resend fills it later. Power of two,
+                    or 0. */
                 uint32_t reorderCount      = 64;
                 /** Retained reliable bodies, held send-until-ack for retransmit.
                     Socket-wide ceiling on unacked reliable traffic; running dry
@@ -392,18 +392,16 @@ namespace bcp::flux
 
         // Flow storage, split by direction; per-peer directory segments indexed
         // by peer slot, under that peer's lock (the replayState_ shape).
-        /** The flows themselves, one slot per OpenFlow. Separate from the
-            association pool because the two are sized for opposite things: a
-            flow is a handful of bytes and there are few, an association owns
-            the rings and there are as many as (flows x peers actually talked
-            to). */
+        /** One slot per OpenFlow. Separate from the association pool because a
+            flow is a handful of bytes and there are few, while an association
+            owns the rings and there are flows x peers of them. */
         common::collections::SlotPool  flowPool_;
-        common::collections::SlotPool  outFlowPool_;
-        common::collections::SlotPool  inFlowPool_;
-        std::unique_ptr<FlowDirEntry[]> outFlowDir_;
-        std::unique_ptr<FlowDirEntry[]> inFlowDir_;
-        uint32_t                       maxOutFlowsPerPeer_ = 0;
-        uint32_t                       maxInFlowsPerPeer_  = 0;
+        common::collections::SlotPool  outAssocPool_;
+        common::collections::SlotPool  inAssocPool_;
+        std::unique_ptr<FlowDirEntry[]> outAssocDir_;
+        std::unique_ptr<FlowDirEntry[]> inAssocDir_;
+        uint32_t                       maxOutAssocPerPeer_ = 0;
+        uint32_t                       maxInAssocPerPeer_  = 0;
         uint16_t                       outInflightCap_     = 0;
         uint16_t                       inWindowBits_       = 0;
         uint16_t                       inReorderCap_       = 0;
@@ -493,10 +491,9 @@ namespace bcp::flux
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireKernelWriter();
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireFlowWriter(const FlowHandle& flow);
 
-        /** A writer over a retained staging slot, the pool a reliable flow's
-            plaintext lives in until its sequence resolves. Shared by the flow
-            send path and the pending flush, so both put a retained body in the
-            one pool the in-flight ring releases into. */
+        /** A writer over a staging slot, where a retained body lives until its
+            sequence resolves. Shared by the send path and the pending flush so
+            the two cannot disagree about which pool that is. */
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireStagingWriter();
 
         /** The outbound gate (called by SocketSender for every packet). Internal
@@ -523,11 +520,11 @@ namespace bcp::flux
             newest, or refused outright. The returned status says which;
             ownership of packetSlot (staging for reliable, kernel send for
             unreliable) moves with it. See SendAdmission. */
-        [[nodiscard]] static bool CanSend(const OutFlowState& flow, const Peer& peer,
+        [[nodiscard]] static bool CanSend(const OutAssociation& flow, const Peer& peer,
                                           uint16_t wireSize, bool windowed) noexcept;
-        static void StampFlowPacket(OutFlowState& flow, Peer& peer, PacketSlot& packet,
+        static void StampFlowPacket(OutAssociation& flow, Peer& peer, PacketSlot& packet,
                                     uint32_t stagingSlot, uint16_t wireSize) noexcept;
-        static void EnqueueWaiting(OutFlowState& flow, uint32_t packetSlot,
+        static void EnqueueWaiting(OutAssociation& flow, uint32_t packetSlot,
                                    uint16_t wireSize) noexcept;
         [[nodiscard]] SendAdmission AdmitFlowPacket(Peer& peer, uint32_t peerSlot,
                                                     PacketSlot& packet,
@@ -574,9 +571,9 @@ namespace bcp::flux
             deliverers; the ordered one parks in-window gaps in hold-back and
             ejects past-window. Returns packets committed to the ready queue. */
         uint32_t ProcessFlowIn(PacketSlotHandle incoming);
-        uint32_t DeliverUnordered(InFlowState& flow, PacketSlotHandle& incoming, uint32_t seq);
-        uint32_t DeliverOrdered(InFlowState& flow, PacketSlotHandle& incoming, uint32_t seq);
-        uint32_t DrainHoldbackRun(InFlowState& flow);
+        uint32_t DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq);
+        uint32_t DeliverOrdered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq);
+        uint32_t DrainHoldbackRun(InAssociation& flow);
 
         /** Migration receive: find candidates by tag, trial-decrypt each
             (OpenSecurePacket), and on the genuine mover arm the path challenge.
@@ -611,8 +608,8 @@ namespace bcp::flux
 
         // --- Flow directory and control plane ---
         // Directory helpers over the FlowDirEntry[] segment: three scan idioms.
-        [[nodiscard]] FlowDirEntry* OutFlowDirFor(uint32_t peerSlot) noexcept;
-        [[nodiscard]] FlowDirEntry* InFlowDirFor(uint32_t peerSlot) noexcept;
+        [[nodiscard]] FlowDirEntry* OutAssocDirFor(uint32_t peerSlot) noexcept;
+        [[nodiscard]] FlowDirEntry* InAssocDirFor(uint32_t peerSlot) noexcept;
         [[nodiscard]] static uint32_t FindFlowSlot(const FlowDirEntry* dir, uint32_t width, uint16_t flowId) noexcept;
         [[nodiscard]] static uint32_t InsertFlowSlot(FlowDirEntry* dir, uint32_t width, uint16_t flowId, uint32_t flowSlot) noexcept;
         static void EraseFlowSlot(FlowDirEntry* dir, uint32_t width, uint32_t flowSlot) noexcept;
@@ -628,55 +625,47 @@ namespace bcp::flux
             only.
 
             @param refundTo null when the peer itself is being freed. */
-        void FreeOutFlow(uint32_t flowSlot, Peer* refundTo) noexcept;
+        void FreeOutAssoc(uint32_t flowSlot, Peer* refundTo) noexcept;
 
-        /** Finds a flow by the id the app chose. The pool is small and opens
-            are rare, so a scan beats an index nobody else would use.
+        /** Scans rather than indexes: the pool is small and opens are rare.
 
             @return the flow slot, or SlotPool::INVALID. */
         [[nodiscard]] uint32_t FindFlowById(uint16_t flowId) noexcept;
 
-        /** Leases the per-target state for (flow, peer) on first send, copying
-            the flow's mode, window and wire byte into it so every later packet
-            reads one object under one lock.
+        /** Leases the per-target state on first send, copying the flow's mode,
+            window and wire byte so later packets read one object under one
+            lock.
 
             @pre Caller holds the peer's write lock.
-            @return the association slot, or INVALID when no such flow is open,
-                    the pool is dry, or this peer is at its directory cap. */
+            @return INVALID when no such flow is open, the pool is dry, or this
+                    peer is at its cap. */
         [[nodiscard]] uint32_t CreateAssociation(const Peer& peer, uint32_t peerSlot,
                                                  uint16_t flowId) noexcept;
 
-        /** Links an association into its flow's list, and unlinks it. Both run
-            under the flow's write lock, which is the list's guard.
-
-            Unlink is called from every path that frees an association: the
-            close sweep, the peer sweep, and a failed registration. An
-            association left linked after its slot is recycled would put a
-            stranger's state on the flow's list. */
+        /** Both run under the flow's write lock, which guards the list. Unlink
+            happens inside FreeOutAssoc, so every teardown path is covered. */
         void LinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept;
         void UnlinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept;
 
-        /** Marks an out-flow FAILED and gives back everything it holds: the
-            in-flight ring's leases and their congestion bytes, and the waiting
-            ring's parked packets. The slot itself stays leased so the app can
-            still observe the failure through its handle; CloseFlow recycles it.
+        /** Marks one association FAILED and gives back both rings and their
+            congestion bytes. The slot stays leased so the failure is still
+            observable; CloseFlow recycles it.
 
-            @pre Caller holds the peer's write lock (the refund's guard). */
-        void FailOutFlow(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept;
+            @pre Caller holds the peer's write lock, which guards the refund. */
+        void FailOutAssoc(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept;
 
-        /** Registers a remote's flow on first sight, from the flow header of a
-            data packet. Caps-only refusal: a dry pool, a full per-peer
-            directory, or a declared window wider than this socket's dedupe
-            bitmap yields Rejected, and the sender is told so it can stop.
+        /** Registers a remote's flow on first sight, from a data packet's flow
+            header. Refusal is caps-only: a dry pool, a full directory, or a
+            window wider than this socket's bitmap.
 
             @pre Caller holds the peer's write lock. */
         enum class FlowAdmit : uint8_t { Registered, Existing, Rejected };
         [[nodiscard]] FlowAdmit AdmitInFlow(uint32_t peerSlot, const Address& from,
                                             const BcpId& peerId, uint16_t flowId,
                                             uint8_t flowData) noexcept;
-        [[nodiscard]] uint32_t DrainOutInflight(OutFlowState* flow) noexcept;
-        void DrainOutWaiting(OutFlowState* flow) noexcept;
-        void DrainInHoldback(InFlowState* flow) noexcept;
+        [[nodiscard]] uint32_t DrainOutInflight(OutAssociation* flow) noexcept;
+        void DrainOutWaiting(OutAssociation* flow) noexcept;
+        void DrainInHoldback(InAssociation* flow) noexcept;
 
         /** Which pool a mode's waiting packets lease from: staging for reliable
             (the body must outlive its first send), the kernel send pool for
@@ -688,19 +677,19 @@ namespace bcp::flux
         /** Resolve one in-flight entry (acked or lost); accumulate feedback into
             `delta` (never touches the peer). ApplyCongestion does the peer-side
             arithmetic under the peer's write lock. */
-        void ResolveOutEntry(OutFlowState* flow, InFlightEntry& entry,
+        void ResolveOutEntry(OutAssociation* flow, InFlightEntry& entry,
                              bool acked, uint64_t nowMicros, CongestionDelta& delta) noexcept;
         void ApplyCongestion(Peer& peer, const CongestionDelta& delta, uint64_t nowMicros) noexcept;
 
         // --- Tick / eviction ---
         // Update threads `nowOverride` (0 = real clock) to each sub-step, which
         // reads Now(nowOverride) fresh, never a captured value. Idle eviction is
-        // inline in Update's per-peer pass. One out-flow's tick splits into a
+        // inline in Update's per-peer pass. One association's tick splits into a
         // lifecycle-retry step and a retransmit step; each reads the clock once
         // at entry, for that flow.
         void UpdateOutFlow(const Address& addr, PeerHandle peer, uint32_t dirIndex, uint64_t nowOverride);
-        void RetryClose(OutFlowState& flow, uint64_t now, /*out*/ bool& giveUp);
-        void RetransmitInflight(OutFlowState& flow, uint64_t now, CongestionDelta& delta,
+        void RetryClose(OutAssociation& flow, uint64_t now, /*out*/ bool& giveUp);
+        void RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
                                 /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots,
                                 uint32_t& resendCount, /*out*/ bool& exhausted);
 
@@ -713,6 +702,6 @@ namespace bcp::flux
         void DrainWaitingSends(const Address& addr);
 
         // --- Peer management ---
-        void SweepPeerFlows(uint32_t peerSlot) noexcept;
+        void SweepPeerAssociations(uint32_t peerSlot) noexcept;
     };
 }
