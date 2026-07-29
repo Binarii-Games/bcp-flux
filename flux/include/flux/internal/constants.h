@@ -38,14 +38,7 @@ namespace bcp::flux::internal
     static constexpr uint8_t  SECURE_CHANNEL_PATH_CHLG      = 0x01;
     static constexpr uint8_t  SECURE_CHANNEL_PATH_RESP      = 0x02;
     static constexpr uint8_t  SECURE_CHANNEL_FLOW_REJECT    = 0x03; ///< receiver refused to register a flow (caps)
-    // 0x04 is unassigned: it carried FLOW_OPEN_ACK when opening was a wire
-    // exchange, and reusing it too soon would make two protocol generations
-    // ambiguous on capture.
-    // 0x05 and 0x06 are retired: they carried FLOW_CLOSE and FLOW_CLOSE_ACK
-    // when closing was negotiated. Closing is local now, and a flow is not tied
-    // to a peer, so a remote dropping its receive state cannot end the flow.
-    // Left unassigned so a capture from either generation stays unambiguous.
-    static constexpr uint8_t  SECURE_CHANNEL_FLOW_ACK       = 0x07;
+    static constexpr uint8_t  SECURE_CHANNEL_FLOW_ACK       = 0x04;
 
     static_assert(WIRE_TAG_SIZE == common::crypto::TAG_SIZE,
                   "The wire tag field carries the AEAD tag verbatim");
