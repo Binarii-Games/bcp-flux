@@ -994,7 +994,10 @@ namespace bcp::flux
             return pHandle;
 
         const bool hasFlow  = packet->HasFlow();
-        const bool retained = hasFlow && pHandle.GetPool() == &stagingPool_;
+        // A reliable flow's plaintext is its own retransmit source, so it lives
+        // in staging and outlives the send. Which pool it came from is how that
+        // is known here.
+        const bool keepsBodyForResend = hasFlow && pHandle.GetPool() == &stagingPool_;
 
         // One peer WRITE lock, taken directly: NO read-then-upgrade, so no gap
         // in which a racing RemovePeer could invalidate the peer between an
@@ -1003,7 +1006,7 @@ namespace bcp::flux
         // the scope before the AEAD seal, so the peer is never locked across the
         // encrypt. The flow is admitted here too: AdmitFlowPacket is lent this
         // peer, so the send path touches the peer table ONCE, not twice. For a
-        // retained body the wire slot is taken before the admission, so a dry
+        // keepsBodyForResend body the wire slot is taken before the admission, so a dry
         // kernel pool fails cleanly with nothing committed (the stamp is the
         // commit). Lock order: staging(pHandle) -> peer -> flow, then the wire
         // slot; wire slots are freshly acquired so they never cross-contend.
@@ -1023,10 +1026,10 @@ namespace bcp::flux
                 }
                 if (!peer->IsValid())
                 {
-                    // Handshake in flight: park behind it. `retained` travels
-                    // with the packet so the flush can restore the right pool.
+                    // Handshake in flight: park behind it. The flag travels with
+                    // the packet so the flush restores the right pool.
                     status = pending::Push(pendingPool_, peerHandle, *packet,
-                                           requireAuth, retained);
+                                           requireAuth, keepsBodyForResend);
                     return PacketSlotHandle::Invalid();
                 }
                 if (requireAuth && !peer->authenticated)
@@ -1054,7 +1057,7 @@ namespace bcp::flux
                         status = common::Error::InvalidState;
                         return PacketSlotHandle::Invalid();
                     }
-                    if (retained)
+                    if (keepsBodyForResend)
                     {
                         common::Result<PacketSlotWriter> out = kernel_->Write();
                         if (out.isErr())
@@ -1070,7 +1073,7 @@ namespace bcp::flux
                             return PacketSlotHandle::Invalid();
                         }
                     }
-                    // The plaintext's own slot: staging for a retained body,
+                    // The plaintext's own slot: staging for a keepsBodyForResend body,
                     // kernel send otherwise, the slot a refused packet waits
                     // in. The gate runs before the materials are gathered, so a
                     // packet that never flies never burns a nonce counter.
@@ -1125,7 +1128,7 @@ namespace bcp::flux
             // A reliable body is its own retransmit source: the ciphertext goes
             // to the wire slot and the plaintext slot stays leased, held by the
             // ring until the seq resolves. Everything else seals in place.
-            if (retained)
+            if (keepsBodyForResend)
             {
                 wirePacket->address  = writable->address;
                 wirePacket->dataSize = writable->dataSize;
@@ -1160,7 +1163,7 @@ namespace bcp::flux
                 return PacketSlotHandle::Invalid();
             }
             status = pending::Push(pendingPool_, peerHandle, *packet,
-                                   requireAuth, retained);
+                                   requireAuth, keepsBodyForResend);
         }
         return PacketSlotHandle::Invalid();
     }
@@ -2313,10 +2316,10 @@ namespace bcp::flux
                     continue;
                 }
 
-                // A retained body must go back to STAGING: the in-flight ring
+                // A keepsBodyForResend body must go back to STAGING: the in-flight ring
                 // keeps that slot as its retransmit source and releases it
                 // there, so a kernel index would be freed into the wrong pool.
-                common::Result<PacketSlotWriter> result = pending->retained
+                common::Result<PacketSlotWriter> result = pending->keepsBodyForResend
                     ? AcquireStagingWriter()
                     : kernel_->Write();
                 if (result.isOk())
