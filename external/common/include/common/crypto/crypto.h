@@ -7,13 +7,15 @@
 #include <monocypher.h>
 #include <common/platform.h>
 
-// Platform secure RNG. Windows: BCryptGenRandom. macOS: getentropy (getrandom
-// is Linux-only). Linux: getrandom.
+// Platform secure RNG. Windows: BCryptGenRandom. Apple: arc4random_buf,
+// because iOS has no sys/random.h. Linux: getrandom.
 #if defined(_WIN32)
     #include <bcrypt.h>
     #pragma comment(lib, "bcrypt.lib")
+#elif defined(__APPLE__)
+    #include <stdlib.h>       // arc4random_buf, on macOS and iOS alike
 #else
-    #include <sys/random.h>   // getentropy (mac) / getrandom (linux)
+    #include <sys/random.h>   // getrandom
 #endif
 
 // Single-file, clearly-named wrapper over monocypher.
@@ -85,15 +87,8 @@ namespace bcp::common::crypto
             BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         return s == 0; // STATUS_SUCCESS
     #elif defined(__APPLE__)
-        // getentropy refuses requests over 256 bytes, so chunk.
-        size_t done = 0;
-        while (done < len)
-        {
-            size_t chunk = len - done;
-            if (chunk > 256) chunk = 256;
-            if (getentropy(out + done, chunk) != 0) return false;
-            done += chunk;
-        }
+        // Kernel CSPRNG with no failure path and no length cap.
+        arc4random_buf(out, len);
         return true;
     #else
         size_t done = 0;
