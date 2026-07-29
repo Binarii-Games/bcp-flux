@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
