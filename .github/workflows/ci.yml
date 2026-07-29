@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc
+            os: ubuntu-latest
+            cmake: -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+          - name: linux-clang
+            os: ubuntu-latest
+            cmake: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          - name: linux-tsan
+            os: ubuntu-latest
+            cmake: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBCP_SANITIZE=thread
+          - name: macos
+            os: macos-latest
+            cmake: ''
+          - name: windows-msvc
+            os: windows-latest
+            # MSVC AddressSanitizer conflicts with the /RTC1 flag CMake puts on
+            # Debug builds, so this job runs without sanitizers for now.
+            cmake: -DBCP_SANITIZE=
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recent runner kernels raise ASLR entropy past what the sanitizer
+      # runtimes handle, and instrumented binaries crash at startup.
+      - name: lower aslr entropy
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug ${{ matrix.cmake }}
+
+      - name: build
+        run: cmake --build build --config Debug --parallel 4
+
+      - name: test
+        run: ctest --test-dir build -C Debug -LE bench --output-on-failure

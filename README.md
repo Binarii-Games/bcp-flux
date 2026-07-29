@@ -1,5 +1,7 @@
 # Flux
 
+[![ci](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ci.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ci.yml)
+
 A connectionless, encrypted UDP transport in C++20. There is no connection
 object, nothing allocates on the packet path, and one socket carries reliable
 and unreliable traffic at the same time.
