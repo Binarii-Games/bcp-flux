@@ -121,11 +121,10 @@ struct World
         if (!relay.Init(portA, portB, clientPort, serverPort)) return false;
         if (SendOp(client, Loopback(portA), 0x01) != common::Error::Ok) return false;
 
-        int received = 0;
         for (int i = 0; i < 200; ++i)
         {
             relay.Pump();
-            received += CollectOp(server, 0x01);
+            CollectOp(server, 0x01);
             CollectOp(client, 0x00);
             client.Update();
             server.Update();

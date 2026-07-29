@@ -28,6 +28,10 @@ namespace bcp::flux
         uint8_t  active;
         uint8_t  requireAuth;   ///< parked by SendSecured: dropped at flush time
                                 ///< unless the peer came out authenticated
+        /** This body is a retransmit source, so the flush must restore it to a
+            STAGING slot: the in-flight ring keeps that slot and releases it
+            there, and a kernel index would be freed into the wrong pool. */
+        uint8_t  keepsBodyForResend;
         Address  address;
         uint16_t dataSize;
         uint8_t  data[];
@@ -51,7 +55,8 @@ namespace bcp::flux
         [[nodiscard]] common::Error Push(common::collections::SlotPool& pool,
                                          PeerHandle& peer,
                                          const PacketSlot& packet,
-                                         bool requireAuth = false);
+                                         bool requireAuth = false,
+                                         bool keepsBodyForResend = false);
 
         /** Detaches the oldest pending packet, marks it inactive and returns its
             slot index, or SlotPool::INVALID when the list is empty (or the handle

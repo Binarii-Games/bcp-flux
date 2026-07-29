@@ -7,7 +7,7 @@
 namespace bcp::flux::internal
 {
     // --- Version ---
-    static constexpr uint16_t VERSION                       = 1;
+    static constexpr uint16_t VERSION                       = 2; ///< 2: flows register from data packets; the flow header gained its data byte
     static constexpr uint8_t  VERSION_CAPS_SIZE             = 4; ///< Fixed; changing it breaks older versions.
     static constexpr uint8_t  VERSION_SIZE                  = 2; 
 
@@ -19,6 +19,10 @@ namespace bcp::flux::internal
     static constexpr uint8_t  WIRE_NONCE_SIZE               = 8;  ///< Send-counter half of the nonce; the rest is derived locally.
     static constexpr uint8_t  WIRE_FLOW_ID_SIZE             = 2;
     static constexpr uint8_t  WIRE_FLOW_SEQ_SIZE            = 4;
+    static constexpr uint8_t  WIRE_FLOW_DATA_SIZE           = 1;  ///< mode + window exponent, after the sequence
+    /** The whole flow header, inside the seal: id, sequence, data byte. */
+    static constexpr uint8_t  WIRE_FLOW_HEADER_SIZE         =
+        WIRE_FLOW_ID_SIZE + WIRE_FLOW_SEQ_SIZE + WIRE_FLOW_DATA_SIZE;
     static constexpr uint8_t  WIRE_PEER_TAG_SIZE            = 4;  ///< Migration tag; present when CTRL_TAGGED is set.
     static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;  ///< First encrypted byte; splits app data from control.
     static constexpr uint8_t  MIN_WIRE_SIZE                 = WIRE_CONTROLLER_SIZE;
@@ -33,11 +37,8 @@ namespace bcp::flux::internal
     static constexpr uint8_t  SECURE_CHANNEL_APP            = 0x00;
     static constexpr uint8_t  SECURE_CHANNEL_PATH_CHLG      = 0x01;
     static constexpr uint8_t  SECURE_CHANNEL_PATH_RESP      = 0x02;
-    static constexpr uint8_t  SECURE_CHANNEL_FLOW_OPEN      = 0x03;
-    static constexpr uint8_t  SECURE_CHANNEL_FLOW_OPEN_ACK  = 0x04;
-    static constexpr uint8_t  SECURE_CHANNEL_FLOW_CLOSE     = 0x05;
-    static constexpr uint8_t  SECURE_CHANNEL_FLOW_CLOSE_ACK = 0x06;
-    static constexpr uint8_t  SECURE_CHANNEL_FLOW_ACK       = 0x07;
+    static constexpr uint8_t  SECURE_CHANNEL_FLOW_REJECT    = 0x03; ///< receiver refused to register a flow (caps)
+    static constexpr uint8_t  SECURE_CHANNEL_FLOW_ACK       = 0x04;
 
     static_assert(WIRE_TAG_SIZE == common::crypto::TAG_SIZE,
                   "The wire tag field carries the AEAD tag verbatim");

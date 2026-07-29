@@ -12,10 +12,11 @@ namespace bcp::flux
         and check the peer owns the id it claims (no registry involved).
 
         Connectionless protocol, and a peer's address can rotate mid-session
-        (NAT rebind, VPN reconnect, network handoff); the id stays stable across
-        that, so a packet from an unknown address can still be tied to a known
-        peer. Not persistent: the keypair is generated per process, so the id
-        lives only as long as the peer's process. Never store one.
+        (NAT rebind, VPN reconnect, network handoff). The id follows the key
+        rather than the address, so a packet from an unknown address can still
+        be tied to a known peer. Its lifetime follows the keypair: a socket
+        given an identity in Config keeps the same id across runs, and one
+        that generates its own keeps it only for that process.
     */
     struct BcpId
     {

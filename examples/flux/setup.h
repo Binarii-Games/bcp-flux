@@ -2,7 +2,7 @@
 
 // Platform setup shared by the examples: which UDP backend to use, and getting
 // Winsock up on Windows. It lives here so each example reads as the thing it
-// demonstrates instead of as boilerplate — the same job tests/flux_net.h does
+// demonstrates instead of as boilerplate, the same job tests/flux_net.h does
 // for the test suite.
 
 #include <common/platform.h>   // OS socket headers, incl. Winsock on Windows

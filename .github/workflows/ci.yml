@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc
+            os: ubuntu-latest
+            aslr: true
+            cmake: -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+          - name: linux-clang
+            os: ubuntu-latest
+            aslr: true
+            cmake: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          - name: linux-tsan
+            os: ubuntu-latest
+            aslr: true
+            cmake: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBCP_SANITIZE=thread
+          # Container jobs run UBSan only: ASan needs an ASLR sysctl the
+          # container is not privileged to make.
+          - name: debian-12
+            os: ubuntu-latest
+            container: debian:12
+            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y g++ cmake make git libubsan1
+            cmake: -DBCP_SANITIZE=undefined
+          - name: rocky-9
+            os: ubuntu-latest
+            container: rockylinux:9
+            setup: dnf install -y gcc-c++ cmake make git libubsan
+            cmake: -DBCP_SANITIZE=undefined
+          - name: macos
+            os: macos-latest
+            cmake: ''
+          - name: windows-msvc
+            os: windows-latest
+            # MSVC AddressSanitizer conflicts with the /RTC1 flag CMake puts on
+            # Debug builds, so this job runs without sanitizers for now.
+            cmake: -DBCP_SANITIZE=
+          # Mobile jobs cross-compile everything and run nothing: there is no
+          # device on a runner to execute tests.
+          - name: android-arm64
+            os: ubuntu-latest
+            buildonly: true
+            cmake: -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DBCP_SANITIZE= -DBCP_EXAMPLES=OFF
+          - name: ios-arm64
+            os: macos-latest
+            buildonly: true
+            cmake: -DCMAKE_SYSTEM_NAME=iOS -DBCP_SANITIZE= -DBCP_EXAMPLES=OFF
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recent runner kernels raise ASLR entropy past what the sanitizer
+      # runtimes handle, and instrumented binaries crash at startup.
+      - name: lower aslr entropy
+        if: matrix.aslr
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: install toolchain
+        if: matrix.setup
+        run: ${{ matrix.setup }}
+
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug ${{ matrix.cmake }}
+
+      - name: build
+        run: cmake --build build --config Debug --parallel 4
+
+      - name: test
+        if: ${{ !matrix.buildonly }}
+        run: ctest --test-dir build -C Debug -LE bench --output-on-failure
