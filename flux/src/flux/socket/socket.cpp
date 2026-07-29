@@ -122,8 +122,6 @@ namespace bcp::flux
             assoc->mode       = mode;
             assoc->epoch      = assoc->epoch + 1;
             assoc->life       = FlowLifecycle::OPEN;
-            assoc->attempts   = 0;
-            assoc->lastCtrlSentMicros = 0;
 
             assoc->nextSeq      = 1;
             assoc->unresolved   = 0;
@@ -1467,8 +1465,6 @@ namespace bcp::flux
             case internal::SECURE_CHANNEL_PATH_CHLG:      PathChallenge_Respond(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_PATH_RESP:      PathChallenge_Complete(from, buf, plen); break;
             case internal::SECURE_CHANNEL_FLOW_REJECT:    Flow_Reject(from, buf, plen);    break;
-            case internal::SECURE_CHANNEL_FLOW_CLOSE:     Flow_Close(from, buf, plen);     break;
-            case internal::SECURE_CHANNEL_FLOW_CLOSE_ACK: Flow_CloseAck(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_FLOW_ACK:       Flow_Ack(from, buf, plen);       break;
             default: break;   // unknown channel: authenticated but unhandled, drop
         }
@@ -2661,86 +2657,7 @@ namespace bcp::flux
         FailOutAssoc(flowSlot, flowId, peer);
     }
 
-    void Socket::Flow_Close(const Address& from, const uint8_t* payload, size_t len)
-    {
-        // The remote is closing a flow IT opened, our receiving half: IN side.
-        if (!inAssocDir_ || len < 2) return;
-        const uint16_t flowId = static_cast<uint16_t>(payload[0])
-                              | static_cast<uint16_t>(payload[1]) << 8;
 
-        bool ack = false;
-        PeerSendMaterials materials;
-        {
-            PeerHandle peerHandle = peers_.GetPeer(from);
-            if (peerHandle.Failed()) return;
-            Peer* peer = peerHandle.Write();
-            if (!peer || !peer->IsValid()) return;
-
-            FlowDirEntry* dir = InAssocDirFor(peerHandle.GetSlotIndex());
-            const uint32_t flowSlot = FindFlowSlot(dir, maxInAssocPerPeer_, flowId);
-            if (flowSlot != common::collections::SlotPool::INVALID)
-            {
-                // Unpublish first, then destroy: nothing can look up a flow
-                // mid-teardown.
-                EraseFlowSlot(dir, maxInAssocPerPeer_, flowSlot);
-
-                InAssociation* flow = reinterpret_cast<InAssociation*>(
-                    inAssocPool_.WriteLock(flowSlot));
-                DrainInHoldback(flow);   // release held recv slots before free
-                flow->life = FlowLifecycle::CLOSED;
-                inAssocPool_.UnlockWrite(flowSlot);
-                inAssocPool_.Release(flowSlot);
-            }
-
-            // Acknowledge whether or not the flow was still here: a re-delivered
-            // close for a flow already gone deserves the same answer, or the
-            // closer retries forever.
-            materials = GatherSendMaterials(*peer);
-            ack       = true;
-        }
-
-        if (ack)
-        {
-            const uint8_t reply[2] = { static_cast<uint8_t>(flowId),
-                                       static_cast<uint8_t>(flowId >> 8) };
-            SendSecureControl(from, materials, internal::SECURE_CHANNEL_FLOW_CLOSE_ACK,
-                              reply, sizeof(reply));
-            common::crypto::Wipe(materials.key.data(), materials.key.size());
-        }
-    }
-
-    void Socket::Flow_CloseAck(const Address& from, const uint8_t* payload, size_t len)
-    {
-        // Confirms one of OUR closes: OUT side.
-        if (!outAssocDir_ || len < 2) return;
-        const uint16_t flowId = static_cast<uint16_t>(payload[0])
-                              | static_cast<uint16_t>(payload[1]) << 8;
-
-        PeerHandle peerHandle = peers_.GetPeer(from);
-        if (peerHandle.Failed()) return;
-        Peer* peer = peerHandle.Write();
-        if (!peer || !peer->IsValid()) return;
-
-        FlowDirEntry* dir = OutAssocDirFor(peerHandle.GetSlotIndex());
-        const uint32_t flowSlot = FindFlowSlot(dir, maxOutAssocPerPeer_, flowId);
-        if (flowSlot == common::collections::SlotPool::INVALID) return;
-
-        // Only a CLOSING flow finishes here: the same id re-opened is a NEW
-        // flow, and a stale ack must not touch it. The peek reads the decision
-        // under the peer lock we hold; the teardown runs once it is unpublished.
-        bool closing;
-        {
-            const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
-                outAssocPool_.ReadLock(flowSlot));
-            closing = flow->life == FlowLifecycle::CLOSING
-                   && flow->flowId == flowId;
-            outAssocPool_.UnlockRead(flowSlot);
-        }
-        if (!closing) return;
-
-        EraseFlowSlot(dir, maxOutAssocPerPeer_, flowSlot);
-        FreeOutAssoc(flowSlot, peer);   // drain + refund the peer's budget + free
-    }
 
     void Socket::FreeOutAssoc(uint32_t flowSlot, Peer* refundTo) noexcept
     {
@@ -3378,28 +3295,6 @@ namespace bcp::flux
         }
     }
 
-    void Socket::RetryClose(OutAssociation& flow, uint64_t now, bool& giveUp)
-    {
-        // CLOSING is the only lifecycle still negotiated on the wire, so it is
-        // the only one with a retry. When the interval has elapsed: give up by
-        // asking the caller to finish the close locally (the remote is
-        // unreachable and the slot should stop being pinned), or arm a resend,
-        // which the caller reads back off the attempts bump.
-        giveUp = false;
-        if (flow.life != FlowLifecycle::CLOSING)
-            return;
-        if (now - flow.lastCtrlSentMicros < flowRetryIntervalMicros_)
-            return;
-
-        if (flow.attempts >= flowMaxAttempts_)
-        {
-            giveUp = true;
-            return;
-        }
-
-        ++flow.attempts;
-        flow.lastCtrlSentMicros = now;
-    }
 
     void Socket::RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
                                      uint32_t* resendSeqs, uint32_t* resendSlots,
@@ -3460,13 +3355,11 @@ namespace bcp::flux
 
         // Gather what to do (and the peer materials) under the transferred
         // handle, then send after it drops: nothing locked across a send.
-        enum class Ctrl : uint8_t { None, ResendClose } ctrl = Ctrl::None;
         bool exhausted = false;   // a reliable packet ran out of retransmits
         uint16_t flowId = 0;
         uint32_t resendSlots[RESENDS_PER_ASSOC_PER_TICK];
         uint32_t resendSeqs[RESENDS_PER_ASSOC_PER_TICK];
         uint32_t resendN = 0;
-        bool finishClose = false;   // CLOSING gave up: unpublish + free locally
 
         CongestionDelta ccDelta;   // loss gathered under the flow lock, applied under the peer's
 
@@ -3489,23 +3382,14 @@ namespace bcp::flux
                 outAssocPool_.WriteLock(flowSlot));
             flowId = flow->flowId;
 
-            const uint8_t attemptsBefore = flow->attempts;
             switch (flow->life)
             {
-            case FlowLifecycle::CLOSING:
-                RetryClose(*flow, now, finishClose);
-                break;
             case FlowLifecycle::OPEN:
                 RetransmitInflight(*flow, now, ccDelta, resendSeqs, resendSlots, resendN,
                                    exhausted);
                 break;
             default: break;
             }
-
-            // RetryClose signals a resend by bumping attempts while leaving the
-            // life unchanged. A give-up (finishClose) never bumps attempts.
-            if (!finishClose && flow->attempts > attemptsBefore)
-                ctrl = Ctrl::ResendClose;
 
             outAssocPool_.UnlockWrite(flowSlot);
 
@@ -3521,77 +3405,29 @@ namespace bcp::flux
                 }
             }
 
-            // Local finish for a given-up close: unpublish then free, no wire
-            // op. Upgrading to write revalidates on the other side of the gap
-            // (the dir entry is re-checked against the slot we decided on).
-            if (finishClose)
-            {
-                Peer* closePeer = peerHandle.Write();
-                if (closePeer)
-                {
-                    FlowDirEntry* dir = OutAssocDirFor(peerHandle.GetSlotIndex());
-                    if (dir[dirIndex].flowSlot == flowSlot)
-                        dir[dirIndex] = FlowDirEntry{ internal::INVALID_FLOW_ID, 0,
-                                                      common::collections::SlotPool::INVALID };
-                }
-                OutAssociation* closing = reinterpret_cast<OutAssociation*>(
-                    outAssocPool_.WriteLock(flowSlot));
-                const bool ours = closing->flowId == flowId
-                               && closing->life == FlowLifecycle::CLOSING;
-                outAssocPool_.UnlockWrite(flowSlot);
-                if (ours) FreeOutAssoc(flowSlot, closePeer);   // drain + refund + CLOSED + Release
-                return;
-            }
-
             const bool hasDelta = ccDelta.resolvedBytes != 0 || ccDelta.sawLoss;
-            if (!hasDelta && ctrl == Ctrl::None && resendN == 0) return;
+            if (!hasDelta && resendN == 0) return;
 
-            // Materials, plus one fresh counter per send (resends + one control
-            // op), on the same upgraded handle. The congestion feedback gathered
-            // above is applied here under the same write lock. All sends run
-            // after this scope with no peer or flow lock held: the staging read
-            // lock a resend takes must never nest under the peer lock (the send
-            // path holds staging then takes the peer lock; the reverse here would
-            // deadlock).
+            // Congestion feedback applies under this write lock; the resends run
+            // after the scope with nothing held, because a resend takes the
+            // staging read lock and the send path takes staging before the peer.
+            // Doing it under the peer lock would invert that order.
             Peer* peerState = peerHandle.Write();
             if (!peerState || !peerState->IsValid()) return;
-            ApplyCongestion(*peerState, ccDelta, now);   // no-op when the delta is empty
-            if (ctrl == Ctrl::None && resendN == 0) return;   // delta applied; nothing to send
+            ApplyCongestion(*peerState, ccDelta, now);
+            if (resendN == 0) return;
 
-            // The first counter (from GatherSendMaterials) goes to the control op
-            // when there is one, else to the first resend, matching the source's
-            // ++sendCounter order so data and control never share a nonce.
+            // One fresh counter per resend, in the order the source hands them
+            // out, so no two packets share a nonce.
             PeerSendMaterials base = GatherSendMaterials(*peerState);
-            if (ctrl != Ctrl::None)
+            for (uint32_t i = 0; i < resendN; ++i)
             {
-                ctrlMaterials = base;
-                for (uint32_t i = 0; i < resendN; ++i)
-                {
-                    resendMaterials[i] = base;
+                resendMaterials[i] = base;
+                if (i > 0)
                     resendMaterials[i].counter = ++peerState->sendCounter;
-                }
-            }
-            else
-            {
-                for (uint32_t i = 0; i < resendN; ++i)
-                {
-                    resendMaterials[i] = base;
-                    if (i > 0)
-                        resendMaterials[i].counter = ++peerState->sendCounter;
-                }
             }
             common::crypto::Wipe(base.key.data(), base.key.size());
         }
-
-        if (ctrl == Ctrl::ResendClose)
-        {
-            const uint8_t payload[2] = { static_cast<uint8_t>(flowId),
-                                         static_cast<uint8_t>(flowId >> 8) };
-            SendSecureControl(addr, ctrlMaterials, internal::SECURE_CHANNEL_FLOW_CLOSE,
-                              payload, sizeof(payload));
-        }
-        if (ctrl != Ctrl::None)
-            common::crypto::Wipe(ctrlMaterials.key.data(), ctrlMaterials.key.size());
 
         // `addr` is the peer's current address: the handle the caller passed was
         // looked up by it, and that lookup only succeeds while the peer is bound
@@ -3785,9 +3621,7 @@ namespace bcp::flux
                         if (dir[i].flowSlot == common::collections::SlotPool::INVALID) continue;
                         const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
                             outAssocPool_.ReadLock(dir[i].flowSlot));
-                        if (flow->life == FlowLifecycle::CLOSING)
-                            consider(flow->lastCtrlSentMicros + flowRetryIntervalMicros_);
-                        else if (flow->life == FlowLifecycle::OPEN && flow->unresolved > 0)
+                        if (flow->life == FlowLifecycle::OPEN && flow->unresolved > 0)
                         {
                             // Earliest RTO across in-flight entries; a full scan
                             // is bounded by the ring cap.

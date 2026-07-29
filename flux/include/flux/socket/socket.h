@@ -615,8 +615,6 @@ namespace bcp::flux
         static void EraseFlowSlot(FlowDirEntry* dir, uint32_t width, uint32_t flowSlot) noexcept;
 
         void Flow_Reject(const Address& from, const uint8_t* payload, size_t len);
-        void Flow_Close(const Address& from, const uint8_t* payload, size_t len);
-        void Flow_CloseAck(const Address& from, const uint8_t* payload, size_t len);
         void Flow_Ack(const Address& from, const uint8_t* payload, size_t len);
 
         /** The teardown {drain rings -> refund bytesInFlight (skip if the peer
@@ -688,7 +686,6 @@ namespace bcp::flux
         // lifecycle-retry step and a retransmit step; each reads the clock once
         // at entry, for that flow.
         void UpdateOutFlow(const Address& addr, PeerHandle peer, uint32_t dirIndex, uint64_t nowOverride);
-        void RetryClose(OutAssociation& flow, uint64_t now, /*out*/ bool& giveUp);
         void RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
                                 /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots,
                                 uint32_t& resendCount, /*out*/ bool& exhausted);

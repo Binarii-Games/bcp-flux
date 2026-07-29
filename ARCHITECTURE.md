@@ -631,7 +631,11 @@ builder, and is never held across a peer or association lock.
 Opening is also local in the other sense: it costs nothing on the wire. A flow
 can be sent on the instant `OpenFlow` returns, including before the peer
 handshake has completed, and the receiver builds its half from whichever packet
-reaches it first. Closing is still a wire exchange. `FAILED` is terminal, reached when
+reaches it first. Closing is local. `CloseFlow` walks the flow's association list, releases what
+each was holding and frees the flow, sending nothing. Telling the far side would
+buy little: a flow is not tied to a peer, so a remote dropping its receive state
+can never end the flow, only lose one association, and an unused association
+idles out on its own. `FAILED` is terminal, reached when
 the remote rejects the flow or a packet exhausts its retransmits; the rings are
 drained and the congestion bytes refunded immediately, but the slot waits for
 the application to observe the failure through its handle before being
@@ -658,9 +662,8 @@ without it `CloseFlow` would scan every peer and take a lock on each.
 
 The per-peer flow directory is split in two so that "my flow 3 to you" and "your
 flow 3 to me" cannot collide. Which directory a message resolves against follows
-from who opened the flow: data and `FLOW_CLOSE` name the sender's out-flow and
-land in the in directory, while `FLOW_REJECT` and `FLOW_CLOSE_ACK` answer our
-own flows and land in the out directory.
+from who opened the flow: data names the sender's flow and lands in the in
+directory, while `FLOW_REJECT` answers our own and lands in the out directory.
 
 A reliable flow's plaintext is its retransmit source and lives in the staging
 pool until its sequence resolves. That is why a packet parked behind an

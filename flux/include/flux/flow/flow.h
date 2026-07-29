@@ -31,9 +31,11 @@ namespace bcp::flux
     };
 
     /** Lifecycle, used at both scopes with different meanings. A flow is OPEN
-        until the application closes it. An association is OPEN until that one
-        target rejects it or stops answering, and FAILED there leaves the flow
-        open for every other peer. */
+        until the application closes it, and CLOSING only for the span of that
+        close, so nothing opens a new association under a flow going away. An
+        association is OPEN until that one target rejects it or stops
+        answering, and FAILED there leaves the flow open for every other
+        peer. */
     enum class FlowLifecycle : uint8_t
     {
         OPEN    = 0,
@@ -150,9 +152,9 @@ namespace bcp::flux
 
     /** One peer's map from wire flow id to association slot. Each peer owns two
         fixed strips, one per direction, so "my flow 3 to you" and "your flow 3
-        to me" cannot collide. Data and FLOW_CLOSE name the sender's flow and
-        resolve against the IN strip; FLOW_REJECT and FLOW_CLOSE_ACK answer our
-        own and resolve against the OUT strip.
+        to me" cannot collide. Data names the sender's flow and resolves against
+        the IN strip; FLOW_REJECT answers our own and resolves against the OUT
+        strip.
 
         flowSlot == INVALID marks a free entry. pad is the alignment gap, named
         so it is zeroed rather than left indeterminate. */
@@ -203,9 +205,6 @@ namespace bcp::flux
 
         uint32_t epoch;         ///< revalidates the drain's peek against its claim
         FlowLifecycle life;     ///< per target: FAILED here leaves the flow open
-
-        uint8_t  attempts;              ///< FLOW_CLOSE retries
-        uint64_t lastCtrlSentMicros;    ///< paces those retries
 
         uint32_t nextSeq;
         uint32_t unresolved;    ///< stamped and unacked; the send gate refuses at inflightCap
