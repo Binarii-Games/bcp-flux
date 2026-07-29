@@ -81,6 +81,38 @@ namespace bcp::flux
         FAILED  = 3,
     };
 
+    /** A flow the application opened: what it IS, independent of who it talks
+        to. One per OpenFlow, socket-wide, and what a FlowHandle points at.
+
+        A flow is not bound to a peer. Sending on it to an address creates an
+        association for that (flow, peer) pair on first use, and the flow keeps
+        a list of them so closing it can reach every one. Talking to fifty
+        peers is one flow and fifty associations, each numbering its own
+        sequences, so a slow peer never stalls the others.
+
+        mode, window and the encoded wire byte are copied into every
+        association at creation. That is deliberate duplication of immutable
+        values, not state to keep in sync: the send gate, the waiting-ring
+        drain and the retransmit scan all read them per packet, and reaching
+        back here would mean a second lock on the packet path purely to answer
+        "is this reliable?". The receiving side already does the same, copying
+        mode and window out of each arriving flow byte.
+
+        `life` here is the flow's own: OPEN until the app closes it. An
+        association carries its own life, which is per target and can reach
+        FAILED while the flow stays open for every other peer. The two are
+        different scopes and neither replaces the other. */
+    struct Flow
+    {
+        uint32_t epoch;         ///< bumped on every lease; stale handles miss
+        uint32_t firstAssoc;    ///< head of the association list, INVALID when none
+        uint16_t flowId;
+        uint16_t window;        ///< declared in-flight cap, what the wire byte encodes
+        FlowMode mode;
+        uint8_t  flowData;      ///< the wire byte, encoded once at open
+        FlowLifecycle life;     ///< OPEN / CLOSING / CLOSED, socket-wide
+    };
+
     /** The identity and lifecycle every flow carries regardless of direction,
         embedded as the FIRST member of both flow types so shared machinery
         (open/close retries, epoch checks, the peer-removal sweep) can operate
@@ -215,6 +247,18 @@ namespace bcp::flux
     struct OutFlowState
     {
         FlowCore core;
+
+        /** The Flow this association belongs to, and the next association under
+            that same Flow. An intrusive list, so CloseFlow reaches every target
+            without walking the peer table: the directories index peer to
+            association, and this is the one direction they cannot answer.
+            Same shape as the pending-packet list a peer holds. */
+        uint32_t flowSlot;
+        uint32_t nextInFlow;
+
+        /** The wire byte, copied from the Flow at creation so stamping a packet
+            never has to lock the Flow. Immutable for the flow's life. */
+        uint8_t  flowData;
 
         uint32_t nextSeq;
 

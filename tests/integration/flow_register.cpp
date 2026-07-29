@@ -70,7 +70,7 @@ static void RegistersFromFirstPacket()
     const flux::Address addrB = flux_net::Loopback(PORT_B);
 
     // No handshake yet, no wire traffic from the open, nothing to wait on.
-    flux::FlowHandle flow = client.OpenFlow(addrB, 7, flux::FlowMode::RELIABLE_ORDERED);
+    flux::FlowHandle flow = client.OpenFlow(7, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!flow.Failed());
     CHECK(client.GetFlowState(flow) == flux::FlowLifecycle::OPEN);
 
@@ -105,7 +105,7 @@ static void RejectedWhenTheReceiverIsFull()
 
     const flux::Address addrB = flux_net::Loopback(PORT_B);
 
-    flux::FlowHandle accepted = client.OpenFlow(addrB, 1, flux::FlowMode::RELIABLE_ORDERED);
+    flux::FlowHandle accepted = client.OpenFlow(1, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!accepted.Failed());
     CHECK(client.BuildPacket().WithFlow(accepted).PutU32(100).Send(addrB)
           == common::Error::Ok);
@@ -116,7 +116,7 @@ static void RejectedWhenTheReceiverIsFull()
 
     // Second flow to the same peer: locally fine, but the server has no room
     // for it. Nothing about OpenFlow can know that, so it still succeeds.
-    flux::FlowHandle refused = client.OpenFlow(addrB, 2, flux::FlowMode::RELIABLE_ORDERED);
+    flux::FlowHandle refused = client.OpenFlow(2, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!refused.Failed());
     CHECK(client.GetFlowState(refused) == flux::FlowLifecycle::OPEN);
 
@@ -129,11 +129,13 @@ static void RejectedWhenTheReceiverIsFull()
     // Never delivered, and the flow is FAILED rather than still trying: the
     // reject told the sender to stop. The app reads that off its handle.
     CHECK(delivered.empty());
-    CHECK(client.GetFlowState(refused) == flux::FlowLifecycle::FAILED);
+    CHECK(client.GetFlowState(refused, addrB) == flux::FlowLifecycle::FAILED);
+    // The FLOW itself is untouched: only that one target failed.
+    CHECK(client.GetFlowState(refused) == flux::FlowLifecycle::OPEN);
 
     // The rejection is scoped to the one flow. The accepted flow to the same
     // peer keeps working, which is what makes a caps refusal survivable.
-    CHECK(client.GetFlowState(accepted) == flux::FlowLifecycle::OPEN);
+    CHECK(client.GetFlowState(accepted, addrB) == flux::FlowLifecycle::OPEN);
     CHECK(client.BuildPacket().WithFlow(accepted).PutU32(101).Send(addrB)
           == common::Error::Ok);
 

@@ -605,10 +605,33 @@ connection across an address change the user made in order to break that link.
 
 #### Flows
 
-Opening is local and costs nothing on the wire. A flow is born `OPEN` and can
-be sent on the instant `OpenFlow` returns, including before the peer handshake
-has completed, and the receiver builds its half from whichever packet reaches
-it first. Closing is still a wire exchange. `FAILED` is terminal, reached when
+A flow is not bound to a peer. `OpenFlow(id, mode, window)` takes no address:
+it creates a small socket-wide object holding what the flow *is*, and sending
+on it to an address creates the per-target state, the association, on first
+use. One flow therefore serves many peers, each with its own sequence, its own
+in-flight state and its own failure, which is what keeps a slow or dead target
+from touching the others. The flow id space is the socket's, so one id names
+one flow, because a remote reads only that id off the wire.
+
+The two carry different state. A flow holds id, mode, declared window, the
+encoded wire byte and a lifecycle the application controls. An association
+holds the peer identity, the sequence, both rings, the round-trip estimate and
+a lifecycle the traffic controls, which can reach `FAILED` for one target while
+the flow stays open for every other. Neither replaces the other.
+
+Mode, window and the wire byte are copied into each association when it is
+created. That duplication is deliberate: they are immutable for the flow's
+life, and the send gate, the waiting-ring drain and the retransmit scan all
+read them per packet, so reaching back to the flow would mean a second lock on
+the packet path purely to answer "is this reliable?". The receiving side has
+always done the same, copying mode and window out of each arriving flow byte.
+Because of it the flow lock is taken and released once per send, at the
+builder, and is never held across a peer or association lock.
+
+Opening is also local in the other sense: it costs nothing on the wire. A flow
+can be sent on the instant `OpenFlow` returns, including before the peer
+handshake has completed, and the receiver builds its half from whichever packet
+reaches it first. Closing is still a wire exchange. `FAILED` is terminal, reached when
 the remote rejects the flow or a packet exhausts its retransmits; the rings are
 drained and the congestion bytes refunded immediately, but the slot waits for
 the application to observe the failure through its handle before being
@@ -626,6 +649,12 @@ too wide yields `FLOW_REJECT`, and the sender fails that one flow rather than
 retransmitting into silence. Every other flow to the same peer is unaffected.
 This is the one path on which a remote makes this socket allocate, and it is
 reachable only after that peer completed a handshake.
+
+Two indexes reach an association, in opposite directions. The per-peer
+directories answer peer to association, which is what the packet path and peer
+removal need; each peer owns a fixed strip, so a removal is a bounded walk. An
+intrusive list per flow answers flow to associations, which only closing needs;
+without it `CloseFlow` would scan every peer and take a lock on each.
 
 The per-peer flow directory is split in two so that "my flow 3 to you" and "your
 flow 3 to me" cannot collide. Which directory a message resolves against follows

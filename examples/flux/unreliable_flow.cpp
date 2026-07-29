@@ -81,7 +81,7 @@ int main()
     std::thread responder(Tick, std::ref(b));
 
     // Local and immediate, same as the reliable case.
-    flux::FlowHandle flow = a.OpenFlow(addrB, FLOW_ID, flux::FlowMode::UNRELIABLE);
+    flux::FlowHandle flow = a.OpenFlow(FLOW_ID, flux::FlowMode::UNRELIABLE);
 
     flux::PacketSlotHandle sink[8];
 

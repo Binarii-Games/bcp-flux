@@ -142,7 +142,7 @@ static void reliable_ordered_flow_delivers_in_order()
     // Opening is local: the flow is OPEN and sendable the instant it exists,
     // with nothing on the wire and nothing to wait for. The server has never
     // heard of flow 7 and will register it from the first packet that arrives.
-    flux::FlowHandle flow = client.OpenFlow(relayAddr, 7, flux::FlowMode::RELIABLE_ORDERED);
+    flux::FlowHandle flow = client.OpenFlow(7, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!flow.Failed());
     CHECK(client.GetFlowState(flow) == flux::FlowLifecycle::OPEN);
 

@@ -9,14 +9,16 @@
 
 namespace bcp::flux
 {
-    /** The app's reference to a flow it opened: a key, not a lease. Only
-        out-flows have one (flows are unidirectional, and the receiving side of
-        a remote's flow is Flux-internal, invisible to the app). It holds no
-        lock and keeps nothing alive; the flow lives in the socket until
-        CloseFlow, so it is cheap to hold for the flow's whole life. Every
+    /** The app's reference to a flow it opened: a key, not a lease. It names
+        the flow, never a target, so the same handle addresses every peer the
+        flow is sent to. The receiving side of a remote's flow is Flux-internal
+        and has no handle.
+
+        It holds no lock and keeps nothing alive; the flow lives in the socket
+        until CloseFlow, so it is cheap to hold for the flow's whole life. Every
         operation goes through the socket (GetFlowState, CloseFlow, sending),
         which checks slot + epoch: a handle outliving its flow misses, never
-        reaching a recycled slot's new tenant.
+        reaching a recycled slot's new tenant, even when the id is reopened.
 
         Move-only so the flow keeps one referent; a moved-from handle is failed
         and matches nothing. */

@@ -175,7 +175,11 @@ namespace bcp::flux
                 direction. */
             struct Flows
             {
-                uint32_t outCount          = 0;    ///< socket-wide out-flow pool
+                /** Flows the application may hold open at once, socket-wide.
+                    A flow is small (id, mode, window, lifecycle); the per-peer
+                    state it spawns is sized by outCount below. */
+                uint32_t flowCount         = 64;
+                uint32_t outCount          = 0;    ///< socket-wide out-ASSOCIATION pool
                 uint32_t inCount           = 0;    ///< socket-wide in-flow pool
                 uint32_t maxOutPerPeer     = 8;    ///< out-directory width per peer
                 uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: flows one remote may register
@@ -310,24 +314,39 @@ namespace bcp::flux
             or complete. Progress is observable via GetPeer. */
         [[nodiscard]] common::Error Connect(const Address& addr);
 
-        /** Opens a flow to the peer. Local and immediate: nothing goes on the
-            wire, the flow comes back OPEN, and it can be sent on straight
-            away, including before the peer handshake has finished (those
-            packets park behind it like any other). The remote registers its
-            receiving half from the first packet that arrives, and refuses only
-            when it is at its caps, which fails the flow rather than the send.
-            Unknown address handshakes first, like Send. The id is the app's to
-            choose and must be free with this peer; the failed handle says why
-            otherwise. */
-        [[nodiscard]] FlowHandle OpenFlow(const Address& peer, uint16_t flowId, FlowMode mode);
+        /** Opens a flow. Local, immediate, and NOT bound to a peer: send on it
+            to any address and the per-target state is created on first use, so
+            one flow serves many peers with an independent sequence for each.
+            Nothing goes on the wire, and it can be sent on straight away, even
+            before a peer handshake has finished; those packets park behind it
+            like any other. The remote registers its receiving half from the
+            first packet that arrives and refuses only when it is at its caps,
+            which fails that one target rather than the flow.
 
-        /** Begins closing: no new sends, tell the remote (FLOW_CLOSE), recycle
-            the slot once the close completes or retries run out. Idempotent; a
-            stale handle is InvalidState. */
+            `window` is the in-flight cap this flow declares on every packet,
+            and a receiver refuses a flow wider than its own dedupe bitmap. It
+            must be a power of two between 32 and 32768 and no wider than this
+            socket's own ring; 0 takes the configured default. The id is the
+            app's to choose and must be free on this socket. */
+        [[nodiscard]] FlowHandle OpenFlow(uint16_t flowId, FlowMode mode, uint32_t window = 0);
+
+        /** Closes the flow and every target it was talking to, releasing their
+            rings and refunding what they held in flight. The flow slot is
+            recycled, so the id becomes free and the handle goes stale.
+            InvalidState on a stale handle or one already closing. */
         [[nodiscard]] common::Error CloseFlow(const FlowHandle& flow);
 
         /** Where the flow stands. CLOSED for a stale handle (epoch check). */
+        /** The flow's own state: OPEN until closed, whatever any one target is
+            doing. */
         [[nodiscard]] FlowLifecycle GetFlowState(const FlowHandle& flow);
+
+        /** This flow's state with ONE peer, which is where failure lives. A
+            target that rejected the flow or stopped answering reads FAILED
+            here while the flow stays OPEN for everybody else. CLOSED means no
+            association exists yet, which is also what a target never sent to
+            reads. */
+        [[nodiscard]] FlowLifecycle GetFlowState(const FlowHandle& flow, const Address& peer);
 
         /** Advances this side's migration tag for every established peer, so
             packets after a deliberate local address change wear unlinkable
@@ -373,6 +392,12 @@ namespace bcp::flux
 
         // Flow storage, split by direction; per-peer directory segments indexed
         // by peer slot, under that peer's lock (the replayState_ shape).
+        /** The flows themselves, one slot per OpenFlow. Separate from the
+            association pool because the two are sized for opposite things: a
+            flow is a handful of bytes and there are few, an association owns
+            the rings and there are as many as (flows x peers actually talked
+            to). */
+        common::collections::SlotPool  flowPool_;
         common::collections::SlotPool  outFlowPool_;
         common::collections::SlotPool  inFlowPool_;
         std::unique_ptr<FlowDirEntry[]> outFlowDir_;
@@ -604,6 +629,32 @@ namespace bcp::flux
 
             @param refundTo null when the peer itself is being freed. */
         void FreeOutFlow(uint32_t flowSlot, Peer* refundTo) noexcept;
+
+        /** Finds a flow by the id the app chose. The pool is small and opens
+            are rare, so a scan beats an index nobody else would use.
+
+            @return the flow slot, or SlotPool::INVALID. */
+        [[nodiscard]] uint32_t FindFlowById(uint16_t flowId) noexcept;
+
+        /** Leases the per-target state for (flow, peer) on first send, copying
+            the flow's mode, window and wire byte into it so every later packet
+            reads one object under one lock.
+
+            @pre Caller holds the peer's write lock.
+            @return the association slot, or INVALID when no such flow is open,
+                    the pool is dry, or this peer is at its directory cap. */
+        [[nodiscard]] uint32_t CreateAssociation(const Peer& peer, uint32_t peerSlot,
+                                                 uint16_t flowId) noexcept;
+
+        /** Links an association into its flow's list, and unlinks it. Both run
+            under the flow's write lock, which is the list's guard.
+
+            Unlink is called from every path that frees an association: the
+            close sweep, the peer sweep, and a failed registration. An
+            association left linked after its slot is recycled would put a
+            stranger's state on the flow's list. */
+        void LinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept;
+        void UnlinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept;
 
         /** Marks an out-flow FAILED and gives back everything it holds: the
             in-flight ring's leases and their congestion bytes, and the waiting

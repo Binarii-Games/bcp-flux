@@ -89,9 +89,8 @@ int main()
     // Local and immediate: no wire exchange, nothing to wait for. The peer
     // handshake still happens underneath on first send, and the packets park
     // behind it.
-    flux::FlowHandle flow = a.OpenFlow(addrB, FLOW_ID, flux::FlowMode::RELIABLE_ORDERED);
+    flux::FlowHandle flow = a.OpenFlow(FLOW_ID, flux::FlowMode::RELIABLE_ORDERED);
 
-    flux::PacketSlotHandle sink[8];
 
     // WithFlow instead of NoFlow: the packet gets the flow's id and its next
     // sequence number, which is what makes acking, ordering and resending
@@ -101,6 +100,7 @@ int main()
 
     // A keeps pumping: the acks that resolve the in-flight packets come back
     // here, and an unacked reliable packet is retransmitted from Update.
+    flux::PacketSlotHandle sink[8];
     while (delivered < BURST)
     {
         a.Update();
