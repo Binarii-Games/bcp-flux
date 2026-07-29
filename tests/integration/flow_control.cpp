@@ -1,14 +1,16 @@
-// Reliable ordered flow, end to end over real UDP. A flow is opened locally,
-// with nothing on the wire, and the receiver registers its half from the first
-// packet that arrives; then a burst of numbered packets is sent on it. A RELIABLE_ORDERED flow must deliver every one, in the
-// order they were sent.
+// Each flow mode's delivery contract, end to end over real UDP. A flow is
+// opened locally, with nothing on the wire, the receiver registers its half
+// from the first packet that arrives, and a burst of numbered packets is sent
+// on it. RELIABLE_ORDERED must deliver every one in send order,
+// RELIABLE_UNORDERED must deliver every one in whatever order they arrive, and
+// UNRELIABLE must deliver newest only, dropping a packet that arrives after a
+// newer one was delivered.
 //
-// Ordering is the whole point, so the test induces disorder: the burst is
-// routed through a relay that swaps adjacent datagrams before they reach the
-// server. Only a correct resequencer (hold an out-of-order packet until the gap
-// before it fills) recovers 0..N-1 in order; a deliver-on-arrival flow would
-// hand back 1,0,3,2,... and fail. Over plain loopback nothing reorders, so
-// without the relay this assertion could never fail.
+// Arrival order is what separates the contracts, so every burst is routed
+// through a relay that swaps adjacent datagrams before they reach the server.
+// Over plain loopback nothing reorders, and without the relay none of these
+// assertions could fail: the resequencing check needs a gap to hold back, and
+// the newest-only check needs a stale packet to arrive late.
 #include "flux_net.h"
 #include "udp_raw.h"
 
@@ -191,8 +193,119 @@ static void reliable_ordered_flow_delivers_in_order()
     relay.Close();
 }
 
+// The shared shape of the unordered-mode cases: establish through a swapping
+// relay, send a numbered burst on one flow of the given mode, and collect what
+// the server delivers, in delivery order. The caller asserts its contract on
+// the result. `expected` only bounds the drain: draining stops early once that
+// many arrived, so a correct run does not sit out the full tick count.
+static bool RunSwappedBurst(flux::FlowMode mode, uint16_t clientPort, uint16_t serverPort,
+                            uint16_t relayPort, uint32_t burst, size_t expected,
+                            std::vector<uint32_t>& delivered, int& swaps)
+{
+    flux::Socket client, server;
+    CHECK(InitWithFlows(client, clientPort) == common::Error::Ok);
+    CHECK(InitWithFlows(server, serverPort) == common::Error::Ok);
+
+    ReorderRelay relay;
+    CHECK(relay.Init(relayPort, clientPort, serverPort));
+    const flux::Address relayAddr = Loopback(relayPort);
+
+    flux::PacketSlotHandle sink[64];
+
+    CHECK(client.Connect(relayAddr) == common::Error::Ok);
+    bool established = false;
+    for (int i = 0; i < 300 && !established; ++i)
+    {
+        relay.Pump();
+        client.Poll(sink, 64);
+        server.Poll(sink, 64);
+        client.Update();
+        server.Update();
+        established = Established(client, relayAddr) && Established(server, relayAddr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(established);
+    if (!established) { relay.Close(); return false; }
+
+    flux::FlowHandle flow = client.OpenFlow(9, mode);
+    CHECK(!flow.Failed());
+
+    relay.reorderActive = true;
+    for (uint32_t seq = 0; seq < burst; ++seq)
+        CHECK(client.BuildPacket().WithFlow(flow).PutU32(seq).Send(relayAddr) == common::Error::Ok);
+
+    for (int i = 0; i < 300 && delivered.size() < expected; ++i)
+    {
+        relay.Pump();
+        flux::PacketSlotHandle handles[64];
+        uint32_t count = server.Poll(handles, 64);
+        for (uint32_t h = 0; h < count; ++h)
+        {
+            flux::PacketSlotReader reader{std::move(handles[h])};
+            uint32_t seq = 0;
+            if (reader.TakeU32(seq)) delivered.push_back(seq);
+        }
+        client.Poll(sink, 64);
+        client.Update();
+        server.Update();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    swaps = relay.swaps;
+    relay.Close();
+    return true;
+}
+
+static void reliable_unordered_flow_delivers_everything()
+{
+    // The relay swaps adjacent pairs, so packets arrive out of order. The
+    // contract is delivery exactly once per packet, in whatever order they
+    // came: nothing held back, nothing dropped, duplicates filtered.
+    constexpr uint32_t BURST = 32;
+    std::vector<uint32_t> delivered;
+    int swaps = 0;
+    if (!RunSwappedBurst(flux::FlowMode::RELIABLE_UNORDERED, 9433, 9434, 9435,
+                         BURST, BURST, delivered, swaps))
+        return;
+
+    CHECK(swaps > 0);
+    CHECK(delivered.size() == BURST);
+    bool eachOnce = true;
+    uint32_t seenCount[BURST] = {};
+    for (uint32_t payload : delivered)
+        if (payload < BURST) ++seenCount[payload]; else eachOnce = false;
+    for (uint32_t i = 0; i < BURST; ++i)
+        if (seenCount[i] != 1) eachOnce = false;
+    CHECK(eachOnce);
+}
+
+static void unreliable_flow_delivers_newest_only()
+{
+    // Same swapped wire, opposite contract: when the newer of a swapped pair
+    // arrives first, the older one is stale on arrival and must be dropped.
+    // Newest-only delivery is exactly "the delivered sequence is strictly
+    // increasing", and the swaps guarantee at least one stale drop, so a full
+    // delivery count would mean the drop never happened.
+    constexpr uint32_t BURST = 32;
+    std::vector<uint32_t> delivered;
+    int swaps = 0;
+    if (!RunSwappedBurst(flux::FlowMode::UNRELIABLE, 9436, 9437, 9438,
+                         BURST, BURST / 2, delivered, swaps))
+        return;
+
+    CHECK(swaps > 0);
+    CHECK(!delivered.empty());
+    CHECK(delivered.size() < BURST);
+    bool strictlyIncreasing = true;
+    for (size_t i = 1; i < delivered.size(); ++i)
+        if (delivered[i] <= delivered[i - 1]) strictlyIncreasing = false;
+    CHECK(strictlyIncreasing);
+}
+
 int main()
 {
     reliable_ordered_flow_delivers_in_order();
+    reliable_unordered_flow_delivers_everything();
+    unreliable_flow_delivers_newest_only();
     return test::report();
 }

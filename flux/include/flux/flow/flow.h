@@ -20,9 +20,11 @@
 
 namespace bcp::flux
 {
-    /** Whether lost data is retransmitted, and whether delivery waits for
-        order. Every flow packet is numbered and acknowledged whatever the mode,
-        so UNRELIABLE means never resent, not invisible to congestion control. */
+    /** Whether lost data is retransmitted, and what delivery promises. Every
+        flow packet is numbered and acknowledged whatever the mode, so even
+        UNRELIABLE traffic feeds congestion control. UNRELIABLE is never resent
+        and delivers newest only: it carries current state, so a packet older
+        than the newest delivered is dropped as stale. */
     enum class FlowMode : uint8_t
     {
         RELIABLE_ORDERED   = 0,

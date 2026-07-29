@@ -1547,13 +1547,23 @@ namespace bcp::flux
 
     uint32_t Socket::DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq)
     {
-        // Unordered and unreliable: deliver on arrival, no hold-back, so no recv
-        // slot is ever pinned and nothing can flood. The seen bitmap dedupes
-        // retransmits (a fresh nonce clears the replay window, so only this
-        // catches them). A duplicate re-arms acking: the sender's FLOW_ACK may
-        // have been lost, and only a fresh ack stops the resend.
+        // Both unordered modes: no hold-back, so no recv slot is ever pinned
+        // and nothing can flood. The seen bitmap dedupes retransmits (a fresh
+        // nonce clears the replay window, so only this catches them). A
+        // duplicate re-arms acking: the sender's FLOW_ACK may have been lost,
+        // and only a fresh ack stops the resend.
         if (AlreadySeen(&flow, seq))
         {
+            ArmAck(&flow);
+            return 0;
+        }
+        // Unreliable is newest only: a packet older than the newest delivered
+        // carries stale state and is dropped. Still committed and acked, so the
+        // sender resolves it now rather than waiting out the RTO, and not as a
+        // loss, because the network delivered it and policy dropped it.
+        if (flow.mode == FlowMode::UNRELIABLE && seq <= flow.recvHighest)
+        {
+            CommitSeen(&flow, seq);
             ArmAck(&flow);
             return 0;
         }
