@@ -1,6 +1,9 @@
-// A opens an UNRELIABLE flow to B and sends a numbered burst on it.
+// A opens an UNRELIABLE flow and sends a numbered burst on it to B.
 //
-// Same shape as reliable_flow, one word different: the mode passed to OpenFlow.
+// One word different from reliable_flow: the mode passed to OpenFlow. Everything
+// else about a flow is the same, so this one keeps to a single peer to isolate
+// what the mode changes; reliable_flow is where one flow reaching several peers
+// is shown.
 //
 // UNRELIABLE still numbers and acknowledges every packet, so loss is visible to
 // congestion control, but nothing is ever retransmitted and nothing is held
@@ -46,7 +49,7 @@ static void Tick(flux::Socket& socket)
         for (uint32_t i = 0; i < count; ++i)
         {
             // The flow id and sequence number ride the wire header, so an
-            // UNRELIABLE packet is still numbered — it just is not resent.
+            // UNRELIABLE packet is still numbered, it just is not resent.
             const uint16_t flowId = inbox[i].Read()->FlowId();
 
             flux::PacketSlotReader reader{std::move(inbox[i])};
@@ -80,7 +83,8 @@ int main()
 
     std::thread responder(Tick, std::ref(b));
 
-    // Local and immediate, same as the reliable case.
+    // Local, immediate, and not bound to B: this flow could be sent to any
+    // number of peers, and each would get its own state. One is enough here.
     flux::FlowHandle flow = a.OpenFlow(FLOW_ID, flux::FlowMode::UNRELIABLE);
 
     flux::PacketSlotHandle sink[8];

@@ -94,7 +94,7 @@ int main()
     constexpr uint8_t HELLO_B[] = "hello from B";
 
     // NoFlow is a standalone packet: no sequence number, no ack, no
-    // retransmission. And there is no connect step — a first send to an unknown
+    // retransmission. And there is no connect step: a first send to an unknown
     // address starts the handshake and holds the message until the session is up.
     a.BuildPacket().NoFlow().PutBytes(HELLO_A, sizeof(HELLO_A) - 1).Send(addrB);
     b.BuildPacket().NoFlow().PutBytes(HELLO_B, sizeof(HELLO_B) - 1).Send(addrA);

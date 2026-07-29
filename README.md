@@ -33,6 +33,10 @@ reliability, encryption and connection handling by hand.
 - **Three delivery modes on one socket.** Reliable-ordered, reliable-unordered,
   and unreliable. All three are numbered and acknowledged, so loss stays visible
   to congestion control even when nothing is retransmitted.
+- **Flows are not tied to a peer.** One flow serves every address you send it
+  to, each target getting its own sequence, its own retransmits and its own
+  failures, so a dead peer never affects the others. Opening one is local and
+  puts nothing on the wire.
 - **Survives address changes.** A peer that moves keeps its session with no
   re-handshake. The rotating tag identifying it is derived at both ends rather
   than sent, so a move leaves nothing on the wire to follow.
@@ -110,14 +114,14 @@ wire format, and how many ways there are to do each thing.
 
 ## Try it
 
-Each example is one file running two sockets in one process, built with
+Each example is one file running several sockets in one process, built with
 everything else:
 
 ```sh
 ./build/send_and_respond          # A sends, B answers
 ./build/respond                   # B answers through the packet itself, no address named
 ./build/simultaneous_handshake    # both send first, the handshake collision resolves itself
-./build/reliable_flow             # RELIABLE_ORDERED flow, numbered burst
+./build/reliable_flow             # one RELIABLE_ORDERED flow, numbered burst to two peers
 ./build/unreliable_flow           # the same burst on an UNRELIABLE flow
 ```
 
