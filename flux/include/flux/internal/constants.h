@@ -7,7 +7,7 @@
 namespace bcp::flux::internal
 {
     // --- Version ---
-    static constexpr uint16_t VERSION                       = 2; ///< 2: flows register from data packets; the flow header gained its data byte
+    static constexpr uint16_t VERSION                       = 0; ///< Stays 0 until 1.0: the wire is not frozen, so nothing negotiates on it
     static constexpr uint8_t  VERSION_CAPS_SIZE             = 4; ///< Fixed; changing it breaks older versions.
     static constexpr uint8_t  VERSION_SIZE                  = 2; 
 
