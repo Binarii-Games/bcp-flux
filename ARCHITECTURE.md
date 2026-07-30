@@ -452,15 +452,16 @@ wire, and the flow is sendable the instant it returns, including before any
 handshake. The receiver builds its half from whichever packet arrives first,
 reading the mode off the flow data byte.
 
-The in-flight window is `Config::flows::inFlightCount`, socket-wide and the same
-for every flow in both directions: the sender's ring capacity and the receiver's
-seen-bitmap width are one number. Nothing about it travels, so nothing detects a
-mismatch, and both ends must agree. A receiver narrower than its sender reads a
-late arrival below its bitmap floor as a duplicate and drops it without
-recording it, so that sequence enters no ack range and the sender never resolves
-it. On an unordered reliable flow the sender retransmits to its attempt cap and
-the association fails, so a mismatch shows up as failure under load rather than
-at registration.
+The in-flight window is `internal::FLOW_WINDOW`, 256 packets: the sender's ring
+capacity and the receiver's seen-bitmap width, one number for every flow in both
+directions. It is a constant rather than configuration, because nothing carries
+it on the wire and nothing negotiates it, so two sockets that disagreed would
+have no way to find out. Fixing it makes them agree by construction.
+
+That agreement is what the seen bitmap rests on. The send gate refuses when the
+ring slot for the next sequence is still occupied, so while a sequence is
+unresolved the sender can never advance a full window past it, and the
+receiver's bitmap floor can never climb above the oldest thing still in flight.
 
 Registration is caps-only: a dry pool or a full per-peer directory yields
 `FLOW_REJECT`, and the sender fails that one association rather than

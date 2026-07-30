@@ -63,13 +63,21 @@ namespace bcp::flux::internal
 
     // --- Flow ---
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
-    /** The flow window (out-ring capacity and in-bitmap width) rounds to a
-        power of two within these bounds. Floor 64 keeps the seen bitmap a whole
-        number of 64-bit words. The ceiling is the largest power of two that
-        fits OutAssociation::inflightCap and InAssociation::windowBits, both
-        uint16_t, so the rounded value never overflows either. */
-    static constexpr uint16_t FLOW_WINDOW_MIN               = 64;
-    static constexpr uint16_t FLOW_WINDOW_MAX               = 32768;
+    /** The in-flight window, in packets: the sender's ring capacity and the
+        receiver's seen-bitmap width, one number for every flow in both
+        directions. Fixed rather than configurable, because nothing carries it
+        on the wire and nothing negotiates it, so two sockets that disagreed
+        would have no way to find out. A constant makes them agree by
+        construction.
+
+        A power of two, since both the ring and the bitmap index by
+        seq & (window - 1). 256 is a whole number of 64-bit bitmap words, and
+        bounds a reliable association's ring at 6 KB. */
+    static constexpr uint16_t FLOW_WINDOW                   = 256;
+
+    /** Ceiling for the waiting and reorder rings, which stay configurable. The
+        largest power of two that fits the uint16_t caps they are stored in. */
+    static constexpr uint16_t FLOW_RING_MAX                 = 32768;
     /** Ack ranges one flow contributes to a single FLOW_ACK packet, emitted
         newest-first from its seen bitmap. A cap on wire bytes, not on memory:
         acks are cumulative, so ranges that miss one report ride the next. */

@@ -446,15 +446,9 @@ namespace bcp::flux
         const Config::Flows& f = config.flows;
         if (f.outCount == 0 && f.inCount == 0)
             return common::Error::Ok;   // flows disabled entirely
-        if (f.inFlightCount == 0)
-            return common::Error::InvalidParam;
-
-        // One window knob serves both roles (out-ring capacity and in-bitmap
-        // width), rounded to a power of two, floor 64. Nothing on the wire
-        // carries it, so two sockets configured differently are not reconciled.
-        // See Config::flows::inFlightCount for what a mismatch costs.
-        const uint32_t window = RoundUpPow2(f.inFlightCount, internal::FLOW_WINDOW_MIN,
-                                            internal::FLOW_WINDOW_MAX);
+        // Fixed, not configured: nothing carries the window on the wire, so two
+        // sockets that disagreed could never find out. See internal::FLOW_WINDOW.
+        const uint32_t window = internal::FLOW_WINDOW;
 
         auto initDir = [&](std::unique_ptr<FlowDirEntry[]>& dir, uint32_t width) -> bool
         {
@@ -476,9 +470,9 @@ namespace bcp::flux
             // Waiting rings are per-mode: each flow takes the knob its mode
             // names, while every out slot is sized for the larger of the two.
             outReliableWaitCap_ = static_cast<uint16_t>(f.reliableWaitCount > 0
-                ? RoundUpPow2(f.reliableWaitCount, 1, internal::FLOW_WINDOW_MAX) : 0);
+                ? RoundUpPow2(f.reliableWaitCount, 1, internal::FLOW_RING_MAX) : 0);
             outUnreliableWaitCap_ = static_cast<uint16_t>(f.unreliableWaitCount > 0
-                ? RoundUpPow2(f.unreliableWaitCount, 1, internal::FLOW_WINDOW_MAX) : 0);
+                ? RoundUpPow2(f.unreliableWaitCount, 1, internal::FLOW_RING_MAX) : 0);
             const uint16_t waitStrideCap = outReliableWaitCap_ > outUnreliableWaitCap_
                 ? outReliableWaitCap_ : outUnreliableWaitCap_;
 
@@ -526,7 +520,7 @@ namespace bcp::flux
             inWindowBits_ = static_cast<uint16_t>(window);
 
             inReorderCap_ = static_cast<uint16_t>(
-                f.reorderCount > 0 ? RoundUpPow2(f.reorderCount, 1, internal::FLOW_WINDOW_MAX) : 0);
+                f.reorderCount > 0 ? RoundUpPow2(f.reorderCount, 1, internal::FLOW_RING_MAX) : 0);
 
             const uint32_t stride = static_cast<uint32_t>(
                 InAssociation::StrideFor(inWindowBits_, inReorderCap_));

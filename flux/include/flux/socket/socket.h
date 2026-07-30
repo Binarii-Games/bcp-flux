@@ -186,20 +186,6 @@ namespace bcp::flux
                 uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
                 uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: what one remote may create
 
-                /** The in-flight window, socket-wide and shared by every flow in
-                    both directions: the sender's ring capacity and the
-                    receiver's seen-bitmap width are the same number. Power of
-                    two.
-
-                    Both ends must agree, and nothing on the wire detects a
-                    mismatch. A receiver narrower than its sender reads a late
-                    arrival below its bitmap floor as a duplicate and drops it
-                    without recording it, so that sequence appears in no ack
-                    range and the sender never resolves it. On an unordered
-                    reliable flow it retransmits to its attempt cap and the
-                    association fails, so a mismatch surfaces as failure under
-                    load rather than at registration. */
-                uint32_t inFlightCount     = 256;
                 /** How far ahead of a gap ordered delivery buffers; past it a
                     packet is dropped and a resend fills it later. Power of two,
                     or 0. */
@@ -331,9 +317,9 @@ namespace bcp::flux
             first packet that arrives and refuses only when it is at its caps,
             which fails that one target rather than the flow.
 
-            The in-flight window is Config::flows::inFlightCount, socket-wide and
-            the same for every flow, so nothing about it is declared here or on
-            the wire. The id is the app's to choose and must be free on this
+            The in-flight window is internal::FLOW_WINDOW, the same for every
+            flow and every socket, so nothing about it is declared here or on the
+            wire. The id is the app's to choose and must be free on this
             socket. */
         [[nodiscard]] FlowHandle OpenFlow(uint16_t flowId, FlowMode mode);
 
