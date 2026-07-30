@@ -81,6 +81,33 @@ namespace bcp::flux
         return true;
     }
 
+    /** Outcome of trying to admit a flow packet to the wire, decided under the
+        peer and flow locks. Only Sent proceeds to the seal. Every other outcome
+        ends the send here, and who owns the packet slot afterwards differs, so
+        the caller's switch must honour it. */
+    enum class SendAdmission : uint8_t
+    {
+        Sent,      ///< stamped and in flight; proceed to seal + wire
+        Queued,    ///< held in the flow's waiting ring, which owns the slot now
+        Dropped,   ///< unreliable with no buffer configured; discarded, not an error
+        Rejected,  ///< reliable waiting ring full; TooManyPending to the app
+        Dead,      ///< no such flow, or not OPEN; a real failure
+    };
+
+    /** Outcome of registering a remote's flow from the packet that named it. */
+    enum class FlowAdmit : uint8_t { Registered, Existing, Rejected };
+
+    /** Feedback gathered under a flow lock and applied to the peer under the
+        peer lock. The flow side only accumulates, so it never reaches for the
+        peer, which is what keeps the peer-then-flow order acyclic. */
+    struct CongestionDelta
+    {
+        uint32_t resolvedBytes   = 0;   ///< in-flight bytes freed (acked or lost)
+        uint32_t ackedBytes      = 0;   ///< of those, the acked ones; grow the budget
+        uint32_t rttSampleMicros = 0;   ///< newest acked round-trip, 0 if none
+        bool     sawLoss         = false;
+    };
+
     /** A flow the application opened. Socket-wide, one per flow id, and what a
         FlowHandle points at. Holds no per-peer state and knows no address. */
     struct Flow

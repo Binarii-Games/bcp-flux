@@ -2712,7 +2712,7 @@ namespace bcp::flux
                 ? drained : refundTo->bytesInFlight;
     }
 
-    Socket::FlowAdmit Socket::AdmitInFlow(uint32_t peerSlot, const Address& from,
+    FlowAdmit Socket::AdmitInFlow(uint32_t peerSlot, const Address& from,
                                           const BcpId& peerId, uint16_t flowId,
                                           uint8_t flowData) noexcept
     {

@@ -93,19 +93,6 @@ namespace bcp::flux
         PeerTag                    tag{};
     };
 
-    /** Outcome of trying to admit a flow packet to the wire, decided under the
-        peer and flow locks. Only Sent proceeds to the seal; every other outcome
-        ends the send here, and who owns the packet slot afterwards differs, so
-        the caller's switch must honour it. */
-    enum class SendAdmission : uint8_t
-    {
-        Sent,      ///< stamped and in flight; proceed to seal + wire
-        Queued,    ///< held in the flow's waiting ring, which owns the slot now
-        Dropped,   ///< unreliable with no buffer configured; discarded, not an error
-        Rejected,  ///< reliable waiting ring full; TooManyPending to the app
-        Dead,      ///< no such flow, or not OPEN; a real failure
-    };
-
     class Socket
     {
         // Both reach the socket's private send machinery: the builder picks a
@@ -415,17 +402,6 @@ namespace bcp::flux
         uint32_t                       seenGrainStamp_  = 0;
         bool                           acceptUnsecureFromUnknown_ = false;
 
-        /** Feedback gathered under a flow lock, applied to the peer under the
-            peer lock. The flow side only accumulates, so it never reaches the
-            peer lock (the reverse of peer->flow). */
-        struct CongestionDelta
-        {
-            uint32_t resolvedBytes   = 0;   ///< in-flight bytes freed (acked or lost)
-            uint32_t ackedBytes      = 0;   ///< of those, the acked ones; grow the budget
-            uint32_t rttSampleMicros = 0;   ///< newest acked round-trip, 0 if none
-            bool     sawLoss         = false;
-        };
-
         // --- Lifecycle / Init ---
         // Init is a thin sequence over these; each returns an Error.
         [[nodiscard]] common::Error InitIdentity(const Config& config) noexcept;
@@ -648,7 +624,6 @@ namespace bcp::flux
             a dry pool or a full directory.
 
             @pre Caller holds the peer's write lock. */
-        enum class FlowAdmit : uint8_t { Registered, Existing, Rejected };
         [[nodiscard]] FlowAdmit AdmitInFlow(uint32_t peerSlot, const Address& from,
                                             const BcpId& peerId, uint16_t flowId,
                                             uint8_t flowData) noexcept;
