@@ -455,9 +455,12 @@ reading the mode off the flow data byte.
 The in-flight window is `Config::flows::inFlightCount`, socket-wide and the same
 for every flow in both directions: the sender's ring capacity and the receiver's
 seen-bitmap width are one number. Nothing about it travels, so nothing detects a
-mismatch, and both ends must agree. A receiver narrower than its sender treats a
-late arrival below its bitmap floor as a duplicate, which on an unordered
-reliable flow means the packet is dropped, acknowledged, and lost.
+mismatch, and both ends must agree. A receiver narrower than its sender reads a
+late arrival below its bitmap floor as a duplicate and drops it without
+recording it, so that sequence enters no ack range and the sender never resolves
+it. On an unordered reliable flow the sender retransmits to its attempt cap and
+the association fails, so a mismatch shows up as failure under load rather than
+at registration.
 
 Registration is caps-only: a dry pool or a full per-peer directory yields
 `FLOW_REJECT`, and the sender fails that one association rather than

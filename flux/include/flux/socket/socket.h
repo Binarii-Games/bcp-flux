@@ -191,11 +191,14 @@ namespace bcp::flux
                     receiver's seen-bitmap width are the same number. Power of
                     two.
 
-                    Both ends must agree. Nothing about it travels on the wire,
-                    so nothing detects a mismatch, and a receiver narrower than
-                    its sender treats a late arrival below its bitmap floor as a
-                    duplicate: on an unordered reliable flow that packet is
-                    dropped and acknowledged, and the data is lost. */
+                    Both ends must agree, and nothing on the wire detects a
+                    mismatch. A receiver narrower than its sender reads a late
+                    arrival below its bitmap floor as a duplicate and drops it
+                    without recording it, so that sequence appears in no ack
+                    range and the sender never resolves it. On an unordered
+                    reliable flow it retransmits to its attempt cap and the
+                    association fails, so a mismatch surfaces as failure under
+                    load rather than at registration. */
                 uint32_t inFlightCount     = 256;
                 /** How far ahead of a gap ordered delivery buffers; past it a
                     packet is dropped and a resend fills it later. Power of two,
