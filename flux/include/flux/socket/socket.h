@@ -178,7 +178,7 @@ namespace bcp::flux
             struct Flows
             {
                 /** Flows the application may hold open at once, socket-wide.
-                    A flow is small (id, mode, window, lifecycle); the per-peer
+                    A flow is small (id, mode, lifecycle), and the per-peer
                     state it spawns is sized by outCount below. */
                 uint32_t flowCount         = 64;
                 uint32_t outCount          = 0;    ///< sending associations, socket-wide
@@ -186,12 +186,16 @@ namespace bcp::flux
                 uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
                 uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: what one remote may create
 
-                /** Both roles at once: the in-flight ring capacity, which is the
-                    window this socket declares by default, and the seen-bitmap
-                    width, which is the widest window it will register from a
-                    remote. A wider declaration is rejected, since a retransmit
-                    could then arrive older than the bitmap remembers. Power of
-                    two, and one the flow data byte can encode (32 to 32768). */
+                /** The in-flight window, socket-wide and shared by every flow in
+                    both directions: the sender's ring capacity and the
+                    receiver's seen-bitmap width are the same number. Power of
+                    two.
+
+                    Both ends must agree. Nothing about it travels on the wire,
+                    so nothing detects a mismatch, and a receiver narrower than
+                    its sender treats a late arrival below its bitmap floor as a
+                    duplicate: on an unordered reliable flow that packet is
+                    dropped and acknowledged, and the data is lost. */
                 uint32_t inFlightCount     = 256;
                 /** How far ahead of a gap ordered delivery buffers; past it a
                     packet is dropped and a resend fills it later. Power of two,
@@ -324,12 +328,11 @@ namespace bcp::flux
             first packet that arrives and refuses only when it is at its caps,
             which fails that one target rather than the flow.
 
-            `window` is the in-flight cap this flow declares on every packet,
-            and a receiver refuses a flow wider than its own dedupe bitmap. It
-            must be a power of two between 32 and 32768 and no wider than this
-            socket's own ring; 0 takes the configured default. The id is the
-            app's to choose and must be free on this socket. */
-        [[nodiscard]] FlowHandle OpenFlow(uint16_t flowId, FlowMode mode, uint32_t window = 0);
+            The in-flight window is Config::flows::inFlightCount, socket-wide and
+            the same for every flow, so nothing about it is declared here or on
+            the wire. The id is the app's to choose and must be free on this
+            socket. */
+        [[nodiscard]] FlowHandle OpenFlow(uint16_t flowId, FlowMode mode);
 
         /** Closes the flow and every target it was talking to, releasing their
             rings and refunding what they held in flight. The flow slot is
@@ -630,9 +633,8 @@ namespace bcp::flux
             @return the flow slot, or SlotPool::INVALID. */
         [[nodiscard]] uint32_t FindFlowById(uint16_t flowId) noexcept;
 
-        /** Leases the per-target state on first send, copying the flow's mode,
-            window and wire byte so later packets read one object under one
-            lock.
+        /** Leases the per-target state on first send, copying the flow's mode
+            so later packets read one object under one lock.
 
             @pre Caller holds the peer's write lock.
             @return INVALID when no such flow is open, the pool is dry, or this
@@ -653,8 +655,8 @@ namespace bcp::flux
         void FailOutAssoc(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept;
 
         /** Registers a remote's flow on first sight, from a data packet's flow
-            header. Refusal is caps-only: a dry pool, a full directory, or a
-            window wider than this socket's bitmap.
+            header. Refused when the flow data byte does not decode, or on caps:
+            a dry pool or a full directory.
 
             @pre Caller holds the peer's write lock. */
         enum class FlowAdmit : uint8_t { Registered, Existing, Rejected };

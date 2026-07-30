@@ -450,8 +450,9 @@ namespace bcp::flux
             return common::Error::InvalidParam;
 
         // One window knob serves both roles (out-ring capacity and in-bitmap
-        // width), rounded to a power of two, floor 64; the wire handshake
-        // reconciles two sockets whose knobs differ.
+        // width), rounded to a power of two, floor 64. Nothing on the wire
+        // carries it, so two sockets configured differently are not reconciled.
+        // See Config::flows::inFlightCount for what a mismatch costs.
         const uint32_t window = RoundUpPow2(f.inFlightCount, internal::FLOW_WINDOW_MIN,
                                             internal::FLOW_WINDOW_MAX);
 
@@ -852,12 +853,10 @@ namespace bcp::flux
             return common::collections::SlotPool::INVALID;   // no such flow open here
 
         FlowMode mode{};
-        uint16_t window = 0;
         {
             const Flow* flow = reinterpret_cast<const Flow*>(flowPool_.ReadLock(flowSlot));
             const bool open = flow->life == FlowLifecycle::OPEN;
-            mode   = flow->mode;
-            window = flow->window;
+            mode = flow->mode;
             flowPool_.UnlockRead(flowSlot);
             if (!open)
                 return common::collections::SlotPool::INVALID;
@@ -874,7 +873,7 @@ namespace bcp::flux
             OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
                 outAssocPool_.WriteLock(assocSlot));
             ResetOutAssoc(assoc, peerSlot, peer.addr, &peer.id, flowId, mode,
-                         window,
+                         outInflightCap_,
                          mode == FlowMode::UNRELIABLE ? outUnreliableWaitCap_
                                                       : outReliableWaitCap_);
             assoc->flowSlot   = common::collections::SlotPool::INVALID;
@@ -1509,8 +1508,8 @@ namespace bcp::flux
             switch (AdmitInFlow(peerSlot, from, peer->id, flowId, flowData))
             {
             case FlowAdmit::Rejected:
-                // Caps, or a window this socket cannot dedupe. Tell the sender
-                // so it stops rather than retransmitting into silence.
+                // An undecodable flow data byte, or caps. Tell the sender so it
+                // stops rather than retransmitting into silence.
                 rejectMaterials = GatherSendMaterials(*peer);
                 reject = true;
                 break;
@@ -2484,7 +2483,7 @@ namespace bcp::flux
         flowPool_.UnlockWrite(flowSlot);
     }
 
-    FlowHandle Socket::OpenFlow(uint16_t flowId, FlowMode mode, uint32_t window)
+    FlowHandle Socket::OpenFlow(uint16_t flowId, FlowMode mode)
     {
         if (!initialized_.load(std::memory_order_acquire) || !outAssocDir_)
             return FlowHandle{common::Error::NotInitialized};
@@ -2495,13 +2494,8 @@ namespace bcp::flux
             mode != FlowMode::UNRELIABLE)
             return FlowHandle{common::Error::InvalidParam};
 
-        // The window this flow declares on every packet. Zero takes the
-        // socket's configured ring capacity; anything the wire byte cannot
-        // encode is refused here rather than silently declaring a width the
-        // ring does not enforce.
-        const uint32_t declared = window != 0 ? window : outInflightCap_;
-        const uint8_t  flowData = EncodeFlowData(mode, declared);
-        if (flowData == 0 || declared > outInflightCap_)
+        uint8_t flowData = 0;
+        if (!EncodeFlowData(mode, flowData))
             return FlowHandle{common::Error::InvalidParam};
 
         // The id is how a remote names the flow, so two sharing one would be
@@ -2519,7 +2513,6 @@ namespace bcp::flux
             flow->epoch      = flow->epoch + 1;   // survives the lease; stale handles miss
             flow->firstAssoc = common::collections::SlotPool::INVALID;
             flow->flowId     = flowId;
-            flow->window     = static_cast<uint16_t>(declared);
             flow->mode       = mode;
             flow->flowData   = flowData;
             flow->life       = FlowLifecycle::OPEN;
@@ -2735,15 +2728,7 @@ namespace bcp::flux
             return FlowAdmit::Existing;
 
         FlowMode mode{};
-        uint32_t declaredWindow = 0;
-        if (!DecodeFlowData(flowData, mode, declaredWindow))
-            return FlowAdmit::Rejected;
-
-        // The declared window is what the sender will keep in flight, and the
-        // seen bitmap is what this socket can dedupe. Registering a flow wider
-        // than the bitmap would let a retransmit arrive older than anything
-        // still remembered, and the same message would be delivered twice.
-        if (declaredWindow > inWindowBits_)
+        if (!DecodeFlowData(flowData, mode))
             return FlowAdmit::Rejected;
 
         // This is the one path where a REMOTE makes this socket allocate, so

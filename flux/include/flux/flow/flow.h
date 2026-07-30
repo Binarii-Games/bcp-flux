@@ -47,47 +47,37 @@ namespace bcp::flux
     };
 
     /** The flow data byte carried after the sequence in every flow packet:
-        mode in bits 0-2 (3-7 reserved), window exponent in bits 3-7, where
-        window = 16 << exponent.
+        mode in bits 0-2, bits 3-7 reserved and zero. The in-flight window is a
+        socket-wide constant, so nothing about it travels.
 
-        It rides every packet, not just the first, so a receiver can register
-        the flow from whichever packet arrives first.
+        The byte rides every packet, not just the first, so a receiver can
+        register the flow from whichever packet arrives first.
 
-        @return 0 when the mode or window cannot be encoded. 0 is never a valid
-                encoding, so it doubles as the failure value. */
-    [[nodiscard]] inline uint8_t EncodeFlowData(FlowMode mode, uint32_t window) noexcept
+        RELIABLE_ORDERED encodes as zero, so the byte has no spare value to mean
+        failure and both directions report that separately. */
+    [[nodiscard]] inline bool EncodeFlowData(FlowMode mode, uint8_t& outData) noexcept
     {
         if (static_cast<uint8_t>(mode) > 2)
-            return 0;
-
-        uint8_t exponent = 0;
-        for (uint8_t e = 1; e <= 11; ++e)
-        {
-            if (window == (16u << e))
-            {
-                exponent = e;
-                break;
-            }
-        }
-        if (exponent == 0)
-            return 0;
-
-        return static_cast<uint8_t>(static_cast<uint8_t>(mode) | (exponent << 3));
-    }
-
-    /** Reads a flow data byte off the wire. Refuses reserved modes and window
-        exponents out of range, because this input is attacker-chosen. */
-    [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode,
-                                             uint32_t& outWindow) noexcept
-    {
-        const uint8_t modeBits = data & 0x07;
-        const uint8_t exponent = data >> 3;
-
-        if (modeBits > 2 || exponent < 1 || exponent > 11)
             return false;
 
-        outMode   = static_cast<FlowMode>(modeBits);
-        outWindow = 16u << exponent;
+        outData = static_cast<uint8_t>(mode);
+        return true;
+    }
+
+    /** Reads a flow data byte off the wire. Refuses reserved modes, and refuses
+        any reserved bit that is set: this input is attacker-chosen, and a
+        receiver that ignored those bits could not distinguish a flow it
+        understands from one carrying an extension it does not. */
+    [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode) noexcept
+    {
+        if ((data & 0xF8u) != 0)
+            return false;
+
+        const uint8_t modeBits = data & 0x07u;
+        if (modeBits > 2)
+            return false;
+
+        outMode = static_cast<FlowMode>(modeBits);
         return true;
     }
 
@@ -98,7 +88,6 @@ namespace bcp::flux
         uint32_t epoch;         ///< survives the lease and advances; stale handles miss
         uint32_t firstAssoc;    ///< association list head, INVALID when none
         uint16_t flowId;        ///< INVALID_FLOW_ID marks the slot free
-        uint16_t window;        ///< declared in-flight cap
         FlowMode mode;
         uint8_t  flowData;      ///< the wire byte, encoded once at open
         FlowLifecycle life;
@@ -262,9 +251,9 @@ namespace bcp::flux
         The seen bitmap is this side's memory of which seqs arrived. It exists
         because a retransmit wears a fresh nonce and passes the replay window
         looking new, so only this can tell "seq 6 again" from "seq 6 finally".
-        Its width is the window the sender declared, which registration refused
-        unless this socket's bitmap could cover it, so a seq below the floor is
-        provably resolved and can only be a stale duplicate.
+        Its width is the socket-wide in-flight window, which both ends share, so
+        a seq below the floor is provably resolved and can only be a stale
+        duplicate.
 
         Same pool rules as the sending half. */
     struct InAssociation
@@ -287,7 +276,7 @@ namespace bcp::flux
             Config::timers::ackDelayMicros; 0 means nothing is owed. */
         uint64_t ackArmedMicros;
 
-        uint16_t windowBits;    ///< seen-bitmap width, from the declared window
+        uint16_t windowBits;    ///< seen-bitmap width, the socket-wide window
         uint16_t reorderCap;
 
         uint64_t* Seen()

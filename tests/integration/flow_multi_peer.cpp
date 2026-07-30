@@ -196,15 +196,17 @@ static void FlowIdsAreSocketWide()
     CHECK(clash.Failed());
     CHECK(clash.FailReason() == common::Error::AlreadyInUse);
 
-    // The reserved sentinel is never a usable id, and a window the wire byte
-    // cannot encode is refused rather than silently declared wrong.
+    // The reserved sentinel is never a usable id.
     CHECK(client.OpenFlow(0xFFFF, flux::FlowMode::UNRELIABLE).Failed());
-    CHECK(client.OpenFlow(6, flux::FlowMode::UNRELIABLE, 100).Failed());   // not a power of two
-    CHECK(client.OpenFlow(6, flux::FlowMode::UNRELIABLE, 1u << 20).Failed());
 
-    // A window the byte CAN encode, at or under the socket's ring, is fine.
-    flux::FlowHandle narrow = client.OpenFlow(6, flux::FlowMode::UNRELIABLE, 64);
-    CHECK(!narrow.Failed());
+    // A mode outside the three that exist is refused at open, so no flow can
+    // stamp one onto every packet it sends.
+    CHECK(client.OpenFlow(6, static_cast<flux::FlowMode>(3)).Failed());
+    CHECK(client.OpenFlow(6, static_cast<flux::FlowMode>(0xFF)).Failed());
+
+    // A real mode on a free id opens.
+    flux::FlowHandle second = client.OpenFlow(6, flux::FlowMode::UNRELIABLE);
+    CHECK(!second.Failed());
 
     CHECK(client.CloseFlow(flow) == common::Error::Ok);
 

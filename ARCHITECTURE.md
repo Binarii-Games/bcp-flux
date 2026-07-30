@@ -136,9 +136,9 @@ observed and feeds congestion control even when nothing is resent. `UNRELIABLE`
 drops a packet older than the newest it has delivered, still acknowledged, so
 the sender resolves it without waiting out a timeout.
 
-`Flow` is socket-wide, holds no address, and carries id, mode, declared window,
-the encoded wire byte, and a lifecycle the application controls. Sending on it
-to an address creates the per-target state, the association, on first use.
+`Flow` is socket-wide, holds no address, and carries id, mode, the encoded wire
+byte, and a lifecycle the application controls. Sending on it to an address
+creates the per-target state, the association, on first use.
 
 `OutAssociation` is the sending half, one per (flow, target). It holds the peer
 identity, the flow link, the sequence, the round-trip estimate, the in-flight
@@ -288,7 +288,7 @@ unsecured [Controller(1)][payload]
 | Channel | 1 | secure, inside the seal | 0 for application data, otherwise an internal control op |
 | FlowId | 2 | `HAS_FLOW` set | the sender's flow id |
 | FlowSeq | 4 | `HAS_FLOW` set | the packet's sequence on that flow, starting at 1 |
-| FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, window exponent in bits 3-7, `window = 16 << e` |
+| FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, bits 3-7 reserved and zero |
 | payload | rest | always | application bytes, or the control op's body |
 
 The controller bits: `CTRL_INTERNAL` marks handshake traffic, consumed and
@@ -447,16 +447,21 @@ change made for privacy is not linkable by tag either.
 
 #### Flows
 
-Opening is local. `OpenFlow(id, mode, window)` takes no address, costs nothing
-on the wire, and the flow is sendable the instant it returns, including before
-any handshake. The receiver builds its half from whichever packet arrives
-first, reading mode and window off the flow data byte, and refuses a flow whose
-declared window exceeds its own seen bitmap, because a sender outrunning that
-bitmap could have a retransmit delivered twice.
+Opening is local. `OpenFlow(id, mode)` takes no address, costs nothing on the
+wire, and the flow is sendable the instant it returns, including before any
+handshake. The receiver builds its half from whichever packet arrives first,
+reading the mode off the flow data byte.
 
-Registration is caps-only: a dry pool, a full per-peer directory, or a window
-too wide yields `FLOW_REJECT`, and the sender fails that one association rather
-than retransmitting into silence. This is the one path where a remote makes
+The in-flight window is `Config::flows::inFlightCount`, socket-wide and the same
+for every flow in both directions: the sender's ring capacity and the receiver's
+seen-bitmap width are one number. Nothing about it travels, so nothing detects a
+mismatch, and both ends must agree. A receiver narrower than its sender treats a
+late arrival below its bitmap floor as a duplicate, which on an unordered
+reliable flow means the packet is dropped, acknowledged, and lost.
+
+Registration is caps-only: a dry pool or a full per-peer directory yields
+`FLOW_REJECT`, and the sender fails that one association rather than
+retransmitting into silence. This is the one path where a remote makes
 this socket allocate, and it is reachable only after a completed handshake.
 
 Closing is local too. `CloseFlow` walks the flow's association list, releases
@@ -469,11 +474,10 @@ exhausts its retransmits. The rings drain and the congestion bytes refund
 immediately, but the slot waits for the application to observe the failure
 through its handle before recycling.
 
-Mode, window, and the wire byte are copied onto each association at creation,
-because the send gate, the drain, and the retransmit scan read them per packet,
-and reaching back to the flow would mean a second lock on the packet path. The
-flow lock is taken once per send, at the builder, and is never held under a
-peer or association lock.
+Mode is copied onto each association at creation, because the send gate, the
+drain, and the retransmit scan read it per packet, and reaching back to the flow
+would mean a second lock on the packet path. The flow lock is taken once per
+send, at the builder, and is never held under a peer or association lock.
 
 Two indexes reach an association, in opposite directions. The per-peer
 directories answer peer-to-association, which the packet path and peer removal

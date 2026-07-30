@@ -28,11 +28,12 @@ namespace bcp::flux
         On a secure packet everything after the header (the ||) is ciphertext:
         a one-byte in-band Channel (0 for application data, else an internal
         control op), then [FlowId(2)][FlowSeq(4)][FlowData(1)] when
-        CTRL_HAS_FLOW is set, then the payload. FlowData carries the flow's
-        mode and declared window and rides every packet, which is what lets a
-        receiver register a flow from whichever packet reaches it first. The controller byte and peer tag are authenticated
-        associated data, readable on the wire but not alterable; the channel
-        byte is encrypted, so an observer cannot tell control from data.
+        CTRL_HAS_FLOW is set, then the payload. FlowData carries the flow's mode
+        and rides every packet, which is what lets a receiver register a flow
+        from whichever packet reaches it first. The controller byte and peer tag
+        are authenticated associated data, readable on the wire but not
+        alterable. The channel byte is encrypted, so an observer cannot tell
+        control from data.
         SecureChannel() is meaningful only after a successful decrypt.
         NonceCounter is masked under a per-packet value, so it reads as noise
         rather than as a sequence an observer could follow across an address
@@ -55,9 +56,9 @@ namespace bcp::flux
         /** The flow sequence number of a flow packet; 0 (the never-sent
             sentinel) when the packet carries no flow or is too short. */
         uint32_t FlowSeq() const;
-        /** The flow data byte (mode + declared window, see DecodeFlowData); 0
-            when the packet carries no flow or is too short. 0 is not a valid
-            encoding, so it reads as "absent" rather than as a mode. */
+        /** The flow data byte, holding the mode (see DecodeFlowData). Returns 0
+            when the packet carries no flow or is too short, which RELIABLE_ORDERED
+            also encodes as, so read HasFlow() to tell absent from a mode. */
         uint8_t FlowData() const;
         /** Where the flow header starts, past the cleartext header and the
             channel byte; dataSize when this packet has no flow header or is

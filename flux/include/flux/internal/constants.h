@@ -19,7 +19,7 @@ namespace bcp::flux::internal
     static constexpr uint8_t  WIRE_NONCE_SIZE               = 8;  ///< Send-counter half of the nonce; the rest is derived locally.
     static constexpr uint8_t  WIRE_FLOW_ID_SIZE             = 2;
     static constexpr uint8_t  WIRE_FLOW_SEQ_SIZE            = 4;
-    static constexpr uint8_t  WIRE_FLOW_DATA_SIZE           = 1;  ///< mode + window exponent, after the sequence
+    static constexpr uint8_t  WIRE_FLOW_DATA_SIZE           = 1;  ///< mode, after the sequence
     /** The whole flow header, inside the seal: id, sequence, data byte. */
     static constexpr uint8_t  WIRE_FLOW_HEADER_SIZE         =
         WIRE_FLOW_ID_SIZE + WIRE_FLOW_SEQ_SIZE + WIRE_FLOW_DATA_SIZE;
@@ -65,8 +65,9 @@ namespace bcp::flux::internal
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
     /** The flow window (out-ring capacity and in-bitmap width) rounds to a
         power of two within these bounds. Floor 64 keeps the seen bitmap a whole
-        number of 64-bit words; the ceiling is the largest power of two that fits
-        the uint16_t window field, so the rounded value never overflows it. */
+        number of 64-bit words. The ceiling is the largest power of two that
+        fits OutAssociation::inflightCap and InAssociation::windowBits, both
+        uint16_t, so the rounded value never overflows either. */
     static constexpr uint16_t FLOW_WINDOW_MIN               = 64;
     static constexpr uint16_t FLOW_WINDOW_MAX               = 32768;
     /** Ack ranges one flow contributes to a single FLOW_ACK packet, emitted

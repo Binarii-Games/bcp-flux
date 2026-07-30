@@ -28,7 +28,7 @@ namespace bcp::flux
         uint32_t slot_{UINT32_MAX};
         uint32_t epoch_{0};
         uint16_t flowId_{internal::INVALID_FLOW_ID};
-        uint8_t  flowData_{0};   ///< the wire byte: mode + window, fixed at open
+        uint8_t  flowData_{0};   ///< the wire byte: the mode, fixed at open
         common::Error failReason_{common::Error::InvalidState};
 
     public:
@@ -53,9 +53,9 @@ namespace bcp::flux
         [[nodiscard]] common::Error FailReason() const { return failReason_; }
 
         [[nodiscard]] uint16_t Id() const { return flowId_; }
-        /** The encoded mode and window this flow declares on every packet.
-            Carried here because it is fixed for the flow's whole life, so the
-            builder can stamp it without taking the flow's lock. */
+        /** The encoded mode this flow stamps on every packet. Carried here
+            because it is fixed for the flow's whole life, so the builder can
+            stamp it without taking the flow's lock. */
         [[nodiscard]] uint8_t FlowData() const { return flowData_; }
         [[nodiscard]] uint32_t Slot() const { return slot_; }
         [[nodiscard]] uint32_t Epoch() const { return epoch_; }

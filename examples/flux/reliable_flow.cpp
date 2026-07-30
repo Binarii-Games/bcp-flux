@@ -2,8 +2,8 @@
 // different peers.
 //
 // A flow is not tied to a peer. OpenFlow takes no address: it declares what the
-// flow IS (its id, its mode, how much it may keep in flight) and the per-target
-// state is created by the first packet sent to each address. So one handle
+// flow IS (its id and its mode) and the per-target state is created by the
+// first packet sent to each address. So one handle
 // serves every peer, and each gets its own sequence numbering, its own
 // retransmits and its own failures.
 //
