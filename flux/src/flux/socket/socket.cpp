@@ -952,6 +952,12 @@ namespace bcp::flux
             if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
                 return false;   // duplicate or too old, drop
 
+            // The peer has now opened something under the session key, which is
+            // the first proof that the identity bound to this slot is the one
+            // that holds the key. Handshake_Validate refuses to disturb a peer
+            // past this point.
+            peer->confirmed = true;
+
             const uint32_t nowStamp = SeenStamp(common::MonotonicMicros());
             if (static_cast<uint32_t>(nowStamp - peer->lastSeenAt) >= seenGrainStamp_)
                 peer->lastSeenAt = nowStamp;
@@ -1461,6 +1467,7 @@ namespace bcp::flux
 
         bool established = false;
         bool needBind    = false;
+        bool unprovenId  = false;
         uint32_t slot    = 0;
         {
             PeerHandle existingHandle = peers_.GetPeer(from);
@@ -1477,8 +1484,25 @@ namespace bcp::flux
                 {
                     // Duplicate HS_RES, or the remote dropped this peer and is
                     // handshaking anew. The key must belong to the id we hold.
-                    if (!(peer->id == id)) return;
-                    established = true;
+                    if (!(peer->id == id))
+                    {
+                        // Unless nothing here was ever proven. A responder
+                        // establishes from HS_RES alone, and no part of that
+                        // message is authenticated: the initiator cannot sign
+                        // it, because it does not learn this side's key until
+                        // HS_FINISH. So one corrupted or forged HS_RES binds an
+                        // identity nobody holds, and refusing every later
+                        // handshake would strand the address for good. A peer
+                        // that has opened a packet under the session key is
+                        // kept, because there the refusal is what stops an
+                        // off-path rebind of a working session.
+                        if (peer->confirmed) return;
+                        unprovenId = true;
+                    }
+                    else
+                    {
+                        established = true;
+                    }
                 }
                 else
                 {
@@ -1494,6 +1518,17 @@ namespace bcp::flux
                     needBind = !peer->hasId;
                 }
             }
+        }
+
+        // Dropped rather than rebound in place, because the id index still
+        // holds the claimed one and BindId refuses a slot that already carries
+        // an id. Removing it frees both, and the initiator is already
+        // retrying, so its next HS_RES registers cleanly. Done outside the
+        // handle scope above: the table refuses a removal with a handle held.
+        if (unprovenId)
+        {
+            (void)RemovePeer(from);
+            return;
         }
 
         if (needBind && peers_.BindId(slot, id) != common::Error::Ok)

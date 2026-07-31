@@ -451,6 +451,7 @@ namespace bcp::flux
         p->attempts    = 0;
         p->hasId       = (id != nullptr);
         p->authenticated = false;
+        p->confirmed     = false;
         peerPool_.UnlockWrite(slot);
 
         const uint32_t v = version_.load(std::memory_order_relaxed);
