@@ -91,7 +91,7 @@ resolver, or a service name. Naming and routing belong to a layer above.
 
 | Sub-namespace | Holds |
 |---|---|
-| `bcp::flux` | `Socket`, `Peer`, `PeerTable`, flows, handles |
+| `bcp::flux` | `Socket`, `FlowTable`, `Peer`, `PeerTable`, flows, handles |
 | `bcp::flux::internal` | wire constants, not public API |
 | `bcp::flux::wire` | `PacketBuilder` and its stages |
 | `bcp::flux::platform` | per-OS `ISocketKernel` backends |
@@ -184,16 +184,16 @@ owner:
 | recv | `ISocketKernel` | inbound packets |
 | send | `ISocketKernel` | outbound packets |
 | pending | `Socket` | packets parked behind an unfinished handshake |
-| staging | `Socket` | retained reliable bodies, held send-until-ack |
-| flow | `Socket` | `Flow` slots, one per open flow |
-| out-association | `Socket` | `OutAssociation` slots |
-| in-association | `Socket` | `InAssociation` slots |
+| staging | `FlowTable` | retained reliable bodies, held send-until-ack |
+| flow | `FlowTable` | `Flow` slots, one per open flow |
+| out-association | `FlowTable` | `OutAssociation` slots |
+| in-association | `FlowTable` | `InAssociation` slots |
 | peer | `PeerTable` | `Peer` slots |
 | certificate | `CertStore` | trusted `Certificate` slots |
 
 `Socket` borrows the two kernel pools as raw pointers, so it must not outlive
-the kernel. Every other pool it owns directly or reaches through the component
-that owns it.
+the kernel, and lends both to `FlowTable` along with the ready queue. Every
+other pool is owned by `Socket` or by the component it reaches through.
 
 Two flat arrays are indexed by peer slot and guarded by that peer's slot lock:
 the replay window state, and the flow directories (`FlowDirEntry[]`, one
@@ -247,7 +247,16 @@ points, all safe to call concurrently:
   evict idle peers. All time-based work lives here.
 - Sending, through `PacketBuilder`.
 
-Lock order: packet slot, then peer, then flow. The wire send happens with
+Flow state lives in `FlowTable`, which owns the flow, association and staging
+pools and every algorithm that reads only those: sequence numbering, the send
+gate, the waiting ring, the seen bitmap, ack ranges, reorder hold-back and
+retransmit selection. It never acquires a peer, never touches the kernel and
+never encrypts. A peer reaches it only as a reference the socket already
+locked, so the ordering below is a property of the split rather than a rule to
+remember: a class with no way to reach a peer cannot lock one out of order.
+
+Lock order: packet slot, then peer, then flow. Within the flow level, a flow is
+taken before an association, which is how a flow reaches its association list. The wire send happens with
 nothing held, so every locked scope gathers what the send needs
 (`PeerSendMaterials`), closes, and the packet is sealed and sent afterwards. A
 peer lock is never held across a `SendTo` syscall or anything that takes a
@@ -359,8 +368,8 @@ against a trusted certificate.
 
 `CanSend` is a pure predicate over the already-locked flow and peer: ring slot
 free, `unresolved < inflightCap` (reliable only), congestion budget covers the
-packet. `StampFlowPacket` assumes it passed and only mutates. `AdmitFlowPacket`
-sequences the two under the peer lock the caller lends.
+packet. `StampFlowPacket` assumes it passed and only mutates.
+`FlowTable::AdmitOut` sequences the two under the peer lock the caller lends.
 
 | Outcome | Meaning | Slot owner afterwards |
 |---|---|---|
