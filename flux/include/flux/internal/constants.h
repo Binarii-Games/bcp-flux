@@ -50,13 +50,15 @@ namespace bcp::flux::internal
 
     /** The handshake transcript both sides bind into the session key and the
         confirmation MAC, role-ordered so both ends assemble identical bytes:
-          initiatorPk ‖ responderPk ‖ saltI ‖ saltR
+          initiatorPk ‖ responderPk ‖ initiatorEph ‖ responderEph ‖ saltI ‖ saltR
           ‖ initiatorCaps ‖ responderCaps ‖ initiatorVersion ‖ responderVersion ‖ tag
-        Version and caps sit inside the MAC'd transcript; a tampered or
-        mismatched negotiation fails key confirmation. BuildTranscript is the
+        Version and caps sit inside the MAC'd transcript, so a tampered or
+        mismatched negotiation fails key confirmation. The ephemeral public keys
+        are here for the same reason: they are what the forward secrecy rests
+        on, so swapping one has to break the MAC. BuildTranscript is the
         authoritative field order. */
     static constexpr size_t   HS_TRANSCRIPT_SIZE            =
-        2*common::crypto::KEY_SIZE + 2*WIRE_HS_SALT_SIZE + 2*VERSION_SIZE + 2*VERSION_CAPS_SIZE + WIRE_HS_TAG_SIZE;
+        4*common::crypto::KEY_SIZE + 2*WIRE_HS_SALT_SIZE + 2*VERSION_SIZE + 2*VERSION_CAPS_SIZE + WIRE_HS_TAG_SIZE;
 
     static_assert(WIRE_HS_MAC_SIZE == common::crypto::MAC_SIZE,
                   "The wire confirmation field carries a ComputeMac output verbatim");

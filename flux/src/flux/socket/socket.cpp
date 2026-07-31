@@ -99,6 +99,8 @@ namespace bcp::flux
         void BuildTranscript(uint8_t out[internal::HS_TRANSCRIPT_SIZE],
                              const common::crypto::PublicKey& initiatorPk,
                              const common::crypto::PublicKey& responderPk,
+                             const common::crypto::PublicKey& initiatorEph,
+                             const common::crypto::PublicKey& responderEph,
                              const uint8_t saltI[internal::WIRE_HS_SALT_SIZE],
                              const uint8_t saltR[internal::WIRE_HS_SALT_SIZE],
                              const uint32_t initiatorCaps,
@@ -110,6 +112,8 @@ namespace bcp::flux
             uint8_t* p = out;
             std::memcpy(p, initiatorPk.data(), initiatorPk.size());         p += initiatorPk.size();
             std::memcpy(p, responderPk.data(), responderPk.size());         p += responderPk.size();
+            std::memcpy(p, initiatorEph.data(), initiatorEph.size());       p += initiatorEph.size();
+            std::memcpy(p, responderEph.data(), responderEph.size());       p += responderEph.size();
             std::memcpy(p, saltI, internal::WIRE_HS_SALT_SIZE);             p += internal::WIRE_HS_SALT_SIZE;
             std::memcpy(p, saltR, internal::WIRE_HS_SALT_SIZE);             p += internal::WIRE_HS_SALT_SIZE;
             p[0] = static_cast<uint8_t>(initiatorCaps >> 0);
@@ -368,12 +372,35 @@ namespace bcp::flux
 
     void Socket::DeriveSessionInto(common::crypto::SessionKey& out,
                                     const common::crypto::PublicKey& theirPk,
+                                    const common::crypto::SecretKey& myEphSk,
+                                    const common::crypto::PublicKey& theirEphPk,
                                     const uint8_t* transcript, size_t transcriptLen) noexcept
     {
-        common::crypto::SharedSecret shared;
-        common::crypto::ComputeSharedSecret(shared, secretKey_, theirPk);
-        common::crypto::DeriveSessionKey(out, shared, transcript, transcriptLen);
-        common::crypto::Wipe(shared.data(), shared.size());
+        // Two exchanges, both required. The ephemeral pair is what makes the
+        // session unrecoverable afterwards, since neither secret half outlives
+        // this function on either side. The long-lived pair is what makes it
+        // authenticated, since only the holder of that key can arrive at the
+        // same answer, which is what the confirmation MAC then proves. Either
+        // one alone loses the other property.
+        //
+        // One KDF pass over both. The long-lived secret keys the hash and the
+        // ephemeral one leads the context, which keeps the derivation to a
+        // single call and leaves the vendored crypto floor untouched.
+        common::crypto::SharedSecret staticShared;
+        common::crypto::SharedSecret ephShared;
+        common::crypto::ComputeSharedSecret(staticShared, secretKey_, theirPk);
+        common::crypto::ComputeSharedSecret(ephShared, myEphSk, theirEphPk);
+
+        uint8_t context[common::crypto::SHARED_SIZE + internal::HS_TRANSCRIPT_SIZE];
+        std::memcpy(context, ephShared.data(), ephShared.size());
+        std::memcpy(context + ephShared.size(), transcript, transcriptLen);
+
+        common::crypto::DeriveSessionKey(out, staticShared, context,
+                                         ephShared.size() + transcriptLen);
+
+        common::crypto::Wipe(context, sizeof(context));
+        common::crypto::Wipe(ephShared.data(), ephShared.size());
+        common::crypto::Wipe(staticShared.data(), staticShared.size());
     }
 
     PeerSendMaterials Socket::GatherSendMaterials(Peer& peer) noexcept
@@ -1418,6 +1445,12 @@ namespace bcp::flux
         uint8_t saltI[internal::WIRE_HS_SALT_SIZE];
         if (!common::crypto::RandomBytes(saltI, sizeof(saltI))) return;
 
+        // The throwaway pair, one per attempt. The public half travels, the
+        // secret half waits on the peer for HS_FINISH and is wiped there.
+        common::crypto::SecretKey ephSk;
+        common::crypto::PublicKey ephPk;
+        if (!common::crypto::GenerateKeypair(ephSk, ephPk)) return;
+
         common::Result<PacketSlotWriter> result = BuildInternal(SocketOpCode::HS_RES);
         if (result.isErr()) return;
         PacketSlotWriter writer = result.Take();
@@ -1430,7 +1463,10 @@ namespace bcp::flux
             if (peer->state != HandshakeState::AWAITING_CHALLENGE) return;
             peer->state = HandshakeState::AWAITING_FINISH;
             std::memcpy(peer->hsSalt, saltI, sizeof(saltI));
+            peer->hsEphSecret = ephSk;
+            peer->hsEphPub    = ephPk;
         }
+        common::crypto::Wipe(ephSk.data(), ephSk.size());
 
         uint32_t initiatorCaps;
         BuildCapsBitmap(initiatorCaps);
@@ -1438,6 +1474,7 @@ namespace bcp::flux
         writer.WriteAddress(from);
         writer.PutU64(challenge);
         writer.PutBytes(publicKey_.data(), publicKey_.size());
+        writer.PutBytes(ephPk.data(), ephPk.size());
         writer.PutBytes(saltI, sizeof(saltI));
         writer.PutU16(internal::VERSION);
         writer.PutU32(initiatorCaps);
@@ -1451,11 +1488,13 @@ namespace bcp::flux
     {
         uint64_t challenge = 0;
         common::crypto::PublicKey pk;
+        common::crypto::PublicKey ephI;
         uint8_t saltI[internal::WIRE_HS_SALT_SIZE];
         uint16_t initiatorVersion{0};
         uint32_t initiatorCaps{0};
         if (!reader.TakeU64(challenge)) return;
         if (!reader.TakeBytes(pk.data(), pk.size())) return;
+        if (!reader.TakeBytes(ephI.data(), ephI.size())) return;
         if (!reader.TakeBytes(saltI, sizeof(saltI))) return;
         if (!reader.TakeU16(initiatorVersion)) return;
         if (!reader.TakeU32(initiatorCaps)) return;
@@ -1465,7 +1504,8 @@ namespace bcp::flux
 
         const BcpId id = BcpId::Derive(pk);
 
-        bool established = false;
+        bool established = false;   // answering a duplicate, not building anew
+        bool repeat      = false;
         bool needBind    = false;
         bool unprovenId  = false;
         uint32_t slot    = 0;
@@ -1501,7 +1541,15 @@ namespace bcp::flux
                     }
                     else
                     {
-                        established = true;
+                        // Same ephemeral means the same attempt arriving twice,
+                        // so the answer already sent is the only correct one.
+                        // Re-keying here would strand the initiator, which
+                        // wiped its own secret when it established and can no
+                        // longer follow. A different ephemeral is a new attempt,
+                        // and the initiator is necessarily unestablished for it.
+                        repeat = common::crypto::Equal(peer->hsPeerEph.data(),
+                                                       ephI.data(), ephI.size());
+                        established = repeat;
                     }
                 }
                 else
@@ -1547,54 +1595,53 @@ namespace bcp::flux
         uint32_t responderCaps;
         BuildCapsBitmap(responderCaps);
 
+        common::crypto::PublicKey ephR;
         if (!established)
         {
+            // A fresh attempt, so a fresh throwaway pair to answer it with. The
+            // secret half never leaves this scope.
+            common::crypto::SecretKey ephSk;
             if (!common::crypto::RandomBytes(saltR, sizeof(saltR))) return;
+            if (!common::crypto::GenerateKeypair(ephSk, ephR)) return;
 
-            BuildTranscript(transcript, pk, publicKey_, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
+            BuildTranscript(transcript, pk, publicKey_, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
 
             PeerHandle peerHandle = peers_.GetPeer(from);
-            if (peerHandle.Failed()) return;
+            if (peerHandle.Failed())
+            {
+                common::crypto::Wipe(ephSk.data(), ephSk.size());
+                return;
+            }
             Peer* peer = peerHandle.Write();
-            CommitSession(*peer, pk, transcript, sizeof(transcript));
+            CommitSession(*peer, pk, ephSk, ephI, transcript, sizeof(transcript));
+            common::crypto::Wipe(ephSk.data(), ephSk.size());   // the whole point
+
             common::crypto::ComputeMac(confirm, peer->session, transcript, sizeof(transcript));
             std::memcpy(peer->hsSalt, saltR, sizeof(saltR));
+
+            // Enough to repeat this exact answer, and nothing that could
+            // reconstruct the key. A duplicate HS_RES is replied to from here.
+            peer->hsPeerEph = ephI;
+            peer->hsEphPub  = ephR;
+            std::memcpy(peer->hsConfirm, confirm.data(), sizeof(peer->hsConfirm));
+
             ReplayFor(peerHandle.GetSlotIndex()).Reset();   // fresh key -> remote's counter restarts at 0
             tagSession = peer->session;
             bindWindow = migration_;
         }
         else
         {
-            // Re-derive from the incoming salt and the stored one. A stale
-            // duplicate carries the same salt and reproduces the current key, so
-            // nothing changes; a genuine re-handshake carries a fresh salt and
-            // re-keys both sides consistently. The counter resets only when the
-            // key actually changes; resetting it under an unchanged key would
-            // reuse nonces.
+            // The same attempt arriving again, which means the answer was lost
+            // rather than refused. Repeat it verbatim. Re-deriving is not an
+            // option and re-keying is not either: the secret that made this
+            // session was wiped at both ends when it was made, so the only
+            // reachable key is the one already installed.
             PeerHandle peerHandle = peers_.GetPeer(from);
             if (peerHandle.Failed()) return;
-            Peer* peer = peerHandle.Write();
+            const Peer* peer = peerHandle.Read();
             std::memcpy(saltR, peer->hsSalt, sizeof(saltR));
-            BuildTranscript(transcript, pk, publicKey_, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
-
-            common::crypto::SessionKey candidate;
-            DeriveSessionInto(candidate, pk, transcript, sizeof(transcript));
-            if (!common::crypto::Equal(candidate.data(), peer->session.data(), candidate.size()))
-            {
-                // A retried HS_RES can carry a fresh salt, which derives a
-                // different session. Installing it goes through the one path
-                // that installs a session: assigning the key here and listing
-                // what else to reset is how headerKey was left behind, masking
-                // every counter with the previous session's key and failing
-                // every open in both directions with both ends established.
-                CommitSession(*peer, pk, transcript, sizeof(transcript));
-                ReplayFor(peerHandle.GetSlotIndex()).Reset();   // key changed -> remote's counter restarts
-                tagSession  = peer->session;
-                bindWindow  = migration_;
-                dropOldTags = true;    // the old key's window is dead weight
-            }
-            common::crypto::ComputeMac(confirm, peer->session, transcript, sizeof(transcript));
-            common::crypto::Wipe(candidate.data(), candidate.size());
+            ephR = peer->hsEphPub;
+            std::memcpy(confirm.data(), peer->hsConfirm, sizeof(peer->hsConfirm));
         }
 
         if (bindWindow)
@@ -1611,6 +1658,7 @@ namespace bcp::flux
 
         writer.WriteAddress(from);
         writer.PutBytes(publicKey_.data(), publicKey_.size());
+        writer.PutBytes(ephR.data(), ephR.size());
         writer.PutBytes(saltR, sizeof(saltR));
         writer.PutBytes(ownTag_.data(), ownTag_.size());
         writer.PutU16(internal::VERSION);
@@ -1628,12 +1676,14 @@ namespace bcp::flux
     void Socket::Handshake_Complete(const Address& from, PacketSlotReader& reader)
     {
         common::crypto::PublicKey pk;
+        common::crypto::PublicKey ephR;
         uint8_t saltR[internal::WIRE_HS_SALT_SIZE];
         Certificate::IdentityTag tag;
         uint16_t responderVersion;
         uint32_t responderCaps;
         common::crypto::Mac confirm;
         if (!reader.TakeBytes(pk.data(), pk.size())) return;
+        if (!reader.TakeBytes(ephR.data(), ephR.size())) return;
         if (!reader.TakeBytes(saltR, sizeof(saltR))) return;
         if (!reader.TakeBytes(tag.data(), tag.size())) return;
         if (!reader.TakeU16(responderVersion)) return;
@@ -1643,6 +1693,8 @@ namespace bcp::flux
         const BcpId id = BcpId::Derive(pk);
 
         uint8_t saltI[internal::WIRE_HS_SALT_SIZE];
+        common::crypto::SecretKey ephSk;
+        common::crypto::PublicKey ephI;
         uint32_t slot = 0;
         {
             PeerHandle peerHandle = peers_.GetPeer(from);
@@ -1659,6 +1711,8 @@ namespace bcp::flux
              && peer->state != HandshakeState::AWAITING_CHALLENGE) return;
             slot = peerHandle.GetSlotIndex();
             std::memcpy(saltI, peer->hsSalt, sizeof(saltI));   // our contribution
+            ephSk = peer->hsEphSecret;
+            ephI  = peer->hsEphPub;
         }
 
         // The trust gate. A trusted tag presented with the wrong key is an
@@ -1676,10 +1730,10 @@ namespace bcp::flux
         // holds the private half of the key it presented, and nothing in the
         // exchange was tampered with. Checked before anything establishes.
         uint8_t transcript[internal::HS_TRANSCRIPT_SIZE];
-        BuildTranscript(transcript, publicKey_, pk, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
+        BuildTranscript(transcript, publicKey_, pk, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
 
         common::crypto::SessionKey session;
-        DeriveSessionInto(session, pk, transcript, sizeof(transcript));
+        DeriveSessionInto(session, pk, ephSk, ephR, transcript, sizeof(transcript));
 
         common::crypto::Mac expected;
         common::crypto::ComputeMac(expected, session, transcript, sizeof(transcript));
@@ -1703,11 +1757,18 @@ namespace bcp::flux
                 return;
             }
             Peer* peer = peerHandle.Write();
-            CommitSession(*peer, pk, transcript, sizeof(transcript));
+            CommitSession(*peer, pk, ephSk, ephR, transcript, sizeof(transcript));
             std::memcpy(peer->announcedTag, tag.data(), tag.size());
             peer->authenticated = (match == CertStore::Match::Trusted);
             ReplayFor(peerHandle.GetSlotIndex()).Reset();   // fresh session -> remote's counter starts at 0
+
+            // The session exists now, so the secret that made it must not.
+            // Leaving it on the peer would keep the exchange reconstructible
+            // for as long as the peer lives, which is the whole thing this
+            // exists to prevent.
+            common::crypto::Wipe(peer->hsEphSecret.data(), peer->hsEphSecret.size());
         }
+        common::crypto::Wipe(ephSk.data(), ephSk.size());
 
         // Handle scope closed: bind the responder's tag window so its future
         // moves are recognizable from the first packet off a new address.
@@ -1719,6 +1780,8 @@ namespace bcp::flux
     }
 
     void Socket::CommitSession(Peer& peer, const common::crypto::PublicKey& theirPk,
+                                const common::crypto::SecretKey& myEphSk,
+                                const common::crypto::PublicKey& theirEphPk,
                                 const uint8_t* transcript, size_t transcriptLen) noexcept
     {
         // The peer-commit core shared by Validate's establish branch and
@@ -1728,7 +1791,7 @@ namespace bcp::flux
         // args: ReplayFor().Reset (needs the slot), and, in Complete, the
         // announced tag and authentication verdict.
         peer.theirPk = theirPk;
-        DeriveSessionInto(peer.session, theirPk, transcript, transcriptLen);
+        DeriveSessionInto(peer.session, theirPk, myEphSk, theirEphPk, transcript, transcriptLen);
         // Split off the counter-masking key. The label is fixed and public; it
         // only has to differ from every other input the session key is ever
         // fed, so the two derivations cannot collide.

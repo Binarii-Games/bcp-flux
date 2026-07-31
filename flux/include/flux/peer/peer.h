@@ -94,6 +94,22 @@ namespace bcp::flux
             responder side, which gets no announcement. */
         uint8_t announcedTag[internal::WIRE_HS_TAG_SIZE];
 
+        /** Handshake ephemeral state, and the whole point of it is that the
+            secret half does not outlive the exchange. It is wiped the moment
+            the session is derived, which is what stops a later theft of the
+            long-lived key from opening traffic recorded today.
+
+            hsEphSecret is the initiator's, held between HS_RES and HS_FINISH.
+            The other three are the responder's, and exist so a duplicate
+            HS_RES can be answered with the identical HS_FINISH rather than
+            re-keyed: the responder cannot re-derive its old answer once its
+            secret is gone, and the initiator cannot accept a re-key once its
+            own is gone either. hsPeerEph is what tells the two apart. */
+        common::crypto::SecretKey hsEphSecret;
+        common::crypto::PublicKey hsPeerEph;    ///< initiator's ephemeral, as accepted
+        common::crypto::PublicKey hsEphPub;     ///< our ephemeral, to repeat the answer
+        uint8_t hsConfirm[internal::WIRE_HS_MAC_SIZE];
+
         /** Packets queued before the handshake finished, as an intrusive list
             in the socket's pending pool: each slot holds the next index, so the
             peer keeps only the ends. UINT32_MAX (SlotPool::INVALID) means empty;

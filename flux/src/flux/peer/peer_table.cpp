@@ -438,6 +438,10 @@ namespace bcp::flux
         p->pathStep     = 0;
         std::memset(p->hsSalt, 0, sizeof(p->hsSalt));
         std::memset(p->announcedTag, 0, sizeof(p->announcedTag));
+        p->hsEphSecret = {};
+        p->hsPeerEph   = {};
+        p->hsEphPub    = {};
+        std::memset(p->hsConfirm, 0, sizeof(p->hsConfirm));
         p->pendingHead = common::collections::SlotPool::INVALID;
         p->pendingTail = common::collections::SlotPool::INVALID;
         p->firstSeenAt = SeenStamp(common::MonotonicMicros());

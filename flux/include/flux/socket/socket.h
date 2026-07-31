@@ -531,9 +531,17 @@ namespace bcp::flux
         /** The key-derive, MAC, and peer-commit block shared by Validate's
             establish branch and Complete. */
         void CommitSession(Peer& peer, const common::crypto::PublicKey& theirPk,
+                           const common::crypto::SecretKey& myEphSk,
+                           const common::crypto::PublicKey& theirEphPk,
                            const uint8_t* transcript, size_t transcriptLen) noexcept;
+
+        /** Combines the ephemeral exchange with the long-lived one. The caller
+            wipes its ephemeral secret as soon as this returns, which is what
+            makes the session unrecoverable once the handshake is over. */
         void DeriveSessionInto(common::crypto::SessionKey& out,
                                const common::crypto::PublicKey& theirPk,
+                               const common::crypto::SecretKey& myEphSk,
+                               const common::crypto::PublicKey& theirEphPk,
                                const uint8_t* transcript, size_t transcriptLen) noexcept;
         /** The kernel_->Write + CTRL_INTERNAL|CTRL_UNSECURE + opcode preamble,
             one writer factory for the handshake senders. */
