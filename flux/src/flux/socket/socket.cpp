@@ -1542,11 +1542,13 @@ namespace bcp::flux
             DeriveSessionInto(candidate, pk, transcript, sizeof(transcript));
             if (!common::crypto::Equal(candidate.data(), peer->session.data(), candidate.size()))
             {
-                peer->session = candidate;
-                peer->sendCounter = 0;
-                peer->myTagStep    = 0;   // new key -> new tag sequence, both sides
-                peer->theirTagStep = 0;
-                peer->myTag        = DerivePeerTag(peer->session, LaneTo(pk), 0);
+                // A retried HS_RES can carry a fresh salt, which derives a
+                // different session. Installing it goes through the one path
+                // that installs a session: assigning the key here and listing
+                // what else to reset is how headerKey was left behind, masking
+                // every counter with the previous session's key and failing
+                // every open in both directions with both ends established.
+                CommitSession(*peer, pk, transcript, sizeof(transcript));
                 ReplayFor(peerHandle.GetSlotIndex()).Reset();   // key changed -> remote's counter restarts
                 tagSession  = peer->session;
                 bindWindow  = migration_;
