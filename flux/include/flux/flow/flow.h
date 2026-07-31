@@ -46,39 +46,87 @@ namespace bcp::flux
         FAILED  = 3,
     };
 
+    /** How many positions the flow epoch has. A flow id closed and reopened
+        numbers its packets from one again, and the receiver still holds the old
+        association at whatever sequence it reached, so the two generations
+        would share one sequence space and the second would be read as a batch
+        of duplicates. The epoch is what separates them.
+
+        Eight positions leave three generations of forward margin, which is what
+        lets a receiver that missed one or two generations entirely still
+        recognise the current one as newer. */
+    static constexpr uint8_t FLOW_EPOCH_COUNT = 8;
+    static constexpr uint8_t FLOW_EPOCH_MASK  = FLOW_EPOCH_COUNT - 1;
+
     /** The flow data byte carried after the sequence in every flow packet:
-        mode in bits 0-2, bits 3-7 reserved and zero. The in-flight window is a
-        socket-wide constant, so nothing about it travels.
+        mode in bits 0-2, epoch in bits 3-5, bits 6-7 reserved and zero. The
+        in-flight window is a socket-wide constant, so nothing about it travels.
 
         The byte rides every packet, not just the first, so a receiver can
-        register the flow from whichever packet arrives first.
+        register the flow from whichever packet arrives first, and so a
+        generation change is seen on whichever packet of it arrives first rather
+        than only on the one that opened it.
 
         RELIABLE_ORDERED encodes as zero, so the byte has no spare value to mean
         failure and both directions report that separately. */
-    [[nodiscard]] inline bool EncodeFlowData(FlowMode mode, uint8_t& outData) noexcept
+    [[nodiscard]] inline bool EncodeFlowData(FlowMode mode, uint8_t epoch,
+                                             uint8_t& outData) noexcept
     {
         if (static_cast<uint8_t>(mode) > 2)
             return false;
+        if (epoch > FLOW_EPOCH_MASK)
+            return false;
 
-        outData = static_cast<uint8_t>(mode);
+        outData = static_cast<uint8_t>(static_cast<uint8_t>(mode) | (epoch << 3));
         return true;
+    }
+
+    /** The epoch out of a flow data byte, without the rest of the decode. The
+        control ops echo a generation back and need only this part of it. */
+    [[nodiscard]] inline uint8_t FlowDataEpoch(uint8_t data) noexcept
+    {
+        return static_cast<uint8_t>((data >> 3) & FLOW_EPOCH_MASK);
     }
 
     /** Reads a flow data byte off the wire. Refuses reserved modes, and refuses
         any reserved bit that is set: this input is attacker-chosen, and a
         receiver that ignored those bits could not distinguish a flow it
         understands from one carrying an extension it does not. */
-    [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode) noexcept
+    [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode,
+                                             uint8_t& outEpoch) noexcept
     {
-        if ((data & 0xF8u) != 0)
+        if ((data & 0xC0u) != 0)
             return false;
 
         const uint8_t modeBits = data & 0x07u;
         if (modeBits > 2)
             return false;
 
-        outMode = static_cast<FlowMode>(modeBits);
+        outMode  = static_cast<FlowMode>(modeBits);
+        outEpoch = FlowDataEpoch(data);
         return true;
+    }
+
+    /** Where an arriving epoch sits relative to the one an association holds. */
+    enum class FlowEpochOrder : uint8_t { Current, Newer, Stale };
+
+    /** Compares by walking forward from what the association holds, because the
+        field wraps and equality alone cannot tell a fresh generation from one
+        already replaced. A short walk is a generation this side has not caught
+        up with. A long walk can only be the field having come round again, so
+        the packet is a straggler from a generation that is gone.
+
+        Half the space answers each way, so a straggler arriving after the reset
+        is dropped instead of pulling the association back onto a sequence space
+        nothing will ever send on again. */
+    [[nodiscard]] inline FlowEpochOrder CompareFlowEpoch(uint8_t have, uint8_t seen) noexcept
+    {
+        const uint8_t forward = static_cast<uint8_t>((seen - have) & FLOW_EPOCH_MASK);
+        if (forward == 0)
+            return FlowEpochOrder::Current;
+
+        return forward < (FLOW_EPOCH_COUNT / 2) ? FlowEpochOrder::Newer
+                                                : FlowEpochOrder::Stale;
     }
 
     /** Outcome of trying to admit a flow packet to the wire, decided under the
@@ -94,8 +142,10 @@ namespace bcp::flux
         Dead,      ///< no such flow, or not OPEN; a real failure
     };
 
-    /** Outcome of registering a remote's flow from the packet that named it. */
-    enum class FlowAdmit : uint8_t { Registered, Existing, Rejected };
+    /** Outcome of registering a remote's flow from the packet that named it.
+        Stale means a generation already replaced, which is dropped without an
+        answer: nothing is left at the other end to hear one. */
+    enum class FlowAdmit : uint8_t { Registered, Existing, Rejected, Stale };
 
     /** Feedback gathered under a flow lock and applied to the peer under the
         peer lock. The flow side only accumulates, so it never reaches for the
@@ -291,6 +341,7 @@ namespace bcp::flux
 
         uint16_t flowId;        ///< the REMOTE's flow id, from the wire
         FlowMode mode;          ///< decoded from the flow data byte
+        uint8_t  flowEpoch;     ///< same byte: which generation of that id this is
         FlowLifecycle life;
 
         uint32_t epoch;

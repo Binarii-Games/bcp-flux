@@ -178,8 +178,10 @@ namespace bcp::flux
                                              uint16_t wireSize, bool flying) noexcept;
 
         /** Registers a remote's flow from the first packet that names it, and
-            reports the association the packet belongs to. outAssoc is INVALID
-            on a refusal.
+            reports the association the packet belongs to. A packet naming a
+            newer epoch than the association holds resets it here, so the
+            caller receives an association already numbering from one again.
+            outAssoc is INVALID on a refusal and on a stale generation.
             @pre caller holds the peer write lock. */
         [[nodiscard]] FlowAdmit AdmitIn(uint32_t peerSlot, const Address& from, const BcpId& peerId,
                                         uint16_t flowId, uint8_t flowData,
@@ -250,6 +252,18 @@ namespace bcp::flux
         std::unique_ptr<FlowDirEntry[]> outAssocDir_;
         std::unique_ptr<FlowDirEntry[]> inAssocDir_;
 
+        /** One byte per flow id, covering the whole id space. */
+        static constexpr uint32_t EPOCH_MEMORY_SIZE = 0x10000;
+
+        /** The epoch each flow id last opened with, so reopening an id always
+            advances by exactly one and the receiver can tell the generations
+            apart. It has to outlive the flow itself, which rules out the flow
+            slot: the slot is released at close and the next open may land
+            anywhere. Indexed by id rather than searched, which costs the whole
+            id space, and 64 KB against a socket already holding megabytes of
+            packet pools is the cheaper side of that trade. */
+        std::unique_ptr<uint8_t[]> lastEpochById_;
+
         common::collections::SlotPool* recvPool_  = nullptr;   ///< borrowed from the kernel
         common::collections::SlotPool* sendPool_  = nullptr;   ///< borrowed from the kernel
         common::collections::FifoQueue<uint32_t>* readyQueue_ = nullptr;   ///< borrowed from the socket
@@ -292,8 +306,9 @@ namespace bcp::flux
         void UnlinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept;
 
         /** Registers a remote's flow on first sight, from a data packet's flow
-            header. Refused when the flow data byte does not decode, or on caps:
-            a dry pool or a full directory.
+            header, and settles which generation of that flow the packet belongs
+            to. Refused when the flow data byte does not decode, or on caps: a
+            dry pool or a full directory.
 
             @pre Caller holds the peer's write lock. */
         [[nodiscard]] FlowAdmit AdmitInFlow(uint32_t peerSlot, const Address& from,

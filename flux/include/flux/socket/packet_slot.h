@@ -56,9 +56,10 @@ namespace bcp::flux
         /** The flow sequence number of a flow packet; 0 (the never-sent
             sentinel) when the packet carries no flow or is too short. */
         uint32_t FlowSeq() const;
-        /** The flow data byte, holding the mode (see DecodeFlowData). Returns 0
-            when the packet carries no flow or is too short, which RELIABLE_ORDERED
-            also encodes as, so read HasFlow() to tell absent from a mode. */
+        /** The flow data byte, holding the mode and the epoch (see
+            DecodeFlowData). Returns 0 when the packet carries no flow or is too
+            short, which RELIABLE_ORDERED at epoch 0 also encodes as, so read
+            HasFlow() to tell absent from a mode. */
         uint8_t FlowData() const;
         /** Where the flow header starts, past the cleartext header and the
             channel byte; dataSize when this packet has no flow header or is

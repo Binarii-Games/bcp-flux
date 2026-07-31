@@ -297,7 +297,7 @@ unsecured [Controller(1)][payload]
 | Channel | 1 | secure, inside the seal | 0 for application data, otherwise an internal control op |
 | FlowId | 2 | `HAS_FLOW` set | the sender's flow id |
 | FlowSeq | 4 | `HAS_FLOW` set | the packet's sequence on that flow, starting at 1 |
-| FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, bits 3-7 reserved and zero |
+| FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, epoch in bits 3-5, bits 6-7 reserved and zero |
 | payload | rest | always | application bytes, or the control op's body |
 
 The controller bits: `CTRL_INTERNAL` marks handshake traffic, consumed and
@@ -460,6 +460,18 @@ Opening is local. `OpenFlow(id, mode)` takes no address, costs nothing on the
 wire, and the flow is sendable the instant it returns, including before any
 handshake. The receiver builds its half from whichever packet arrives first,
 reading the mode off the flow data byte.
+
+An id closed and opened again numbers its packets from one, while the receiver
+still holds the old association at whatever sequence it reached, so the two
+generations would share one sequence space and the second would read as a run
+of duplicates. The epoch in the flow data byte separates them. `OpenFlow`
+advances it by one for that id, and a receiver seeing a higher one clears the
+association back to sequence one and drops what it was holding. The comparison
+walks forward from the epoch the association holds, because the field wraps
+after eight opens: a short walk is a generation this side has not caught up
+with, a long walk is a straggler from a generation already replaced, and the
+straggler is dropped rather than pulling the association back onto a sequence
+space nothing will send on again.
 
 The in-flight window is `internal::FLOW_WINDOW`, 256 packets: the sender's ring
 capacity and the receiver's seen-bitmap width, one number for every flow in both

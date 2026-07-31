@@ -65,15 +65,16 @@ namespace bcp::flux
             from a local flow: the sender declares it on every packet. */
         void ResetInAssoc(InAssociation* assoc, uint32_t peerSlot, const Address& peerAddr,
                           const BcpId* peerId, uint16_t flowId, FlowMode mode,
-                          uint16_t windowBits, uint16_t reorderCap) noexcept
+                          uint8_t flowEpoch, uint16_t windowBits, uint16_t reorderCap) noexcept
         {
-            assoc->peerSlot = peerSlot;
-            assoc->peerAddr = peerAddr;
-            assoc->peerId   = peerId ? *peerId : BcpId{};
-            assoc->flowId   = flowId;
-            assoc->mode     = mode;
-            assoc->life     = FlowLifecycle::OPEN;
-            assoc->epoch    = assoc->epoch + 1;
+            assoc->peerSlot   = peerSlot;
+            assoc->peerAddr   = peerAddr;
+            assoc->peerId     = peerId ? *peerId : BcpId{};
+            assoc->flowId     = flowId;
+            assoc->mode       = mode;
+            assoc->flowEpoch  = flowEpoch;
+            assoc->life       = FlowLifecycle::OPEN;
+            assoc->epoch      = assoc->epoch + 1;
 
             assoc->recvNext       = 1;
             assoc->recvHighest    = 0;
@@ -371,6 +372,10 @@ namespace bcp::flux
                 flow->life   = FlowLifecycle::CLOSED;
                 flowPool_.UnlockWrite(slot);
             }
+
+            lastEpochById_.reset(new (std::nothrow) uint8_t[EPOCH_MEMORY_SIZE]{});
+            if (!lastEpochById_)
+                return common::Error::NotInitialized;
         }
 
         if (params.inCount > 0)
@@ -573,10 +578,6 @@ namespace bcp::flux
             mode != FlowMode::UNRELIABLE)
             return FlowHandle{common::Error::InvalidParam};
 
-        uint8_t flowData = 0;
-        if (!EncodeFlowData(mode, flowData))
-            return FlowHandle{common::Error::InvalidParam};
-
         // The id is how a remote names the flow, so two sharing one would be
         // indistinguishable on the wire.
         if (FindFlowById(flowId) != common::collections::SlotPool::INVALID)
@@ -585,6 +586,20 @@ namespace bcp::flux
         const uint32_t flowSlot = flowPool_.Acquire();
         if (flowSlot == common::collections::SlotPool::INVALID)
             return FlowHandle{common::Error::LimitReached};
+
+        const uint8_t flowEpoch = static_cast<uint8_t>(
+            (lastEpochById_[flowId] + 1u) & FLOW_EPOCH_MASK);
+
+        uint8_t flowData = 0;
+        if (!EncodeFlowData(mode, flowEpoch, flowData))
+        {
+            flowPool_.Release(flowSlot);
+            return FlowHandle{common::Error::InvalidParam};
+        }
+
+        // Kept only once nothing left can fail, so a refused open does not
+        // spend one of the eight positions the receiver walks.
+        lastEpochById_[flowId] = flowEpoch;
 
         uint32_t epoch = 0;
         {
@@ -1010,14 +1025,34 @@ namespace bcp::flux
                                      const BcpId& peerId, uint16_t flowId,
                                      uint8_t flowData) noexcept
     {
-        FlowDirEntry* dir = InDirFor(peerSlot);
-        if (FindFlowSlot(dir, maxInAssocPerPeer_, flowId)
-            != common::collections::SlotPool::INVALID)
-            return FlowAdmit::Existing;
-
         FlowMode mode{};
-        if (!DecodeFlowData(flowData, mode))
+        uint8_t  flowEpoch = 0;
+        if (!DecodeFlowData(flowData, mode, flowEpoch))
             return FlowAdmit::Rejected;
+
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        const uint32_t existing = FindFlowSlot(dir, maxInAssocPerPeer_, flowId);
+        if (existing != common::collections::SlotPool::INVALID)
+        {
+            InAssociation* assoc = reinterpret_cast<InAssociation*>(
+                inAssocPool_.WriteLock(existing));
+            const FlowEpochOrder order = CompareFlowEpoch(assoc->flowEpoch, flowEpoch);
+            if (order == FlowEpochOrder::Newer)
+            {
+                // The sender closed this id and opened it again, so it numbers
+                // from one now and nothing held against the old generation can
+                // ever be completed. Drain first: the reset only stamps the
+                // hold-back entries free, and the slots they name are ours to
+                // release.
+                DrainInHoldback(assoc);
+                ResetInAssoc(assoc, peerSlot, from, &peerId, flowId, mode,
+                             flowEpoch, inWindowBits_, inReorderCap_);
+            }
+            inAssocPool_.UnlockWrite(existing);
+
+            return order == FlowEpochOrder::Stale ? FlowAdmit::Stale
+                                                  : FlowAdmit::Existing;
+        }
 
         // This is the one path where a REMOTE makes this socket allocate, so
         // it is caps-only: a dry pool or a full directory refuses, and the
@@ -1031,7 +1066,7 @@ namespace bcp::flux
             InAssociation* flow = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(flowSlot));
             ResetInAssoc(flow, peerSlot, from, &peerId, flowId, mode,
-                        inWindowBits_, inReorderCap_);
+                         flowEpoch, inWindowBits_, inReorderCap_);
             inAssocPool_.UnlockWrite(flowSlot);
         }
         if (InsertFlowSlot(dir, maxInAssocPerPeer_, flowId, flowSlot)
@@ -1053,7 +1088,7 @@ namespace bcp::flux
         // First packet of a flow registers it: the flow data byte carries
         // everything registration needs.
         const FlowAdmit admit = AdmitInFlow(peerSlot, from, peerId, flowId, flowData);
-        if (admit != FlowAdmit::Rejected)
+        if (admit == FlowAdmit::Registered || admit == FlowAdmit::Existing)
             outAssoc = FindFlowSlot(InDirFor(peerSlot), maxInAssocPerPeer_, flowId);
         return admit;
     }
