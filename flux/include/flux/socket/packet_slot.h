@@ -11,6 +11,7 @@
 #include <common/wire/bytes_writer.h>
 
 #include <flux/address.h>
+#include <flux/flow/flow.h>
 
 namespace bcp::flux
 {
@@ -61,6 +62,18 @@ namespace bcp::flux
             short, which RELIABLE_ORDERED at epoch 0 also encodes as, so read
             HasFlow() to tell absent from a mode. */
         uint8_t FlowData() const;
+
+        /** Where this packet sits in a message spanning several packets. Whole
+            for an ordinary packet, and for anything that carries no flow, so a
+            caller that never sends a message larger than one packet can ignore
+            this entirely.
+
+            A run is delivered in order and never assembled by the transport, so
+            the caller appends the payloads itself. First means drop whatever
+            partial message is being held and begin a new one, which is what
+            makes a run abandoned by a failed or reopened flow recoverable
+            rather than silently spliced onto the next one. */
+        FlowPart Part() const;
         /** Where the flow header starts, past the cleartext header and the
             channel byte; dataSize when this packet has no flow header or is
             too short to hold one. The three flow accessors and ContentOffset

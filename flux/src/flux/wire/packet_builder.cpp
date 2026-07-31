@@ -67,13 +67,20 @@ namespace bcp::flux::wire
         return PacketContentStage(*sender_, std::move(writer), respondTo_);
     }
 
-    PacketContentStage PacketBuilder::WithFlow(const FlowHandle& flow)
+    PacketContentStage PacketBuilder::WithFlow(const FlowHandle& flow, FlowPart part)
     {
         if (!socket_)
             return PacketContentStage(failReason_);
         if (spent_)
             return PacketContentStage(common::Error::InvalidState);
         spent_ = true;
+
+        // Refused here rather than on the wire, so a caller framing a message
+        // on a mode that cannot carry one learns at the send that asked for it.
+        FlowMode mode{};
+        if (part != FlowPart::Whole
+         && (!socket_->FlowModeOf(flow, mode) || !FlowPartAllowed(mode, part)))
+            return PacketContentStage(common::Error::InvalidParam);
 
         // The pool depends on the flow's mode: a reliable flow's body is its own
         // retransmit source and must outlive the send, so the socket resolves
@@ -91,8 +98,15 @@ namespace bcp::flux::wire
         if (!WriteCommonHeader(writer, true, tagged_, true))
             return PacketContentStage(common::Error::BufferFull);
 
+        // The stored byte carries the mode and the generation, which are fixed
+        // for the flow's lifetime. The framing bits belong to this packet
+        // alone, so they are laid over it here rather than at open.
+        uint8_t flowData = flow.FlowData();
+        if (part == FlowPart::First || part == FlowPart::Middle) flowData |= FLOW_PART_MORE;
+        if (part == FlowPart::Middle || part == FlowPart::Last)  flowData |= FLOW_PART_CONT;
+
         // PutU32(0) reserves the sequence bytes; PreProcessOut stamps them.
-        if (!writer.PutU16(flow.Id()) || !writer.PutU32(0) || !writer.PutU8(flow.FlowData()))
+        if (!writer.PutU16(flow.Id()) || !writer.PutU32(0) || !writer.PutU8(flowData))
             return PacketContentStage(common::Error::BufferFull);
 
         return PacketContentStage(*sender_, std::move(writer), respondTo_);

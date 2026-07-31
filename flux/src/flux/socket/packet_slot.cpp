@@ -98,6 +98,11 @@ namespace bcp::flux
         return data[offset + internal::WIRE_FLOW_ID_SIZE + internal::WIRE_FLOW_SEQ_SIZE];
     }
 
+    FlowPart PacketSlot::Part() const
+    {
+        return FlowDataPart(FlowData());
+    }
+
     const uint8_t* PacketSlot::PeerTagField() const
     {
         if (!IsTagged())

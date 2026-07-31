@@ -4,6 +4,7 @@
 #include <utility>
 
 #include <common/error.h>
+#include <flux/flow/flow.h>
 #include <flux/socket/packet_slot.h>
 
 namespace bcp::flux
@@ -132,8 +133,19 @@ namespace bcp::flux::wire
             flow's id and its next sequence number, both stamped at send time;
             a reliable flow additionally retains the body for retransmission.
             A failed or stale handle, or a flow not yet OPEN, yields a stage
-            that refuses to send. */
-        PacketContentStage WithFlow(const FlowHandle& flow);
+            that refuses to send.
+
+            `part` places the packet in a message spanning several of them, and
+            defaults to a message of one, which is what every send that does not
+            care about framing already is. Anything else needs
+            RELIABLE_ORDERED, since ordered delivery is what lets two bits carry
+            the framing, and yields a refusing stage on the other modes.
+
+            The transport never assembles the run. It carries the framing and
+            the receiver reads it off each packet, so a message has no size
+            limit and nothing is allocated to hold one. */
+        PacketContentStage WithFlow(const FlowHandle& flow,
+                                    FlowPart part = FlowPart::Whole);
 
         inline bool Failed()
         {

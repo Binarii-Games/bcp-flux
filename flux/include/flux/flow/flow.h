@@ -58,27 +58,82 @@ namespace bcp::flux
     static constexpr uint8_t FLOW_EPOCH_COUNT = 8;
     static constexpr uint8_t FLOW_EPOCH_MASK  = FLOW_EPOCH_COUNT - 1;
 
+    /** Where a packet sits in a message that spans several of them. A message
+        larger than one packet is sent as a run of them on one flow, and these
+        two bits are the whole of the framing: the transport carries them and
+        never assembles anything, so a message has no size limit and the receive
+        path allocates nothing to hold one.
+
+        Whole is an ordinary packet, which is a message of one, so every send
+        that never asks for anything else keeps behaving exactly as before.
+
+        First is what makes a truncated message recoverable. A flow that fails
+        or reopens mid-message leaves the receiver holding a run that will never
+        be finished, and the next First tells it to drop what it has rather than
+        appending a fresh message onto the wreckage of the old one. */
+    enum class FlowPart : uint8_t
+    {
+        Whole  = 0,   ///< a message of one packet
+        First  = 1,   ///< opens a message, more to come
+        Middle = 2,   ///< neither opens nor closes
+        Last   = 3,   ///< closes the message opened by an earlier First
+    };
+
+    /** Bit 7 says a packet continues something earlier rather than saying one
+        opens a message, so an ordinary packet still encodes both bits as zero
+        and nothing about an existing send changes. */
+    static constexpr uint8_t FLOW_PART_MORE = 0x40;   ///< bit 6: more follows
+    static constexpr uint8_t FLOW_PART_CONT = 0x80;   ///< bit 7: continues an earlier packet
+
+    /** Ordered delivery is what lets two bits carry the whole framing, so the
+        other modes have no use for them and must refuse them. On an unordered
+        flow the run could arrive in any order and there would be nothing to
+        append to, and unreliable delivers newest only, which would tear a
+        message apart by design. */
+    [[nodiscard]] inline bool FlowPartAllowed(FlowMode mode, FlowPart part) noexcept
+    {
+        return part == FlowPart::Whole || mode == FlowMode::RELIABLE_ORDERED;
+    }
+
     /** The flow data byte carried after the sequence in every flow packet:
-        mode in bits 0-2, epoch in bits 3-5, bits 6-7 reserved and zero. The
-        in-flight window is a socket-wide constant, so nothing about it travels.
+        mode in bits 0-2, epoch in bits 3-5, more-follows in bit 6, and
+        message-starts in bit 7. The in-flight window is a socket-wide constant,
+        so nothing about it travels.
 
         The byte rides every packet, not just the first, so a receiver can
         register the flow from whichever packet arrives first, and so a
         generation change is seen on whichever packet of it arrives first rather
         than only on the one that opened it.
 
-        RELIABLE_ORDERED encodes as zero, so the byte has no spare value to mean
-        failure and both directions report that separately. */
+        RELIABLE_ORDERED as a whole message encodes as zero, so the byte has no
+        spare value to mean failure and both directions report that
+        separately. */
     [[nodiscard]] inline bool EncodeFlowData(FlowMode mode, uint8_t epoch,
-                                             uint8_t& outData) noexcept
+                                             FlowPart part, uint8_t& outData) noexcept
     {
         if (static_cast<uint8_t>(mode) > 2)
             return false;
         if (epoch > FLOW_EPOCH_MASK)
             return false;
+        if (!FlowPartAllowed(mode, part))
+            return false;
 
-        outData = static_cast<uint8_t>(static_cast<uint8_t>(mode) | (epoch << 3));
+        uint8_t bits = 0;
+        if (part == FlowPart::First || part == FlowPart::Middle) bits |= FLOW_PART_MORE;
+        if (part == FlowPart::Middle || part == FlowPart::Last)  bits |= FLOW_PART_CONT;
+
+        outData = static_cast<uint8_t>(static_cast<uint8_t>(mode) | (epoch << 3) | bits);
         return true;
+    }
+
+    /** The framing bits out of a flow data byte, without the rest of the
+        decode. */
+    [[nodiscard]] inline FlowPart FlowDataPart(uint8_t data) noexcept
+    {
+        const bool more = (data & FLOW_PART_MORE) != 0;
+        const bool cont = (data & FLOW_PART_CONT) != 0;
+        if (!cont) return more ? FlowPart::First : FlowPart::Whole;
+        return more ? FlowPart::Middle : FlowPart::Last;
     }
 
     /** The epoch out of a flow data byte, without the rest of the decode. The
@@ -89,21 +144,25 @@ namespace bcp::flux
     }
 
     /** Reads a flow data byte off the wire. Refuses reserved modes, and refuses
-        any reserved bit that is set: this input is attacker-chosen, and a
-        receiver that ignored those bits could not distinguish a flow it
-        understands from one carrying an extension it does not. */
+        framing bits on a mode that cannot carry them: this input is
+        attacker-chosen, and a receiver that ignored a bit it does not
+        understand could not tell a flow it understands from one carrying an
+        extension it does not. */
     [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode,
-                                             uint8_t& outEpoch) noexcept
+                                             uint8_t& outEpoch, FlowPart& outPart) noexcept
     {
-        if ((data & 0xC0u) != 0)
-            return false;
-
         const uint8_t modeBits = data & 0x07u;
         if (modeBits > 2)
             return false;
 
-        outMode  = static_cast<FlowMode>(modeBits);
+        const FlowMode mode = static_cast<FlowMode>(modeBits);
+        const FlowPart part = FlowDataPart(data);
+        if (!FlowPartAllowed(mode, part))
+            return false;
+
+        outMode  = mode;
         outEpoch = FlowDataEpoch(data);
+        outPart  = part;
         return true;
     }
 

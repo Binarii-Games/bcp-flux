@@ -509,6 +509,11 @@ namespace bcp::flux
         return kernel_->Write();
     }
 
+    bool Socket::FlowModeOf(const FlowHandle& flow, FlowMode& outMode) noexcept
+    {
+        return flows_.ModeOf(flow, outMode);
+    }
+
     common::Result<PacketSlotWriter> Socket::AcquireFlowWriter(const FlowHandle& flow)
     {
         if (!initialized_.load(std::memory_order_acquire) || !flows_.SendEnabled())

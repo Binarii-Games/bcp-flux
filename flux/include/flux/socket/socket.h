@@ -458,6 +458,10 @@ namespace bcp::flux
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireKernelWriter();
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireFlowWriter(const FlowHandle& flow);
 
+        /** The flow's mode, for the builder's framing gate. False when the
+            handle is stale or the flow is not open. */
+        [[nodiscard]] bool FlowModeOf(const FlowHandle& flow, FlowMode& outMode) noexcept;
+
         /** The outbound gate (called by SocketSender for every packet). Internal
             packets pass through; established peers seal and fly; unknown or
             mid-handshake peers park. Thin: validate -> gather -> stamp ->

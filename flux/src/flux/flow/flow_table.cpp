@@ -591,8 +591,11 @@ namespace bcp::flux
         const uint8_t flowEpoch = static_cast<uint8_t>(
             (lastEpochById_[flowId] + 1u) & FLOW_EPOCH_MASK);
 
+        // Encoded as a whole message, so the stored byte carries only what is
+        // fixed for the flow's lifetime. The framing bits vary per packet and
+        // the builder lays them over this.
         uint8_t flowData = 0;
-        if (!EncodeFlowData(mode, flowEpoch, flowData))
+        if (!EncodeFlowData(mode, flowEpoch, FlowPart::Whole, flowData))
         {
             flowPool_.Release(flowSlot);
             return FlowHandle{common::Error::InvalidParam};
@@ -1050,9 +1053,13 @@ namespace bcp::flux
                                      const BcpId& peerId, uint16_t flowId,
                                      uint8_t flowData) noexcept
     {
+        // The part is a property of this packet, not of the association, so it
+        // is decoded only to be validated: framing on a mode that cannot frame
+        // is refused here rather than reaching the delivery path.
         FlowMode mode{};
         uint8_t  flowEpoch = 0;
-        if (!DecodeFlowData(flowData, mode, flowEpoch))
+        FlowPart part{};
+        if (!DecodeFlowData(flowData, mode, flowEpoch, part))
             return FlowAdmit::Rejected;
 
         FlowDirEntry* dir = InDirFor(peerSlot);

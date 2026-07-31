@@ -297,7 +297,7 @@ unsecured [Controller(1)][payload]
 | Channel | 1 | secure, inside the seal | 0 for application data, otherwise an internal control op |
 | FlowId | 2 | `HAS_FLOW` set | the sender's flow id |
 | FlowSeq | 4 | `HAS_FLOW` set | the packet's sequence on that flow, starting at 1 |
-| FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, epoch in bits 3-5, bits 6-7 reserved and zero |
+| FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, epoch in bits 3-5, more-follows in bit 6, continues in bit 7 |
 | payload | rest | always | application bytes, or the control op's body |
 
 The controller bits: `CTRL_INTERNAL` marks handshake traffic, consumed and
@@ -472,6 +472,25 @@ after eight opens: a short walk is a generation this side has not caught up
 with, a long walk is a straggler from a generation already replaced, and the
 straggler is dropped rather than pulling the association back onto a sequence
 space nothing will send on again.
+
+A message larger than one packet travels as a run of them on one ordered flow,
+and bits 6 and 7 are the whole of the framing. More-follows says the message
+continues past this packet, and continues says this packet is not the one that
+opened it, so an ordinary send leaves both clear and is a message of one. The
+transport carries the two bits and never gathers the run, so a message has no
+size limit and the receive path allocates nothing to hold one.
+
+Ordered delivery is what lets two bits do that job, and the other modes refuse
+them. An unordered flow could deliver a run in any order, leaving nothing to
+append to, and unreliable delivers newest only, which would tear a message apart
+by design.
+
+The bit that says a packet opened a message is what makes an abandoned one
+recoverable. A flow that fails or is reopened mid-message leaves the receiver
+holding a run nothing will finish, and the next opening packet tells it to drop
+what it holds rather than appending a fresh message to the remains of the old
+one. Without it the receiver would deliver bytes that were never sent, in an
+order that looks correct.
 
 The in-flight window is `internal::FLOW_WINDOW`, 256 packets: the sender's ring
 capacity and the receiver's seen-bitmap width, one number for every flow in both
