@@ -7,56 +7,48 @@
 namespace bcp::flux::internal
 {
     // --- Version ---
-    static constexpr uint16_t VERSION                       = 0; ///< Stays 0 until 1.0: the wire is not frozen, so nothing negotiates on it
-    static constexpr uint8_t  VERSION_CAPS_SIZE             = 4; ///< Fixed; changing it breaks older versions.
-    static constexpr uint8_t  VERSION_SIZE                  = 2; 
-
+    static constexpr uint16_t VERSION                       = 0;  ///< 0 until 1.0; nothing negotiates on it
+    static constexpr uint8_t  VERSION_CAPS_SIZE             = 4;
+    static constexpr uint8_t  VERSION_SIZE                  = 2;
 
     // --- Wire ---
-    static constexpr uint16_t MAX_WIRE_PACKET_SIZE          = 1200; ///< Conservative floor: under the IPv6 min MTU (1280) less IP+UDP headers, with margin for tunnels/VPNs. MTU discovery probes upward from here.
+    static constexpr uint16_t MAX_WIRE_PACKET_SIZE          = 1200;  ///< under the IPv6 minimum MTU less IP+UDP, with room for tunnels
     static constexpr uint8_t  WIRE_CONTROLLER_SIZE          = 1;
     static constexpr uint8_t  WIRE_TAG_SIZE                 = 16;
-    static constexpr uint8_t  WIRE_NONCE_SIZE               = 8;  ///< Send-counter half of the nonce; the rest is derived locally.
+    static constexpr uint8_t  WIRE_NONCE_SIZE               = 8;  ///< counter half only; the rest is derived locally
     static constexpr uint8_t  WIRE_FLOW_ID_SIZE             = 2;
     static constexpr uint8_t  WIRE_FLOW_SEQ_SIZE            = 4;
-    static constexpr uint8_t  WIRE_FLOW_DATA_SIZE           = 1;  ///< mode, after the sequence
-    /** The whole flow header, inside the seal: id, sequence, data byte. */
+    static constexpr uint8_t  WIRE_FLOW_DATA_SIZE           = 1;  ///< mode, epoch, message framing (see flow.h)
     static constexpr uint8_t  WIRE_FLOW_HEADER_SIZE         =
         WIRE_FLOW_ID_SIZE + WIRE_FLOW_SEQ_SIZE + WIRE_FLOW_DATA_SIZE;
-    static constexpr uint8_t  WIRE_PEER_TAG_SIZE            = 4;  ///< Migration tag; present when CTRL_TAGGED is set.
-    static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;  ///< First encrypted byte; splits app data from control.
+    static constexpr uint8_t  WIRE_PEER_TAG_SIZE            = 4;  ///< present when CTRL_TAGGED is set
+    static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;
     static constexpr uint8_t  MIN_WIRE_SIZE                 = WIRE_CONTROLLER_SIZE;
     static constexpr uint8_t  MIN_SECURE_WIRE_SIZE          = WIRE_CONTROLLER_SIZE + WIRE_TAG_SIZE + WIRE_NONCE_SIZE;
 
-    /** In-band secure channel: the first byte of every secure packet's
-        plaintext, encrypted and never visible on the wire. 0 is application
-        data; anything else is internal control (path validation). A validation
-        packet is byte-for-byte indistinguishable from data to any observer,
-        even one that knows Flux's header. The receiver learns which only after
-        a successful decrypt. */
+    /** First plaintext byte of a secure packet, so which kind it is shows only
+        after decrypting. CTRL_HAS_FLOW stays cleartext, but packet size gives
+        the same away. */
     static constexpr uint8_t  SECURE_CHANNEL_APP            = 0x00;
     static constexpr uint8_t  SECURE_CHANNEL_PATH_CHLG      = 0x01;
     static constexpr uint8_t  SECURE_CHANNEL_PATH_RESP      = 0x02;
-    static constexpr uint8_t  SECURE_CHANNEL_FLOW_REJECT    = 0x03; ///< receiver refused to register a flow (caps)
+    static constexpr uint8_t  SECURE_CHANNEL_FLOW_REJECT    = 0x03;
     static constexpr uint8_t  SECURE_CHANNEL_FLOW_ACK       = 0x04;
 
     static_assert(WIRE_TAG_SIZE == common::crypto::TAG_SIZE,
                   "The wire tag field carries the AEAD tag verbatim");
 
     // --- Handshake ---
-    static constexpr uint8_t  WIRE_HS_SALT_SIZE             = 16; ///< Each side's KDF salt contribution.
-    static constexpr uint8_t  WIRE_HS_TAG_SIZE              = 32; ///< Responder's announced identity tag.
-    static constexpr uint8_t  WIRE_HS_MAC_SIZE              = 16; ///< Key-confirmation MAC over the transcript.
+    static constexpr uint8_t  WIRE_HS_SALT_SIZE             = 16;
+    static constexpr uint8_t  WIRE_HS_TAG_SIZE              = 32;  ///< responder's announced identity tag
+    static constexpr uint8_t  WIRE_HS_MAC_SIZE              = 16;
 
-    /** The handshake transcript both sides bind into the session key and the
-        confirmation MAC, role-ordered so both ends assemble identical bytes:
-          initiatorPk ‖ responderPk ‖ initiatorEph ‖ responderEph ‖ saltI ‖ saltR
-          ‖ initiatorCaps ‖ responderCaps ‖ initiatorVersion ‖ responderVersion ‖ tag
-        Version and caps sit inside the MAC'd transcript, so a tampered or
-        mismatched negotiation fails key confirmation. The ephemeral public keys
-        are here for the same reason: they are what the forward secrecy rests
-        on, so swapping one has to break the MAC. BuildTranscript is the
-        authoritative field order. */
+    /** Role-ordered so both ends assemble identical bytes. BuildTranscript is
+        the authoritative layout:
+          initiatorPk responderPk initiatorEph responderEph saltI saltR
+          initiatorCaps responderCaps initiatorVersion responderVersion tag
+        Everything negotiated is inside the MAC, so tampering fails key
+        confirmation. */
     static constexpr size_t   HS_TRANSCRIPT_SIZE            =
         4*common::crypto::KEY_SIZE + 2*WIRE_HS_SALT_SIZE + 2*VERSION_SIZE + 2*VERSION_CAPS_SIZE + WIRE_HS_TAG_SIZE;
 
@@ -110,22 +102,16 @@ namespace bcp::flux::internal
     static constexpr uint32_t  MAX_READ_PER_TICK            = 258;
 
     // --- Migration ---
-    /** Ceiling on unknown-address tag lookups (and their trial decrypts) per
-        Poll pass. Genuine moves are rare; a burst beyond this smells like a
-        flood, and a legit mover past the budget just retries next packet. */
+    /** Unknown-address tag lookups, and their trial decrypts, per Poll pass. A
+        burst past this is a flood; a genuine mover retries on its next packet. */
     static constexpr uint32_t  MIGRATE_BUDGET_PER_POLL      = 64;
 
     // --- Liveness ---
-    /** Peer seen-stamps store monotonic microseconds right-shifted by this,
-        giving ~1.024 ms units in 32 bits (a ~49.7-day wrap). Wrapped
-        subtraction keeps elapsed time exact under one wrap, so an idle peer
-        past a full wrap can only be evicted late, never early. */
+    /** Monotonic micros are stored right-shifted by this, giving ~1.024 ms units
+        in 32 bits and a ~49.7-day wrap. Wrapped subtraction stays exact under
+        one wrap, so a peer past a full wrap evicts late, never early. */
     static constexpr uint32_t  SEEN_STAMP_SHIFT             = 10;
-    /** Evictions one Update call will perform; the rest ride the next tick.
-        Bounds the burst of RemovePeer teardowns when many peers idle out
-        together. Same shape as MIGRATE_BUDGET_PER_POLL, smaller because a
-        teardown (flow sweep + pending drain) far outweighs a tag lookup. */
-    static constexpr uint32_t  MAX_EVICT_PER_UPDATE         = 16;
+    static constexpr uint32_t  MAX_EVICT_PER_UPDATE         = 16;  ///< the rest ride the next tick
 
     // --- Workers ---
     static constexpr uint8_t   SOCK_WORKER_COUNT            = 8;

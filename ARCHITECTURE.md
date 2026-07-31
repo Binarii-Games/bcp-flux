@@ -313,9 +313,10 @@ with a mask derived from a per-peer header key and this packet's own AEAD tag,
 unique per packet. Both ends recompute it, and an observer sees eight bytes
 that never form a sequence.
 
-The channel byte sits inside the seal, so a control packet (path validation,
-flow reject, flow ack) is byte-for-byte indistinguishable from data to any
-observer. The receiver learns which it holds only after a successful decrypt.
+The channel byte sits inside the seal, so the receiver learns whether it holds
+control or data only after a successful decrypt. The cleartext `CTRL_HAS_FLOW`
+bit still says whether a packet carries a flow, which packet size gives away
+anyway.
 
 Handshake packets are the only cleartext opcodes (`HS_INIT`, `HS_CHLG`,
 `HS_RES`, `HS_FINISH`), carried on unsecured internal packets because no key
