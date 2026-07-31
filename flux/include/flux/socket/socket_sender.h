@@ -21,6 +21,6 @@ namespace bcp::flux
             authenticated against a trusted certificate. Refused on an unauthenticated
             established peer (NotAuthenticated); when parked behind a handshake, dropped
             at flush time unless the peer came out authenticated. */
-        common::Error Send (PacketSlotHandle pHandle, bool requireAuth = false);
+        [[nodiscard]] common::Error Send (PacketSlotHandle pHandle, bool requireAuth = false);
     };
 }

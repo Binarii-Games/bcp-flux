@@ -166,10 +166,16 @@ namespace bcp::flux
         /** The send gate: creates the association on first send, then admits,
             queues, drops or refuses. The flow is named by the packet's own flow
             header, which is all the gate has at this point.
+
+            `flying` is false when the peer's handshake has not finished, so the
+            packet is admitted but held. It is stamped as never sent, which
+            leaves it overdue and puts it on the wire on the first tick after
+            the session opens.
+
             @pre caller holds the packet slot write lock and the peer write lock. */
         [[nodiscard]] SendAdmission AdmitOut(Peer& peer, uint32_t peerSlot,
                                              PacketSlot& packet, uint32_t packetSlot,
-                                             uint16_t wireSize) noexcept;
+                                             uint16_t wireSize, bool flying) noexcept;
 
         /** Registers a remote's flow from the first packet that names it, and
             reports the association the packet belongs to. outAssoc is INVALID

@@ -249,12 +249,16 @@ namespace bcp::flux
 
             @pre CanSend passed under the same lock. */
         void StampFlowPacket(OutAssociation& flow, Peer& peer, PacketSlot& packet,
-                             uint32_t stagingSlot, uint16_t wireSize) noexcept
+                             uint32_t stagingSlot, uint16_t wireSize,
+                             bool flying) noexcept
         {
             const uint32_t seq = flow.nextSeq;
             InFlightEntry& entry = flow.InFlight()[seq & (flow.inflightCap - 1)];
             entry.seq          = seq;
-            entry.sentAtMicros = common::MonotonicMicros();
+            // A packet held behind a handshake is stamped but not on the wire,
+            // and zero reads as overdue against any timeout, so the first tick
+            // after the session opens carries it without a special path.
+            entry.sentAtMicros = flying ? common::MonotonicMicros() : 0;
             entry.packetSlot   = stagingSlot;   // INVALID for an unreliable flow
             entry.wireSize     = wireSize;
             entry.retries      = 0;
@@ -932,7 +936,8 @@ namespace bcp::flux
 
         @pre Caller holds the peer write lock; the peer is lent in. */
     SendAdmission FlowTable::AdmitOut(Peer& peer, uint32_t peerSlot, PacketSlot& packet,
-                                      uint32_t packetSlot, uint16_t wireSize) noexcept
+                                      uint32_t packetSlot, uint16_t wireSize,
+                                      bool flying) noexcept
     {
         // The peer is lent, already write-locked: no re-lookup. Take only the
         // flow lock (peer->flow), decide, and mutate.
@@ -965,7 +970,7 @@ namespace bcp::flux
                 StampFlowPacket(*assoc, peer, packet,
                                 unreliable ? common::collections::SlotPool::INVALID
                                            : packetSlot,
-                                wireSize);
+                                wireSize, flying);
                 result = SendAdmission::Sent;
             }
             else if (assoc->waitingCount < assoc->waitingCap)
@@ -1394,7 +1399,7 @@ namespace bcp::flux
                                 candidate.mode == FlowMode::UNRELIABLE
                                     ? common::collections::SlotPool::INVALID
                                     : candidate.packetSlot,
-                                wireSize);
+                                wireSize, true);
                 claimed = true;
             }
         }

@@ -540,21 +540,32 @@ namespace bcp::flux
                     status = common::Error::InvalidState;
                     return PacketSlotHandle::Invalid();
                 }
-                if (!peer->IsValid())
-                {
-                    // Handshake in flight: park behind it. The flag travels with
-                    // the packet so the flush restores the right pool.
-                    status = pending::Push(pendingPool_, peerHandle, *packet,
-                                           requireAuth, keepsBodyForResend);
-                    return PacketSlotHandle::Invalid();
-                }
-                if (requireAuth && !peer->authenticated)
+
+                // A handshake in flight decides where the packet waits, not
+                // whether it is accepted. A retained body is admitted to its
+                // flow either way, so the flow counts it as sent from here on
+                // and the congestion gate answers the caller now rather than
+                // the packet being refused later with nobody left to tell.
+                const bool sessionUp = peer->IsValid();
+
+                // Authentication is a property of an established session, so a
+                // packet waiting on a handshake carries the requirement and is
+                // judged once the peer has proved itself.
+                if (sessionUp && requireAuth && !peer->authenticated)
                 {
                     status = common::Error::NotAuthenticated;
                     return PacketSlotHandle::Invalid();
                 }
                 if (!packet->IsSecure())
+                {
+                    if (!sessionUp)
+                    {
+                        status = pending::Push(pendingPool_, peerHandle, *packet,
+                                               requireAuth, keepsBodyForResend);
+                        return PacketSlotHandle::Invalid();
+                    }
                     return pHandle;   // established, unsecured: flies plain
+                }
 
                 const uint16_t minSize = packet->IsTagged()
                     ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
@@ -573,7 +584,7 @@ namespace bcp::flux
                         status = common::Error::InvalidState;
                         return PacketSlotHandle::Invalid();
                     }
-                    if (keepsBodyForResend)
+                    if (keepsBodyForResend && sessionUp)
                     {
                         common::Result<PacketSlotWriter> out = kernel_->Write();
                         if (out.isErr())
@@ -595,7 +606,7 @@ namespace bcp::flux
                     // packet that never flies never burns a nonce counter.
                     const SendAdmission admission = flows_.AdmitOut(
                         *peer, peerHandle.GetSlotIndex(), *writable,
-                        pHandle.GetSlotIndex(), writable->dataSize);
+                        pHandle.GetSlotIndex(), writable->dataSize, sessionUp);
                     switch (admission)
                     {
                     case SendAdmission::Sent:
@@ -618,6 +629,20 @@ namespace bcp::flux
                         return PacketSlotHandle::Invalid();
                     }
                 }
+                // Waiting on the handshake. A retained body needs no pending
+                // copy: it is in staging with an in-flight entry that owns it,
+                // and the retransmit pass carries it once the session opens.
+                // Everything else has nowhere else to live, so it parks.
+                if (!sessionUp)
+                {
+                    if (keepsBodyForResend)
+                        (void)pHandle.Detach();
+                    else
+                        status = pending::Push(pendingPool_, peerHandle, *packet,
+                                               requireAuth, keepsBodyForResend);
+                    return PacketSlotHandle::Invalid();
+                }
+
                 materials = GatherSendMaterials(*peer);
                 established = true;
             }
@@ -671,17 +696,16 @@ namespace bcp::flux
             status = initiated;
             return PacketSlotHandle::Invalid();
         }
+        // The peer exists now, mid-handshake, which is a case handled above.
+        // Running it again rather than repeating that handling here is what
+        // keeps one admission path: the retry cannot loop, because Connect
+        // either produced the peer or returned an error.
+        if (peers_.GetPeer(address).Failed())
         {
-            PeerHandle peerHandle = peers_.GetPeer(address);
-            if (peerHandle.Failed())
-            {
-                status = common::Error::PeerNotFound;
-                return PacketSlotHandle::Invalid();
-            }
-            status = pending::Push(pendingPool_, peerHandle, *packet,
-                                   requireAuth, keepsBodyForResend);
+            status = common::Error::PeerNotFound;
+            return PacketSlotHandle::Invalid();
         }
-        return PacketSlotHandle::Invalid();
+        return PreProcessOut(std::move(pHandle), status, requireAuth);
     }
 
     void Socket::SealStagingToWire(const Address& to, const PacketSlot& staging,
@@ -1347,7 +1371,9 @@ namespace bcp::flux
 
         writer.WriteAddress(addr);
 
-        sender_.Send(std::move(writer).ExtractHandle());
+        // Handshake traffic bypasses the flow gate, so the only failure here
+        // is a dry pool. A lost one is recovered by the handshake retry.
+        (void)sender_.Send(std::move(writer).ExtractHandle());
     }
 
     void Socket::Handshake_Challenge(const Address& from)
@@ -1361,7 +1387,9 @@ namespace bcp::flux
         writer.WriteAddress(from);
         writer.PutU64(challengeGenerator_.Generate(from.addr));
 
-        sender_.Send(std::move(writer).ExtractHandle());
+        // Handshake traffic bypasses the flow gate, so the only failure here
+        // is a dry pool. A lost one is recovered by the handshake retry.
+        (void)sender_.Send(std::move(writer).ExtractHandle());
     }
 
     void Socket::Handshake_Respond(const Address& from, PacketSlotReader& reader)
@@ -1398,7 +1426,9 @@ namespace bcp::flux
         writer.PutU16(internal::VERSION);
         writer.PutU32(initiatorCaps);
 
-        sender_.Send(std::move(writer).ExtractHandle());
+        // Handshake traffic bypasses the flow gate, so the only failure here
+        // is a dry pool. A lost one is recovered by the handshake retry.
+        (void)sender_.Send(std::move(writer).ExtractHandle());
     }
 
     void Socket::Handshake_Validate(const Address& from, PacketSlotReader& reader)
@@ -1540,7 +1570,9 @@ namespace bcp::flux
         writer.PutU32(responderCaps);
         writer.PutBytes(confirm.data(), confirm.size());
 
-        sender_.Send(std::move(writer).ExtractHandle());
+        // Handshake traffic bypasses the flow gate, so the only failure here
+        // is a dry pool. A lost one is recovered by the handshake retry.
+        (void)sender_.Send(std::move(writer).ExtractHandle());
 
         // Only a simultaneous handshake has anything parked on this side.
         FlushPending(from);
@@ -1720,10 +1752,14 @@ namespace bcp::flux
                     PacketSlotWriter writer = result.Take();
                     writer.WriteAddress(pending->address);
                     writer.PutBytes(pending->data, pending->dataSize);
-                    sender_.Send(std::move(writer).ExtractHandle(), pending->requireAuth != 0);
+                    // Nothing parked here is owed delivery. A reliable flow
+                    // packet was admitted when it was accepted and waits in
+                    // staging with an in-flight entry, so it never reaches this
+                    // list, and a refusal is the caller's to see at that point
+                    // rather than something to discover here.
+                    (void)sender_.Send(std::move(writer).ExtractHandle(),
+                                       pending->requireAuth != 0);
                 }
-                // Pool dry: the packet drops, which is all an unreliable send
-                // promises; a reliable flow's retransmit covers the rest.
                 pendingPool_.Release(batch[i]);
             }
 
@@ -2187,7 +2223,13 @@ namespace bcp::flux
             // gather, the close finish, and the materials all juggle this one
             // peer lock, and it drops with the scope, before any send.
             PeerHandle peerHandle = std::move(peer);
-            if (peerHandle.Failed() || !peerHandle.Read()) return;
+            if (peerHandle.Failed()) return;
+            const Peer* readPeer = peerHandle.Read();
+            // A packet admitted while the handshake was still running sits in
+            // an association with no session to seal it. Retransmits wait for
+            // the session rather than burning attempts on a key that does not
+            // exist yet.
+            if (!readPeer || !readPeer->IsValid()) return;
             flowSlot = flows_.OutAssocAt(peerHandle.GetSlotIndex(), dirIndex);
             if (flowSlot == common::collections::SlotPool::INVALID) return;
 
