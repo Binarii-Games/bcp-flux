@@ -1609,7 +1609,15 @@ namespace bcp::flux
             PeerHandle peerHandle = peers_.GetPeer(from);
             if (peerHandle.Failed()) return;
             const Peer* peer = peerHandle.Read();
-            if (peer->state != HandshakeState::AWAITING_FINISH) return;
+            // Either waiting state accepts a FINISH, because the confirmation
+            // MAC below is what authenticates it and the state only sequences.
+            // A retry resets a peer to AWAITING_CHALLENGE to unwedge one stuck
+            // on a lost FINISH, and on a path slower than the retry interval
+            // that reset lands while a good FINISH is still in flight. A stale
+            // one is refused regardless: answering a new challenge regenerates
+            // the salt, which changes the transcript, which fails the MAC.
+            if (peer->state != HandshakeState::AWAITING_FINISH
+             && peer->state != HandshakeState::AWAITING_CHALLENGE) return;
             slot = peerHandle.GetSlotIndex();
             std::memcpy(saltI, peer->hsSalt, sizeof(saltI));   // our contribution
         }
