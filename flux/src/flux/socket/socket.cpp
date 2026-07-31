@@ -3,6 +3,7 @@
 #include <common/log.h>
 #include <common/crypto/crypto.h>
 #include <flux/socket/platform/win_socket.h>
+#include <flux/socket/platform/faulty_socket.h>
 #include <flux/socket/platform/posix_socket.h>
 #include <flux/internal/constants.h>
 #include <flux/wire/packet_builder.h>
@@ -326,6 +327,9 @@ namespace bcp::flux
 #ifdef _WIN32
             kernel_ = std::make_unique<platform::WinSocket>();
 #endif
+            break;
+        case BackendType::FAULTY:
+            kernel_ = std::make_unique<platform::FaultySocket>();
             break;
         case BackendType::RIO_WIN:
         case BackendType::URING_UNX:

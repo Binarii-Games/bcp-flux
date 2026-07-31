@@ -112,6 +112,11 @@ namespace bcp::flux
             STD_UNX,
             RIO_WIN,
             URING_UNX,
+            /** The platform socket with deliberate faults on top: loss, delay,
+                reordering, duplication, corruption. For tests, because loopback
+                never loses anything. Reach it through
+                platform::FaultySocket to set rates or script exact failures. */
+            FAULTY,
         };
 
         /** Every count is a memory budget, and memory budgets belong to the
