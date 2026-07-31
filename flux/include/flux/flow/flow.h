@@ -27,10 +27,46 @@ namespace bcp::flux
         than the newest delivered is dropped as stale. */
     enum class FlowMode : uint8_t
     {
-        RELIABLE_ORDERED   = 0,
-        RELIABLE_UNORDERED = 1,
-        UNRELIABLE         = 2,
+        RELIABLE_ORDERED      = 0,
+        RELIABLE_UNORDERED    = 1,
+        UNRELIABLE            = 2,
+        /** Ordered and reliable like the first, with four times the window.
+            For traffic that fills a pipe rather than tracking a clock: the
+            depth is throughput on a long path, and the cost is a longer stall
+            behind one lost packet, which realtime traffic will not pay. It
+            draws its associations from a pool of its own so that cost lands on
+            the flows that asked for it. */
+        RELIABLE_ORDERED_BULK = 3,
     };
+
+    static constexpr uint8_t FLOW_MODE_COUNT = 4;
+
+    [[nodiscard]] inline bool IsOrdered(FlowMode mode) noexcept
+    {
+        return mode == FlowMode::RELIABLE_ORDERED
+            || mode == FlowMode::RELIABLE_ORDERED_BULK;
+    }
+
+    /** Whether a mode keeps sent bodies for retransmission. */
+    [[nodiscard]] inline bool IsReliable(FlowMode mode) noexcept
+    {
+        return mode != FlowMode::UNRELIABLE;
+    }
+
+    /** In-flight window, in packets, for a mode. Both ends derive it from the
+        three mode bits on the wire, so a sender's ring and a receiver's seen
+        bitmap agree by construction with nothing negotiated. A declared window
+        was tried and removed for exactly that reason: nothing forced the two
+        to match.
+
+        Unreliable is no smaller than the reliable modes. It is never resent,
+        but it is still acknowledged for congestion control, and at a high send
+        rate a shallow window would stall waiting for that feedback. */
+    [[nodiscard]] inline uint16_t WindowFor(FlowMode mode) noexcept
+    {
+        return mode == FlowMode::RELIABLE_ORDERED_BULK
+             ? internal::FLOW_WINDOW_BULK : internal::FLOW_WINDOW;
+    }
 
     /** Lifecycle, used at both scopes with different meanings. A flow is OPEN
         until the application closes it, and CLOSING only for the span of that
@@ -92,7 +128,7 @@ namespace bcp::flux
         message apart by design. */
     [[nodiscard]] inline bool FlowPartAllowed(FlowMode mode, FlowPart part) noexcept
     {
-        return part == FlowPart::Whole || mode == FlowMode::RELIABLE_ORDERED;
+        return part == FlowPart::Whole || IsOrdered(mode);
     }
 
     /** The flow data byte carried after the sequence in every flow packet:
@@ -111,7 +147,7 @@ namespace bcp::flux
     [[nodiscard]] inline bool EncodeFlowData(FlowMode mode, uint8_t epoch,
                                              FlowPart part, uint8_t& outData) noexcept
     {
-        if (static_cast<uint8_t>(mode) > 2)
+        if (static_cast<uint8_t>(mode) >= FLOW_MODE_COUNT)
             return false;
         if (epoch > FLOW_EPOCH_MASK)
             return false;
@@ -152,7 +188,7 @@ namespace bcp::flux
                                              uint8_t& outEpoch, FlowPart& outPart) noexcept
     {
         const uint8_t modeBits = data & 0x07u;
-        if (modeBits > 2)
+        if (modeBits >= FLOW_MODE_COUNT)
             return false;
 
         const FlowMode mode = static_cast<FlowMode>(modeBits);

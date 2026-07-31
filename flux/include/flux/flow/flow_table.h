@@ -33,6 +33,100 @@ namespace bcp::flux
         Not thread-safe as an object. Safety comes from the pools, which carry a
         lock per slot, and from the caller holding the peer lock where a
         signature says so. */
+    /** Two association pools behind one index space, so the send window can
+        differ by mode without every association paying for the largest.
+
+        Indices below the first pool's capacity belong to it and the rest are
+        offset into the second, which keeps a slot index a plain uint32_t
+        everywhere it is stored: the peer directories, the flow's association
+        list, and the drain's peeked candidate. Every call but Acquire is the
+        SlotPool call it forwards to, so the rest of the table never learns
+        there are two.
+
+        SlotPool::INVALID is UINT32_MAX and lands past both, so it is refused
+        rather than resolving to the second pool. */
+    class SplitAssocPool
+    {
+    public:
+        [[nodiscard]] bool Init(uint32_t standardCount, uint32_t standardStride,
+                                uint32_t bulkCount, uint32_t bulkStride) noexcept
+        {
+            standardCount_ = standardCount;
+            bulkCount_     = bulkCount;
+            if (standardCount > 0 && !standard_.Init(standardCount, standardStride))
+                return false;
+            if (bulkCount > 0 && !bulk_.Init(bulkCount, bulkStride))
+                return false;
+            return true;
+        }
+
+        [[nodiscard]] uint32_t Acquire(bool wantsBulk) noexcept
+        {
+            if (wantsBulk)
+            {
+                if (bulkCount_ == 0) return common::collections::SlotPool::INVALID;
+                const uint32_t raw = bulk_.Acquire();
+                return raw == common::collections::SlotPool::INVALID
+                     ? raw : raw + standardCount_;
+            }
+            if (standardCount_ == 0) return common::collections::SlotPool::INVALID;
+            return standard_.Acquire();
+        }
+
+        void Release(uint32_t slot) noexcept
+        {
+            if (!Holds(slot)) return;
+            IsBulk(slot) ? bulk_.Release(slot - standardCount_) : standard_.Release(slot);
+        }
+
+        [[nodiscard]] const uint8_t* ReadLock(uint32_t slot) noexcept
+        {
+            if (!Holds(slot)) return nullptr;
+            return IsBulk(slot) ? bulk_.ReadLock(slot - standardCount_)
+                                : standard_.ReadLock(slot);
+        }
+        [[nodiscard]] uint8_t* WriteLock(uint32_t slot) noexcept
+        {
+            if (!Holds(slot)) return nullptr;
+            return IsBulk(slot) ? bulk_.WriteLock(slot - standardCount_)
+                                : standard_.WriteLock(slot);
+        }
+        void UnlockRead(uint32_t slot) noexcept
+        {
+            if (!Holds(slot)) return;
+            IsBulk(slot) ? bulk_.UnlockRead(slot - standardCount_)
+                         : standard_.UnlockRead(slot);
+        }
+        void UnlockWrite(uint32_t slot) noexcept
+        {
+            if (!Holds(slot)) return;
+            IsBulk(slot) ? bulk_.UnlockWrite(slot - standardCount_)
+                         : standard_.UnlockWrite(slot);
+        }
+
+        [[nodiscard]] uint32_t GetCapacity() const noexcept
+        {
+            return standardCount_ + bulkCount_;
+        }
+        /** The window an association in this slot was built with, which the
+            caller needs before it can read the slot's rings. */
+        [[nodiscard]] bool IsBulk(uint32_t slot) const noexcept
+        {
+            return slot >= standardCount_;
+        }
+
+    private:
+        [[nodiscard]] bool Holds(uint32_t slot) const noexcept
+        {
+            return slot < standardCount_ + bulkCount_;
+        }
+
+        common::collections::SlotPool standard_;
+        common::collections::SlotPool bulk_;
+        uint32_t standardCount_ = 0;
+        uint32_t bulkCount_     = 0;
+    };
+
     class FlowTable
     {
     public:
@@ -47,6 +141,7 @@ namespace bcp::flux
         {
             uint32_t flowCount      = 0;
             uint32_t outCount       = 0;
+            uint32_t bulkOutCount   = 0;
             uint32_t inCount        = 0;
             uint32_t maxOutPerPeer  = 0;
             uint32_t maxInPerPeer   = 0;
@@ -257,7 +352,7 @@ namespace bcp::flux
 
     private:
         common::collections::SlotPool  flowPool_;
-        common::collections::SlotPool  outAssocPool_;
+        SplitAssocPool                 outAssocPool_;
         common::collections::SlotPool  inAssocPool_;
         common::collections::SlotPool  stagingPool_;
         std::unique_ptr<FlowDirEntry[]> outAssocDir_;
@@ -289,6 +384,7 @@ namespace bcp::flux
         uint32_t ackDelayMicros_       = 0;
         uint32_t retryIntervalMicros_  = 0;
         uint8_t  maxAttempts_          = 0;
+        bool     bulkEnabled_          = false;   ///< a bulk pool was provisioned
 
         // Directory helpers over the FlowDirEntry[] segment: three scan idioms.
         [[nodiscard]] FlowDirEntry* OutDirFor(uint32_t peerSlot) noexcept;

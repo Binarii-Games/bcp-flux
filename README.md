@@ -123,16 +123,22 @@ flux::FlowHandle flow = socket.OpenFlow(7, flux::FlowMode::RELIABLE_ORDERED);
 socket.BuildPacket().WithFlow(flow).PutU32(value).Send(addr);
 ```
 
-Three modes:
+Four modes:
 
-| Mode | Retransmitted | Delivered |
-|---|---|---|
-| `RELIABLE_ORDERED` | yes | in sequence, gaps held back until filled |
-| `RELIABLE_UNORDERED` | yes | on arrival |
-| `UNRELIABLE` | no | newest only, stale packets dropped |
+| Mode | Retransmitted | Delivered | In flight |
+|---|---|---|---|
+| `RELIABLE_ORDERED` | yes | in sequence, gaps held back until filled | 256 |
+| `RELIABLE_UNORDERED` | yes | on arrival | 256 |
+| `UNRELIABLE` | no | newest only, stale packets dropped | 256 |
+| `RELIABLE_ORDERED_BULK` | yes | in sequence | 1024 |
 
-All three number and acknowledge every packet, so loss feeds congestion
+All four number and acknowledge every packet, so loss feeds congestion
 control even when nothing is resent.
+
+Bulk is the same contract as `RELIABLE_ORDERED` with four times the window, for
+traffic that fills a pipe rather than tracking a clock. It costs more memory per
+target and stalls longer behind a lost packet, so it draws from a pool you size
+yourself with `flows.bulkOutCount`, which is zero by default.
 
 ### One flow, many peers
 

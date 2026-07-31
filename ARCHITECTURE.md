@@ -123,13 +123,14 @@ Identity comes in three forms, and they are not interchangeable:
 
 #### Flow and association
 
-A flow is a unidirectional numbered channel, in one of three modes:
+A flow is a unidirectional numbered channel, in one of four modes:
 
-| Mode | Retransmit | Delivery |
-|---|---|---|
-| `RELIABLE_ORDERED` | yes | in sequence |
-| `RELIABLE_UNORDERED` | yes | on arrival |
-| `UNRELIABLE` | no | newest only |
+| Mode | Retransmit | Delivery | Window |
+|---|---|---|---|
+| `RELIABLE_ORDERED` | yes | in sequence | 256 |
+| `RELIABLE_UNORDERED` | yes | on arrival | 256 |
+| `UNRELIABLE` | no | newest only | 256 |
+| `RELIABLE_ORDERED_BULK` | yes | in sequence | 1024 |
 
 Every flow packet is numbered and acknowledged whatever the mode, so loss is
 observed and feeds congestion control even when nothing is resent. `UNRELIABLE`
@@ -493,11 +494,18 @@ what it holds rather than appending a fresh message to the remains of the old
 one. Without it the receiver would deliver bytes that were never sent, in an
 order that looks correct.
 
-The in-flight window is `internal::FLOW_WINDOW`, 256 packets: the sender's ring
-capacity and the receiver's seen-bitmap width, one number for every flow in both
-directions. It is a constant rather than configuration, because nothing carries
-it on the wire and nothing negotiates it, so two sockets that disagreed would
-have no way to find out. Fixing it makes them agree by construction.
+The in-flight window is the sender's ring capacity and the receiver's
+seen-bitmap width, and `WindowFor` derives it from the mode. It is not
+configuration, and nothing carries it on the wire: both ends read the same three
+mode bits and reach the same number, so they agree by construction. A declared
+window was tried and removed because nothing forced the two to match.
+
+Bulk is four times as deep because depth is throughput on a long path, and it
+costs a longer stall behind one lost packet, which realtime traffic will not
+pay. The deeper ring is inline in the association, 24 KB a slot against 6, so
+bulk associations come from a pool of their own and a socket that never opens
+one pays nothing. `Config::flows::bulkOutCount` sizes it, and at zero the mode
+is refused at `OpenFlow` rather than at the first send.
 
 That agreement is what the seen bitmap rests on. The send gate refuses when the
 ring slot for the next sequence is still occupied, so while a sequence is

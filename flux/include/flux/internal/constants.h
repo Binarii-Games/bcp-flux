@@ -57,43 +57,30 @@ namespace bcp::flux::internal
 
     // --- Flow ---
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
-    /** The in-flight window, in packets: the sender's ring capacity and the
-        receiver's seen-bitmap width, one number for every flow in both
-        directions. Fixed rather than configurable, because nothing carries it
-        on the wire and nothing negotiates it, so two sockets that disagreed
-        would have no way to find out. A constant makes them agree by
-        construction.
 
-        A power of two, since both the ring and the bitmap index by
-        seq & (window - 1). 256 is a whole number of 64-bit bitmap words, and
-        bounds a reliable association's ring at 6 KB. */
+    /** Sender's ring capacity and receiver's seen-bitmap width, chosen per mode
+        by WindowFor. Nothing carries it on the wire, so deriving it from the
+        mode bits is what makes both ends agree. Powers of two: both index by
+        seq & (window - 1). */
     static constexpr uint16_t FLOW_WINDOW                   = 256;
+    static constexpr uint16_t FLOW_WINDOW_BULK              = 1024;
 
-    /** Ceiling for the waiting and reorder rings, which stay configurable. The
-        largest power of two that fits the uint16_t caps they are stored in. */
+    /** Ceiling for the configurable waiting and reorder rings: the largest
+        power of two fitting the uint16_t caps they are stored in. */
     static constexpr uint16_t FLOW_RING_MAX                 = 32768;
 
-    /** Handshake attempts before a peer is judged unreachable and dropped.
-        Paced by Config::timers::retryIntervalMicros, so 8 gives a peer about
-        1.6 seconds of silence before whatever parked behind the handshake
-        fails visibly, rather than waiting on an idle timeout that may be off. */
+    /** Paced by Config::timers::retryIntervalMicros, so 8 is about 1.6 seconds
+        before whatever parked behind the handshake fails visibly. */
     static constexpr uint8_t  HANDSHAKE_MAX_ATTEMPTS        = 8;
+    static constexpr uint32_t HANDSHAKE_RETRY_DEFAULT       = 200000;  ///< used when Config leaves it at zero
 
-    /** Used when Config leaves the retry interval at zero, which would
-        otherwise make every tick a retry. */
-    static constexpr uint32_t HANDSHAKE_RETRY_DEFAULT        = 200000;
-    /** Ack ranges one flow contributes to a single FLOW_ACK packet, emitted
-        newest-first from its seen bitmap. A cap on wire bytes, not on memory:
-        acks are cumulative, so ranges that miss one report ride the next. */
+    /** Per flow, per FLOW_ACK packet. Bounds wire bytes only: acks are
+        cumulative, so a range that misses one report rides the next. */
     static constexpr uint8_t  FLOW_ACK_RANGE_COUNT          = 16;
 
     // --- Congestion control ---
-    /** The in-flight budget is per peer, measured in BYTES, spent only by flow
-        packets (the non-flow tier is untracked). It starts at
-        CC_INITIAL_WINDOW_BYTES (ten full packets' worth), grows on
-        acknowledgement, and trims to CC_LOSS_RETAIN_PERCENT of itself on loss,
-        never below the Config floor (default CC_MIN_BUDGET_DEFAULT). Every value
-        here is bytes; none is on the wire. */
+    // Per peer, in bytes, spent only by flow packets. Grows on acknowledgement,
+    // trims to CC_LOSS_RETAIN_PERCENT on loss, never below the Config floor.
     static constexpr uint32_t CC_INITIAL_WINDOW_BYTES       = 10u * MAX_WIRE_PACKET_SIZE;
     static constexpr uint8_t  CC_LOSS_RETAIN_PERCENT        = 85;
     static constexpr uint32_t CC_MIN_BUDGET_DEFAULT         = 2u * MAX_WIRE_PACKET_SIZE;

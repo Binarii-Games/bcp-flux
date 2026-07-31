@@ -338,10 +338,17 @@ namespace bcp::flux
             const uint16_t waitStrideCap = outReliableWaitCap_ > outUnreliableWaitCap_
                 ? outReliableWaitCap_ : outUnreliableWaitCap_;
 
+            // Two strides, because the in-flight ring is inline and the bulk
+            // window is four times as deep. One pool would make every
+            // association pay the deeper ring whether it asked for it or not.
             const uint32_t stride = static_cast<uint32_t>(
                 OutAssociation::StrideFor(outInflightCap_, waitStrideCap));
-            if (!outAssocPool_.Init(params.outCount, stride))
+            const uint32_t bulkStride = static_cast<uint32_t>(
+                OutAssociation::StrideFor(internal::FLOW_WINDOW_BULK, waitStrideCap));
+            if (!outAssocPool_.Init(params.outCount, stride,
+                                    params.bulkOutCount, bulkStride))
                 return common::Error::NotInitialized;
+            bulkEnabled_ = params.bulkOutCount > 0;
             if (!initDir(outAssocDir_, params.maxOutPerPeer))
                 return common::Error::NotInitialized;
             maxOutAssocPerPeer_ = params.maxOutPerPeer;
@@ -388,8 +395,13 @@ namespace bcp::flux
             inReorderCap_ = static_cast<uint16_t>(
                 params.reorderCount > 0 ? RoundUpPow2(params.reorderCount, 1, internal::FLOW_RING_MAX) : 0);
 
+            // Every inbound slot is cut for the widest window a sender can
+            // choose, because the remote picks the mode and this side has to
+            // hold whichever it picks. Unlike the sending half that costs
+            // almost nothing: the seen bitmap is bits, so the widest is 128
+            // bytes against 32, and one pool stays simpler than two.
             const uint32_t stride = static_cast<uint32_t>(
-                InAssociation::StrideFor(inWindowBits_, inReorderCap_));
+                InAssociation::StrideFor(internal::FLOW_WINDOW_BULK, inReorderCap_));
             if (!inAssocPool_.Init(params.inCount, stride))
                 return common::Error::NotInitialized;
             if (!initDir(inAssocDir_, params.maxInPerPeer))
@@ -574,9 +586,14 @@ namespace bcp::flux
     {
         if (flowId == internal::INVALID_FLOW_ID)
             return FlowHandle{common::Error::InvalidParam};
-        if (mode != FlowMode::RELIABLE_ORDERED &&
-            mode != FlowMode::RELIABLE_UNORDERED &&
-            mode != FlowMode::UNRELIABLE)
+        if (static_cast<uint8_t>(mode) >= FLOW_MODE_COUNT)
+            return FlowHandle{common::Error::InvalidParam};
+
+        // Refused here rather than at the first send. A bulk flow draws from a
+        // pool the embedder has to ask for, and a socket that did not ask has
+        // no way to serve one, so saying so at the open is the only place the
+        // caller can act on it.
+        if (mode == FlowMode::RELIABLE_ORDERED_BULK && !bulkEnabled_)
             return FlowHandle{common::Error::InvalidParam};
 
         // The id is how a remote names the flow, so two sharing one would be
@@ -941,7 +958,8 @@ namespace bcp::flux
                 return common::collections::SlotPool::INVALID;
         }
 
-        const uint32_t assocSlot = outAssocPool_.Acquire();
+        const uint32_t assocSlot = outAssocPool_.Acquire(
+            mode == FlowMode::RELIABLE_ORDERED_BULK);
         if (assocSlot == common::collections::SlotPool::INVALID)
             return common::collections::SlotPool::INVALID;
 
@@ -952,7 +970,7 @@ namespace bcp::flux
             OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
                 outAssocPool_.WriteLock(assocSlot));
             ResetOutAssoc(assoc, peerSlot, peer.addr, &peer.id, flowId, mode, flowEpoch,
-                          outInflightCap_,
+                          WindowFor(mode),
                           mode == FlowMode::UNRELIABLE ? outUnreliableWaitCap_
                                                        : outReliableWaitCap_);
             assoc->flowSlot   = common::collections::SlotPool::INVALID;
@@ -1078,7 +1096,7 @@ namespace bcp::flux
                 // release.
                 DrainInHoldback(assoc);
                 ResetInAssoc(assoc, peerSlot, from, &peerId, flowId, mode,
-                             flowEpoch, inWindowBits_, inReorderCap_);
+                             flowEpoch, WindowFor(mode), inReorderCap_);
             }
             inAssocPool_.UnlockWrite(existing);
 
@@ -1098,7 +1116,7 @@ namespace bcp::flux
             InAssociation* flow = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(flowSlot));
             ResetInAssoc(flow, peerSlot, from, &peerId, flowId, mode,
-                         flowEpoch, inWindowBits_, inReorderCap_);
+                         flowEpoch, WindowFor(mode), inReorderCap_);
             inAssocPool_.UnlockWrite(flowSlot);
         }
         if (InsertFlowSlot(dir, maxInAssocPerPeer_, flowId, flowSlot)
@@ -1493,7 +1511,7 @@ namespace bcp::flux
         uint32_t produced = 0;
         if (flow->life == FlowLifecycle::OPEN && flow->flowId == flowId)
         {
-            produced = flow->mode == FlowMode::RELIABLE_ORDERED
+            produced = IsOrdered(flow->mode)
                 ? DeliverOrdered(*flow, incoming, seq)
                 : DeliverUnordered(*flow, incoming, seq);
         }

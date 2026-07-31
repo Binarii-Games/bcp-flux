@@ -199,9 +199,12 @@ static void FlowIdsAreSocketWide()
     // The reserved sentinel is never a usable id.
     CHECK(client.OpenFlow(0xFFFF, flux::FlowMode::UNRELIABLE).Failed());
 
-    // A mode outside the three that exist is refused at open, so no flow can
-    // stamp one onto every packet it sends.
-    CHECK(client.OpenFlow(6, static_cast<flux::FlowMode>(3)).Failed());
+    // A mode that does not exist is refused at open, so no flow can stamp one
+    // onto every packet it sends. RELIABLE_ORDERED_BULK does exist but draws
+    // from a pool this socket never asked for, and that is refused at the open
+    // too rather than at the first send.
+    CHECK(client.OpenFlow(6, flux::FlowMode::RELIABLE_ORDERED_BULK).Failed());
+    CHECK(client.OpenFlow(6, static_cast<flux::FlowMode>(4)).Failed());
     CHECK(client.OpenFlow(6, static_cast<flux::FlowMode>(0xFF)).Failed());
 
     // A real mode on a free id opens.

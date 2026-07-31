@@ -265,6 +265,7 @@ namespace bcp::flux
         FlowTable::Params params;
         params.flowCount           = f.flowCount;
         params.outCount            = f.outCount;
+    params.bulkOutCount        = f.bulkOutCount;
         params.inCount             = f.inCount;
         params.maxOutPerPeer       = f.maxOutPerPeer;
         params.maxInPerPeer        = f.maxInPerPeer;

@@ -172,6 +172,12 @@ namespace bcp::flux
                     state it spawns is sized by outCount below. */
                 uint32_t flowCount         = 64;
                 uint32_t outCount          = 0;    ///< sending associations, socket-wide
+                /** Sending associations for RELIABLE_ORDERED_BULK, which draw
+                    from a pool of their own because their in-flight ring is
+                    four times as deep (24 KB a slot against 6). Zero refuses
+                    the mode, so a socket that never sends bulk pays nothing
+                    for it. */
+                uint32_t bulkOutCount      = 0;
                 uint32_t inCount           = 0;    ///< receiving associations, socket-wide
                 uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
                 uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: what one remote may create
