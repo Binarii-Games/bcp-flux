@@ -191,6 +191,8 @@ namespace bcp::flux
 
         if (common::Error error = InitPeerTableAndReplay(config); error != common::Error::Ok)
             return error;
+        handshakeRetryMicros_ = config.timers.retryIntervalMicros;
+
         if (common::Error error = InitFlows(config); error != common::Error::Ok)
             return error;
         if (common::Error error = InitLiveness(config); error != common::Error::Ok)
@@ -2083,6 +2085,12 @@ namespace bcp::flux
         if (!initialized_.load(std::memory_order_acquire))
             return 0;
 
+        // A zero interval would make every tick a retry, so an unset timer
+        // falls back to the protocol default rather than flooding.
+        const uint32_t interval = handshakeRetryMicros_ != 0
+            ? handshakeRetryMicros_ : internal::HANDSHAKE_RETRY_DEFAULT;
+        const uint32_t retryStamps = interval >> internal::SEEN_STAMP_SHIFT;
+
         uint32_t retried = 0;
         uint32_t cursor  = 0;
         for (;;)
@@ -2094,19 +2102,50 @@ namespace bcp::flux
 
             for (uint32_t i = 0; i < count; ++i)
             {
+                bool unreachable = false;
                 {
                     PeerHandle peerHandle = peers_.GetPeer(batch[i]);
                     if (peerHandle.Failed()) continue;   // gone since the snapshot
                     Peer* peer = peerHandle.Write();
                     if (peer->IsValid()) continue;
 
-                    // Back to square one: HS_CHLG is only answered from
-                    // AWAITING_CHALLENGE, so a peer stuck waiting for a lost
-                    // FINISH restarts cleanly instead of wedging.
-                    peer->state = HandshakeState::AWAITING_CHALLENGE;
-                    if (peer->attempts < UINT8_MAX)
+                    if (peer->attempts >= internal::HANDSHAKE_MAX_ATTEMPTS)
+                    {
+                        unreachable = true;
+                    }
+                    else
+                    {
+                        // Attempt N is due one interval after attempt N-1,
+                        // measured from registration, so a tick running far
+                        // faster than the path's round trip does not flood.
+                        // Read fresh and floored at zero: a peer registered
+                        // during this same pass is younger than any stamp taken
+                        // before it, and an unsigned wrap there would fire a
+                        // retry immediately and restart a healthy handshake.
+                        const uint32_t stampNow = SeenStamp(common::MonotonicMicros());
+                        const uint32_t elapsed  = stampNow > peer->firstSeenAt
+                            ? stampNow - peer->firstSeenAt : 0;
+                        if (elapsed < static_cast<uint32_t>(peer->attempts + 1) * retryStamps)
+                            continue;
+
+                        // Back to square one: HS_CHLG is only answered from
+                        // AWAITING_CHALLENGE, so a peer stuck waiting for a lost
+                        // FINISH restarts cleanly instead of wedging.
+                        peer->state = HandshakeState::AWAITING_CHALLENGE;
                         ++peer->attempts;
+                    }
                 }
+
+                // Out of attempts: the peer never answered. Dropping it releases
+                // what parked behind the handshake and fails its associations,
+                // so the application sees the outcome instead of waiting on an
+                // idle timeout that may be off.
+                if (unreachable)
+                {
+                    (void)RemovePeer(batch[i]);
+                    continue;
+                }
+
                 SendHandshakeInit(batch[i]);
                 ++retried;
             }
@@ -2119,6 +2158,13 @@ namespace bcp::flux
     void Socket::Update(uint64_t nowOverride)
     {
         if (!initialized_.load(std::memory_order_acquire)) return;
+
+        // Before anything else: a handshake nobody finishes strands whatever
+        // parked behind it, and the packet carrying it is the one thing here
+        // that no retransmit covers, because a peer with no session has no
+        // flow state to scan. Paced and bounded internally.
+        (void)RetryHandshakes();
+
         if (!flows_.SendEnabled() && !flows_.ReceiveEnabled() && evictAfterStamp_ == 0) return;
 
         uint32_t evicted = 0;

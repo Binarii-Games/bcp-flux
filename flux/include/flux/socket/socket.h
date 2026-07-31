@@ -207,7 +207,9 @@ namespace bcp::flux
             struct Timers
             {
                 uint32_t ackDelayMicros      = 5000;     ///< forced FLOW_ACK cadence
-                uint32_t retryIntervalMicros = 200000;   ///< open/close + retransmit fallback
+                /** Paces handshake retries and is the retransmit fallback
+                    before a peer has a round-trip sample. */
+                uint32_t retryIntervalMicros = 200000;
                 uint8_t  maxAttempts         = 8;        ///< give-up bound on open/close
             } timers;
 
@@ -332,9 +334,16 @@ namespace bcp::flux
             Returns peers rotated. */
         uint32_t RotateTags();
 
-        /** Re-sends HS_INIT for every peer whose handshake has not completed;
-            returns how many. Give-up policy stays with the caller (read
-            attempts, RemovePeer). Runs on the calling thread. */
+        /** Re-sends HS_INIT for every peer whose handshake has not completed,
+            and drops the ones that have stopped answering. Update calls this,
+            so an application driving only Poll and Update recovers a lost
+            handshake without knowing this exists.
+
+            Paced from each peer's registration by
+            Config::timers::retryIntervalMicros, and bounded by
+            internal::HANDSHAKE_MAX_ATTEMPTS, past which the peer is removed and
+            whatever parked behind it fails visibly. Returns how many were
+            retried. Runs on the calling thread. */
         uint32_t RetryHandshakes();
 
         /** Drops the peer: releases pending, closes and frees every flow, then
@@ -379,6 +388,10 @@ namespace bcp::flux
 
         // Fixed-at-Init scalars.
         uint32_t                       minCongestionBudget_ = internal::CC_MIN_BUDGET_DEFAULT;
+        /** Paces handshake retries. Kept here rather than read from the flow
+            table because a handshake happens whether or not flows are
+            configured, and the table is empty when they are not. */
+        uint32_t                       handshakeRetryMicros_ = 0;
         uint32_t                       evictAfterStamp_ = 0;   ///< idleTimeout + grain, SeenStamp units; 0 = off
         uint32_t                       seenGrainStamp_  = 0;
         bool                           acceptUnsecureFromUnknown_ = false;

@@ -78,6 +78,16 @@ namespace bcp::flux::internal
     /** Ceiling for the waiting and reorder rings, which stay configurable. The
         largest power of two that fits the uint16_t caps they are stored in. */
     static constexpr uint16_t FLOW_RING_MAX                 = 32768;
+
+    /** Handshake attempts before a peer is judged unreachable and dropped.
+        Paced by Config::timers::retryIntervalMicros, so 8 gives a peer about
+        1.6 seconds of silence before whatever parked behind the handshake
+        fails visibly, rather than waiting on an idle timeout that may be off. */
+    static constexpr uint8_t  HANDSHAKE_MAX_ATTEMPTS        = 8;
+
+    /** Used when Config leaves the retry interval at zero, which would
+        otherwise make every tick a retry. */
+    static constexpr uint32_t HANDSHAKE_RETRY_DEFAULT        = 200000;
     /** Ack ranges one flow contributes to a single FLOW_ACK packet, emitted
         newest-first from its seen bitmap. A cap on wire bytes, not on memory:
         acks are cumulative, so ranges that miss one report ride the next. */
