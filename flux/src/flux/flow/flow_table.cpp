@@ -32,7 +32,7 @@ namespace bcp::flux
             @pre Caller holds the slot write lock. */
         void ResetOutAssoc(OutAssociation* assoc, uint32_t peerSlot, const Address& peerAddr,
                            const BcpId* peerId, uint16_t flowId, FlowMode mode,
-                           uint16_t inflightCap, uint16_t waitingCap) noexcept
+                           uint8_t flowEpoch, uint16_t inflightCap, uint16_t waitingCap) noexcept
         {
             assoc->peerSlot   = peerSlot;
             assoc->peerAddr   = peerAddr;
@@ -41,6 +41,7 @@ namespace bcp::flux
             assoc->nextInFlow = common::collections::SlotPool::INVALID;
             assoc->flowId     = flowId;
             assoc->mode       = mode;
+            assoc->flowEpoch  = flowEpoch;
             assoc->epoch      = assoc->epoch + 1;
             assoc->life       = FlowLifecycle::OPEN;
 
@@ -65,15 +66,16 @@ namespace bcp::flux
             from a local flow: the sender declares it on every packet. */
         void ResetInAssoc(InAssociation* assoc, uint32_t peerSlot, const Address& peerAddr,
                           const BcpId* peerId, uint16_t flowId, FlowMode mode,
-                          uint16_t windowBits, uint16_t reorderCap) noexcept
+                          uint8_t flowEpoch, uint16_t windowBits, uint16_t reorderCap) noexcept
         {
-            assoc->peerSlot = peerSlot;
-            assoc->peerAddr = peerAddr;
-            assoc->peerId   = peerId ? *peerId : BcpId{};
-            assoc->flowId   = flowId;
-            assoc->mode     = mode;
-            assoc->life     = FlowLifecycle::OPEN;
-            assoc->epoch    = assoc->epoch + 1;
+            assoc->peerSlot   = peerSlot;
+            assoc->peerAddr   = peerAddr;
+            assoc->peerId     = peerId ? *peerId : BcpId{};
+            assoc->flowId     = flowId;
+            assoc->mode       = mode;
+            assoc->flowEpoch  = flowEpoch;
+            assoc->life       = FlowLifecycle::OPEN;
+            assoc->epoch      = assoc->epoch + 1;
 
             assoc->recvNext       = 1;
             assoc->recvHighest    = 0;
@@ -371,6 +373,10 @@ namespace bcp::flux
                 flow->life   = FlowLifecycle::CLOSED;
                 flowPool_.UnlockWrite(slot);
             }
+
+            lastEpochById_.reset(new (std::nothrow) uint8_t[EPOCH_MEMORY_SIZE]{});
+            if (!lastEpochById_)
+                return common::Error::NotInitialized;
         }
 
         if (params.inCount > 0)
@@ -573,10 +579,6 @@ namespace bcp::flux
             mode != FlowMode::UNRELIABLE)
             return FlowHandle{common::Error::InvalidParam};
 
-        uint8_t flowData = 0;
-        if (!EncodeFlowData(mode, flowData))
-            return FlowHandle{common::Error::InvalidParam};
-
         // The id is how a remote names the flow, so two sharing one would be
         // indistinguishable on the wire.
         if (FindFlowById(flowId) != common::collections::SlotPool::INVALID)
@@ -585,6 +587,20 @@ namespace bcp::flux
         const uint32_t flowSlot = flowPool_.Acquire();
         if (flowSlot == common::collections::SlotPool::INVALID)
             return FlowHandle{common::Error::LimitReached};
+
+        const uint8_t flowEpoch = static_cast<uint8_t>(
+            (lastEpochById_[flowId] + 1u) & FLOW_EPOCH_MASK);
+
+        uint8_t flowData = 0;
+        if (!EncodeFlowData(mode, flowEpoch, flowData))
+        {
+            flowPool_.Release(flowSlot);
+            return FlowHandle{common::Error::InvalidParam};
+        }
+
+        // Kept only once nothing left can fail, so a refused open does not
+        // spend one of the eight positions the receiver walks.
+        lastEpochById_[flowId] = flowEpoch;
 
         uint32_t epoch = 0;
         {
@@ -812,9 +828,13 @@ namespace bcp::flux
     size_t FlowTable::BuildPeerAckBody(uint32_t peerSlot, uint8_t* out, size_t cap) noexcept
     {
         // One packet carries every association of this peer that owes acks.
-        // Each entry: [flowId(2)][rangeCount(1)][first,last]*count. Generated
-        // under each association's lock (nested inside the peer read lock, which
-        // holds the sweep out); owed counters reset here.
+        // Each entry: [flowId(2)][epoch(1)][rangeCount(1)][first,last]*count.
+        // The epoch is what stops an ack outliving the generation it describes:
+        // an id closed and reopened numbers from one again, and without it the
+        // sender would resolve the new generation's packets against sequences
+        // only the old one ever delivered. Generated under each association's
+        // lock (nested inside the peer read lock, which holds the sweep out);
+        // owed counters reset here.
         size_t bodyLen = 0;
 
         FlowDirEntry* dir = InDirFor(peerSlot);
@@ -830,12 +850,13 @@ namespace bcp::flux
                 AckRange ranges[internal::FLOW_ACK_RANGE_COUNT];
                 const uint8_t rc = BuildAckRanges(flow, ranges,
                                                   internal::FLOW_ACK_RANGE_COUNT);
-                const size_t need = 3 + static_cast<size_t>(rc) * 8;
+                const size_t need = 4 + static_cast<size_t>(rc) * 8;
                 if (rc > 0 && bodyLen + need <= cap)
                 {
                     const uint16_t flowId = flow->flowId;
                     out[bodyLen++] = static_cast<uint8_t>(flowId);
                     out[bodyLen++] = static_cast<uint8_t>(flowId >> 8);
+                    out[bodyLen++] = flow->flowEpoch;
                     out[bodyLen++] = rc;
                     for (uint8_t r = 0; r < rc; ++r)
                     {
@@ -861,15 +882,20 @@ namespace bcp::flux
         return bodyLen;
     }
 
-    void FlowTable::ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, const AckRange* ranges,
-                                   uint8_t count, uint64_t now, CongestionDelta& delta) noexcept
+    void FlowTable::ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
+                                   const AckRange* ranges, uint8_t count, uint64_t now,
+                                   CongestionDelta& delta) noexcept
     {
         const uint32_t flowSlot = FindOutAssoc(peerSlot, flowId);
         if (flowSlot == common::collections::SlotPool::INVALID) return;
 
+        // Matched exactly, not walked forward like the data path: an ack
+        // describes one generation and has none of its own to catch up to, so
+        // anything but this association's own epoch is an ack for a flow that
+        // no longer exists and must resolve nothing.
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(flowSlot));
-        if (flow->flowId == flowId)
+        if (flow->flowId == flowId && flow->flowEpoch == flowEpoch)
         {
             const uint32_t cap = flow->inflightCap;
             InFlightEntry* ring = flow->InFlight();
@@ -878,6 +904,18 @@ namespace bcp::flux
                     ResolveOutEntry(flow, ring[i], true, now, delta);
         }
         outAssocPool_.UnlockWrite(flowSlot);
+    }
+
+    bool FlowTable::OutAssocEpochIs(uint32_t assocSlot, uint8_t flowEpoch) noexcept
+    {
+        if (assocSlot >= outAssocPool_.GetCapacity()) return false;
+
+        const OutAssociation* assoc = reinterpret_cast<const OutAssociation*>(
+            outAssocPool_.ReadLock(assocSlot));
+        const bool matches = assoc->flowEpoch == flowEpoch;
+        outAssocPool_.UnlockRead(assocSlot);
+
+        return matches;
     }
 
     /** @pre Caller holds the peer write lock; the peer is lent in. */
@@ -889,10 +927,12 @@ namespace bcp::flux
             return common::collections::SlotPool::INVALID;   // no such flow open here
 
         FlowMode mode{};
+        uint8_t  flowEpoch = 0;
         {
             const Flow* flow = reinterpret_cast<const Flow*>(flowPool_.ReadLock(flowSlot));
             const bool open = flow->life == FlowLifecycle::OPEN;
-            mode = flow->mode;
+            mode      = flow->mode;
+            flowEpoch = FlowDataEpoch(flow->flowData);
             flowPool_.UnlockRead(flowSlot);
             if (!open)
                 return common::collections::SlotPool::INVALID;
@@ -908,10 +948,10 @@ namespace bcp::flux
         {
             OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
                 outAssocPool_.WriteLock(assocSlot));
-            ResetOutAssoc(assoc, peerSlot, peer.addr, &peer.id, flowId, mode,
-                         outInflightCap_,
-                         mode == FlowMode::UNRELIABLE ? outUnreliableWaitCap_
-                                                      : outReliableWaitCap_);
+            ResetOutAssoc(assoc, peerSlot, peer.addr, &peer.id, flowId, mode, flowEpoch,
+                          outInflightCap_,
+                          mode == FlowMode::UNRELIABLE ? outUnreliableWaitCap_
+                                                       : outReliableWaitCap_);
             assoc->flowSlot   = common::collections::SlotPool::INVALID;
             assoc->nextInFlow = common::collections::SlotPool::INVALID;
             outAssocPool_.UnlockWrite(assocSlot);
@@ -1010,14 +1050,34 @@ namespace bcp::flux
                                      const BcpId& peerId, uint16_t flowId,
                                      uint8_t flowData) noexcept
     {
-        FlowDirEntry* dir = InDirFor(peerSlot);
-        if (FindFlowSlot(dir, maxInAssocPerPeer_, flowId)
-            != common::collections::SlotPool::INVALID)
-            return FlowAdmit::Existing;
-
         FlowMode mode{};
-        if (!DecodeFlowData(flowData, mode))
+        uint8_t  flowEpoch = 0;
+        if (!DecodeFlowData(flowData, mode, flowEpoch))
             return FlowAdmit::Rejected;
+
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        const uint32_t existing = FindFlowSlot(dir, maxInAssocPerPeer_, flowId);
+        if (existing != common::collections::SlotPool::INVALID)
+        {
+            InAssociation* assoc = reinterpret_cast<InAssociation*>(
+                inAssocPool_.WriteLock(existing));
+            const FlowEpochOrder order = CompareFlowEpoch(assoc->flowEpoch, flowEpoch);
+            if (order == FlowEpochOrder::Newer)
+            {
+                // The sender closed this id and opened it again, so it numbers
+                // from one now and nothing held against the old generation can
+                // ever be completed. Drain first: the reset only stamps the
+                // hold-back entries free, and the slots they name are ours to
+                // release.
+                DrainInHoldback(assoc);
+                ResetInAssoc(assoc, peerSlot, from, &peerId, flowId, mode,
+                             flowEpoch, inWindowBits_, inReorderCap_);
+            }
+            inAssocPool_.UnlockWrite(existing);
+
+            return order == FlowEpochOrder::Stale ? FlowAdmit::Stale
+                                                  : FlowAdmit::Existing;
+        }
 
         // This is the one path where a REMOTE makes this socket allocate, so
         // it is caps-only: a dry pool or a full directory refuses, and the
@@ -1031,7 +1091,7 @@ namespace bcp::flux
             InAssociation* flow = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(flowSlot));
             ResetInAssoc(flow, peerSlot, from, &peerId, flowId, mode,
-                        inWindowBits_, inReorderCap_);
+                         flowEpoch, inWindowBits_, inReorderCap_);
             inAssocPool_.UnlockWrite(flowSlot);
         }
         if (InsertFlowSlot(dir, maxInAssocPerPeer_, flowId, flowSlot)
@@ -1053,7 +1113,7 @@ namespace bcp::flux
         // First packet of a flow registers it: the flow data byte carries
         // everything registration needs.
         const FlowAdmit admit = AdmitInFlow(peerSlot, from, peerId, flowId, flowData);
-        if (admit != FlowAdmit::Rejected)
+        if (admit == FlowAdmit::Registered || admit == FlowAdmit::Existing)
             outAssoc = FindFlowSlot(InDirFor(peerSlot), maxInAssocPerPeer_, flowId);
         return admit;
     }

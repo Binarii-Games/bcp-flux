@@ -127,6 +127,12 @@ namespace bcp::flux
         bool    authenticated; ///< announced tag matched a trusted certificate AND the
                                ///< peer proved it owns that certificate's key
 
+        /** Whether a packet from this peer has ever opened under the session
+            key. A responder establishes from HS_RES alone, and nothing in that
+            message is authenticated, so until this is set the identity bound
+            here is only what the message claimed. */
+        bool    confirmed;
+
         bool IsValid() const { return state == HandshakeState::ESTABLISHED; }
     };
 

@@ -952,6 +952,12 @@ namespace bcp::flux
             if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
                 return false;   // duplicate or too old, drop
 
+            // The peer has now opened something under the session key, which is
+            // the first proof that the identity bound to this slot is the one
+            // that holds the key. Handshake_Validate refuses to disturb a peer
+            // past this point.
+            peer->confirmed = true;
+
             const uint32_t nowStamp = SeenStamp(common::MonotonicMicros());
             if (static_cast<uint32_t>(nowStamp - peer->lastSeenAt) >= seenGrainStamp_)
                 peer->lastSeenAt = nowStamp;
@@ -1056,8 +1062,12 @@ namespace bcp::flux
 
         if (reject)
         {
-            const uint8_t payload[2] = { static_cast<uint8_t>(flowId),
-                                         static_cast<uint8_t>(flowId >> 8) };
+            // The generation is echoed from the packet being refused, so the
+            // sender can tell a refusal of this flow from one aimed at a
+            // generation of the same id it has already closed.
+            const uint8_t payload[3] = { static_cast<uint8_t>(flowId),
+                                         static_cast<uint8_t>(flowId >> 8),
+                                         FlowDataEpoch(flowData) };
             SendSecureControl(from, rejectMaterials, internal::SECURE_CHANNEL_FLOW_REJECT,
                               payload, sizeof(payload));
             common::crypto::Wipe(rejectMaterials.key.data(), rejectMaterials.key.size());
@@ -1457,6 +1467,7 @@ namespace bcp::flux
 
         bool established = false;
         bool needBind    = false;
+        bool unprovenId  = false;
         uint32_t slot    = 0;
         {
             PeerHandle existingHandle = peers_.GetPeer(from);
@@ -1473,8 +1484,25 @@ namespace bcp::flux
                 {
                     // Duplicate HS_RES, or the remote dropped this peer and is
                     // handshaking anew. The key must belong to the id we hold.
-                    if (!(peer->id == id)) return;
-                    established = true;
+                    if (!(peer->id == id))
+                    {
+                        // Unless nothing here was ever proven. A responder
+                        // establishes from HS_RES alone, and no part of that
+                        // message is authenticated: the initiator cannot sign
+                        // it, because it does not learn this side's key until
+                        // HS_FINISH. So one corrupted or forged HS_RES binds an
+                        // identity nobody holds, and refusing every later
+                        // handshake would strand the address for good. A peer
+                        // that has opened a packet under the session key is
+                        // kept, because there the refusal is what stops an
+                        // off-path rebind of a working session.
+                        if (peer->confirmed) return;
+                        unprovenId = true;
+                    }
+                    else
+                    {
+                        established = true;
+                    }
                 }
                 else
                 {
@@ -1490,6 +1518,17 @@ namespace bcp::flux
                     needBind = !peer->hasId;
                 }
             }
+        }
+
+        // Dropped rather than rebound in place, because the id index still
+        // holds the claimed one and BindId refuses a slot that already carries
+        // an id. Removing it frees both, and the initiator is already
+        // retrying, so its next HS_RES registers cleanly. Done outside the
+        // handle scope above: the table refuses a removal with a handle held.
+        if (unprovenId)
+        {
+            (void)RemovePeer(from);
+            return;
         }
 
         if (needBind && peers_.BindId(slot, id) != common::Error::Ok)
@@ -1542,11 +1581,13 @@ namespace bcp::flux
             DeriveSessionInto(candidate, pk, transcript, sizeof(transcript));
             if (!common::crypto::Equal(candidate.data(), peer->session.data(), candidate.size()))
             {
-                peer->session = candidate;
-                peer->sendCounter = 0;
-                peer->myTagStep    = 0;   // new key -> new tag sequence, both sides
-                peer->theirTagStep = 0;
-                peer->myTag        = DerivePeerTag(peer->session, LaneTo(pk), 0);
+                // A retried HS_RES can carry a fresh salt, which derives a
+                // different session. Installing it goes through the one path
+                // that installs a session: assigning the key here and listing
+                // what else to reset is how headerKey was left behind, masking
+                // every counter with the previous session's key and failing
+                // every open in both directions with both ends established.
+                CommitSession(*peer, pk, transcript, sizeof(transcript));
                 ReplayFor(peerHandle.GetSlotIndex()).Reset();   // key changed -> remote's counter restarts
                 tagSession  = peer->session;
                 bindWindow  = migration_;
@@ -1607,7 +1648,15 @@ namespace bcp::flux
             PeerHandle peerHandle = peers_.GetPeer(from);
             if (peerHandle.Failed()) return;
             const Peer* peer = peerHandle.Read();
-            if (peer->state != HandshakeState::AWAITING_FINISH) return;
+            // Either waiting state accepts a FINISH, because the confirmation
+            // MAC below is what authenticates it and the state only sequences.
+            // A retry resets a peer to AWAITING_CHALLENGE to unwedge one stuck
+            // on a lost FINISH, and on a path slower than the retry interval
+            // that reset lands while a good FINISH is still in flight. A stale
+            // one is refused regardless: answering a new challenge regenerates
+            // the salt, which changes the transcript, which fails the MAC.
+            if (peer->state != HandshakeState::AWAITING_FINISH
+             && peer->state != HandshakeState::AWAITING_CHALLENGE) return;
             slot = peerHandle.GetSlotIndex();
             std::memcpy(saltI, peer->hsSalt, sizeof(saltI));   // our contribution
         }
@@ -1845,9 +1894,10 @@ namespace bcp::flux
         // The remote refused to register one of OUR flows: it is at its caps,
         // and retrying the same flow would only ask again. Fail it so the app
         // sees the outcome through its handle, and drain what it was holding.
-        if (!flows_.SendEnabled() || len < 2) return;
+        if (!flows_.SendEnabled() || len < 3) return;
         const uint16_t flowId = static_cast<uint16_t>(payload[0])
                               | static_cast<uint16_t>(payload[1]) << 8;
+        const uint8_t flowEpoch = payload[2] & FLOW_EPOCH_MASK;
 
         PeerHandle peerHandle = peers_.GetPeer(from);
         if (peerHandle.Failed()) return;
@@ -1857,13 +1907,20 @@ namespace bcp::flux
         const uint32_t flowSlot = flows_.FindOutAssoc(peerHandle.GetSlotIndex(), flowId);
         if (flowSlot == common::collections::SlotPool::INVALID) return;
 
+        // A refusal outlives the flow it refused when the id is reopened
+        // quickly, and failing the new association on it would take down a flow
+        // the remote has never objected to.
+        if (!flows_.OutAssocEpochIs(flowSlot, flowEpoch)) return;
+
         flows_.FailAssoc(flowSlot, flowId, peer);
     }
 
     void Socket::Flow_Ack(const Address& from, const uint8_t* payload, size_t len)
     {
         // Answers OUR sent packets: OUT side. Body is a run of
-        // [flowId(2)][rangeCount(1)][first(4),last(4)]*count for one peer.
+        // [flowId(2)][epoch(1)][rangeCount(1)][first(4),last(4)]*count for one
+        // peer. The epoch names which generation of that id the ranges belong
+        // to, and an entry naming any other one resolves nothing.
         if (!flows_.SendEnabled()) return;
         const uint64_t now = common::MonotonicMicros();
 
@@ -1879,12 +1936,13 @@ namespace bcp::flux
         const uint32_t peerSlot = peerHandle.GetSlotIndex();
 
         size_t off = 0;
-        while (off + 3 <= len)
+        while (off + 4 <= len)
         {
             const uint16_t flowId = static_cast<uint16_t>(payload[off])
                                   | static_cast<uint16_t>(payload[off + 1]) << 8;
-            uint8_t rangeCount = payload[off + 2];
-            off += 3;
+            const uint8_t flowEpoch = payload[off + 2] & FLOW_EPOCH_MASK;
+            uint8_t rangeCount = payload[off + 3];
+            off += 4;
             if (rangeCount > internal::FLOW_ACK_RANGE_COUNT) break;   // malformed: apply what we have
 
             AckRange ranges[internal::FLOW_ACK_RANGE_COUNT];
@@ -1904,7 +1962,7 @@ namespace bcp::flux
             }
             if (truncated) break;
 
-            flows_.ApplyAckRanges(peerSlot, flowId, ranges, rangeCount, now, ccDelta);
+            flows_.ApplyAckRanges(peerSlot, flowId, flowEpoch, ranges, rangeCount, now, ccDelta);
         }
 
         // Apply the gathered feedback once, on the same handle upgraded to

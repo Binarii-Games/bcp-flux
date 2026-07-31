@@ -28,7 +28,7 @@ namespace bcp::flux
         uint32_t slot_{UINT32_MAX};
         uint32_t epoch_{0};
         uint16_t flowId_{internal::INVALID_FLOW_ID};
-        uint8_t  flowData_{0};   ///< the wire byte: the mode, fixed at open
+        uint8_t  flowData_{0};   ///< the wire byte: mode and epoch, fixed at open
         common::Error failReason_{common::Error::InvalidState};
 
     public:
