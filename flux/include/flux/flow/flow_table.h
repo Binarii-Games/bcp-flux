@@ -159,9 +159,20 @@ namespace bcp::flux
         /** Resolves the acked sequences and accumulates the congestion effect,
             which the caller applies to the peer after upgrading to write. Only
             association state is mutated here, so the read lock is enough.
+
+            An ack naming any epoch but the association's own resolves nothing:
+            it describes a generation of this flow id that has already been
+            closed, and its sequence numbers mean something else now.
             @pre caller holds the peer read lock. */
-        void ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, const AckRange* ranges,
-                            uint8_t count, uint64_t now, CongestionDelta& delta) noexcept;
+        void ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
+                            const AckRange* ranges, uint8_t count, uint64_t now,
+                            CongestionDelta& delta) noexcept;
+
+        /** Whether this association belongs to the named generation. The reject
+            handler asks before it fails anything, so a refusal aimed at a flow
+            id's previous generation cannot take down its current one.
+            @pre caller holds the peer read lock. */
+        [[nodiscard]] bool OutAssocEpochIs(uint32_t assocSlot, uint8_t flowEpoch) noexcept;
 
         /** The send gate: creates the association on first send, then admits,
             queues, drops or refuses. The flow is named by the packet's own flow

@@ -267,9 +267,12 @@ namespace bcp::flux
 
         // Copied from the flow at creation, immutable after. mode is read for
         // every packet by the send gate, the drain and the retransmit scan, so
-        // it lives here rather than behind a second lock on the flow.
+        // it lives here rather than behind a second lock on the flow. flowEpoch
+        // is the generation this association belongs to, which is what the ack
+        // and reject handlers check before they resolve or fail anything.
         uint16_t flowId;
         FlowMode mode;
+        uint8_t  flowEpoch;
 
         uint32_t epoch;         ///< revalidates the drain's peek against its claim
         FlowLifecycle life;     ///< per target: FAILED here leaves the flow open

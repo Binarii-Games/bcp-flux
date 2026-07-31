@@ -501,8 +501,16 @@ through its handle before recycling.
 
 Mode is copied onto each association at creation, because the send gate, the
 drain, and the retransmit scan read it per packet, and reaching back to the flow
-would mean a second lock on the packet path. The flow lock is taken once per
-send, at the builder, and is never held under a peer or association lock.
+would mean a second lock on the packet path. The epoch is copied the same way
+and for a different reason. Both control ops name a flow by its id, so an ack
+or a refusal that arrives after the id has been closed and reopened would land
+on the new association and speak for sequences that now mean something else. An
+ack carries the epoch of the association that wrote it and resolves nothing
+unless it matches, and a refusal echoes the epoch of the packet it refused and
+fails nothing unless it matches. The match is exact rather than the forward walk
+the data path uses, because a control op describes one generation and has none
+of its own to catch up to. The flow lock is taken once per send, at the builder,
+and is never held under a peer or association lock.
 
 Two indexes reach an association, in opposite directions. The per-peer
 directories answer peer-to-association, which the packet path and peer removal
