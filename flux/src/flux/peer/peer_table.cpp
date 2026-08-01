@@ -429,6 +429,8 @@ namespace bcp::flux
         p->id          = id ? *id : BcpId{};
         p->theirPk     = {};
         p->session     = {};
+        p->headerKey   = {};
+        p->macKey      = {};
         p->sendCounter = 0;
         p->myTagStep    = 0;
         p->theirTagStep = 0;

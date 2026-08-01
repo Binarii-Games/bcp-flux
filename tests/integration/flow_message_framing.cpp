@@ -110,7 +110,7 @@ namespace
                 if (!packet) continue;
                 const size_t offset = packet->ContentOffset();
                 into.Take(packet->Part(), packet->Content(offset),
-                          packet->dataSize - offset);
+                          packet->ContentLength());
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }

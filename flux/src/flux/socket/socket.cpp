@@ -411,6 +411,7 @@ namespace bcp::flux
         PeerSendMaterials materials;
         materials.key       = peer.session;
         materials.headerKey = peer.headerKey;
+        materials.macKey    = peer.macKey;
         materials.counter   = ++peer.sendCounter;
         materials.lane      = LaneTo(peer.theirPk);
         materials.tag       = peer.myTag;
@@ -429,13 +430,13 @@ namespace bcp::flux
         const uint8_t* tagBytes = nullptr;
         if (tagged)
         {
-            uint8_t* tagField = dst.data + internal::MIN_SECURE_WIRE_SIZE;
+            uint8_t* tagField = dst.data + internal::WIRE_SECURE_HEAD_SIZE;
             std::memcpy(tagField, materials.tag.data(), materials.tag.size());
             tagBytes = materials.tag.data();
         }
         const size_t aadLen = BuildSecureAad(aad, dst.data[0], tagBytes);
 
-        uint8_t* nonceField = dst.data + internal::WIRE_CONTROLLER_SIZE + internal::WIRE_TAG_SIZE;
+        uint8_t* nonceField = dst.data + internal::WIRE_CONTROLLER_SIZE;
         StampNonceCounter(nonceField, materials.counter);
 
         common::crypto::Nonce nonce;
@@ -444,12 +445,92 @@ namespace bcp::flux
         common::crypto::Tag aeadTag;
         common::crypto::Encrypt(dst.data + headerSize, aeadTag, materials.key, nonce,
                                 plaintext, bodyLen, aad, aadLen);
-        std::memcpy(dst.data + internal::WIRE_CONTROLLER_SIZE, aeadTag.data(), aeadTag.size());
+
+        // After the ciphertext, not before it. The caller sized dataSize to
+        // header plus body, so the tag extends the packet rather than sitting
+        // in space someone reserved for it.
+        std::memcpy(dst.data + headerSize + bodyLen, aeadTag.data(), aeadTag.size());
+        dst.dataSize = static_cast<uint16_t>(headerSize + bodyLen + internal::WIRE_TAG_SIZE);
 
         // Last, because the mask comes from the tag the seal just produced. The
         // nonce was built from the real counter above; only the wire copy is
         // masked, so the AEAD is unaffected.
         MaskNonceCounter(nonceField, materials.headerKey, aeadTag.data());
+    }
+
+    void Socket::SealMacOnlyPacket(PacketSlot& dst, size_t headerSize, size_t bodyLen,
+                                   const PeerSendMaterials& materials, bool tagged) noexcept
+    {
+        if (tagged)
+        {
+            uint8_t* tagField = dst.data + internal::WIRE_SECURE_HEAD_SIZE;
+            std::memcpy(tagField, materials.tag.data(), materials.tag.size());
+        }
+
+        uint8_t* nonceField = dst.data + internal::WIRE_CONTROLLER_SIZE;
+        StampNonceCounter(nonceField, materials.counter);
+
+        // One pass over everything that is about to travel, the controller byte
+        // included. Nothing is encrypted, so there is no ciphertext to separate
+        // from associated data, and no scratch to assemble.
+        const size_t covered = headerSize + bodyLen;
+        common::crypto::Mac mac;
+        common::crypto::ComputeMac(mac, materials.macKey, dst.data, covered);
+        std::memcpy(dst.data + covered, mac.data(), mac.size());
+        dst.dataSize = static_cast<uint16_t>(covered + internal::WIRE_TAG_SIZE);
+
+        // Last, so the MAC covered the real counter. The receiver reads the MAC
+        // off the end before it has verified anything, unmasks with it, and only
+        // then checks: a tampered counter or a tampered MAC both end in a
+        // mismatch.
+        MaskNonceCounter(nonceField, materials.headerKey, mac.data());
+    }
+
+    bool Socket::OpenMacOnlyPacket(PacketSlot& packet,
+                                   const common::crypto::SessionKey& macKey,
+                                   const common::crypto::SessionKey& headerKey,
+                                   uint64_t& outCounter) noexcept
+    {
+        const bool tagged = packet.IsTagged();
+        const size_t headerSize = tagged
+            ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+            : internal::WIRE_SECURE_HEAD_SIZE;
+        if (packet.dataSize < headerSize + internal::WIRE_TAG_SIZE)
+            return false;
+
+        const size_t covered = packet.dataSize - internal::WIRE_TAG_SIZE;
+        common::crypto::Mac carried;
+        std::memcpy(carried.data(), packet.data + covered, carried.size());
+
+        // Unmask into a local, never back into the header: a wrong key here is
+        // routine on the migration path, and a header mutated by a failed
+        // attempt would poison the next one.
+        uint8_t nonceField[internal::WIRE_NONCE_SIZE];
+        std::memcpy(nonceField, packet.data + internal::WIRE_CONTROLLER_SIZE,
+                    sizeof(nonceField));
+        MaskNonceCounter(nonceField, headerKey, carried.data());
+        const uint64_t counter = ReadNonceCounter(nonceField);
+
+        // Recompute over the range as the sender built it, which means with the
+        // counter unmasked. Restore it for the span of the check and put the
+        // wire bytes back afterwards, so a failed attempt leaves the packet
+        // exactly as it arrived.
+        uint8_t masked[internal::WIRE_NONCE_SIZE];
+        std::memcpy(masked, packet.data + internal::WIRE_CONTROLLER_SIZE, sizeof(masked));
+        std::memcpy(packet.data + internal::WIRE_CONTROLLER_SIZE, nonceField, sizeof(nonceField));
+
+        common::crypto::Mac expected;
+        common::crypto::ComputeMac(expected, macKey, packet.data, covered);
+        const bool ok = common::crypto::Equal(expected.data(), carried.data(), expected.size());
+
+        if (!ok)
+        {
+            std::memcpy(packet.data + internal::WIRE_CONTROLLER_SIZE, masked, sizeof(masked));
+            return false;
+        }
+
+        outCounter = counter;
+        return true;
     }
 
     bool Socket::OpenSecurePacket(PacketSlot& packet,
@@ -460,13 +541,14 @@ namespace bcp::flux
     {
         const bool tagged = packet.IsTagged();
         const size_t headerSize = tagged
-            ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-            : internal::MIN_SECURE_WIRE_SIZE;
-        if (packet.dataSize < headerSize)
+            ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+            : internal::WIRE_SECURE_HEAD_SIZE;
+        if (packet.dataSize < headerSize + internal::WIRE_TAG_SIZE)
             return false;
 
         common::crypto::Tag tag;
-        std::memcpy(tag.data(), packet.data + internal::WIRE_CONTROLLER_SIZE, tag.size());
+        std::memcpy(tag.data(), packet.data + packet.dataSize - internal::WIRE_TAG_SIZE,
+                    tag.size());
 
         // Unmask into a local, never back into the header: a wrong key here is
         // routine (the migration path tries every candidate against the same
@@ -474,7 +556,7 @@ namespace bcp::flux
         // next one.
         uint8_t nonceField[internal::WIRE_NONCE_SIZE];
         std::memcpy(nonceField,
-                    packet.data + internal::WIRE_CONTROLLER_SIZE + internal::WIRE_TAG_SIZE,
+                    packet.data + internal::WIRE_CONTROLLER_SIZE,
                     sizeof(nonceField));
         MaskNonceCounter(nonceField, headerKey, tag.data());
         const uint64_t counter = ReadNonceCounter(nonceField);
@@ -485,10 +567,10 @@ namespace bcp::flux
         uint8_t aad[internal::WIRE_CONTROLLER_SIZE + internal::WIRE_PEER_TAG_SIZE];
         const size_t aadLen = BuildSecureAad(
             aad, packet.data[0],
-            tagged ? packet.data + internal::MIN_SECURE_WIRE_SIZE : nullptr);
+            tagged ? packet.data + internal::WIRE_SECURE_HEAD_SIZE : nullptr);
 
         uint8_t* body = packet.data + headerSize;
-        const size_t bodyLen = packet.dataSize - headerSize;
+        const size_t bodyLen = packet.dataSize - headerSize - internal::WIRE_TAG_SIZE;
         if (!common::crypto::Decrypt(body, key, nonce, body, bodyLen, tag, aad, aadLen))
             return false;
 
@@ -607,8 +689,8 @@ namespace bcp::flux
                 }
 
                 const uint16_t minSize = packet->IsTagged()
-                    ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-                    : internal::MIN_SECURE_WIRE_SIZE;
+                    ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+                    : internal::WIRE_SECURE_HEAD_SIZE;
                 if (packet->dataSize < minSize)
                 {
                     status = common::Error::InvalidHeader;
@@ -701,27 +783,38 @@ namespace bcp::flux
 
             const bool tagged = writable->IsTagged();
             const size_t headerSize = tagged
-                ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-                : internal::MIN_SECURE_WIRE_SIZE;
+                ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+                : internal::WIRE_SECURE_HEAD_SIZE;
             const size_t bodyLen = writable->dataSize - headerSize;
 
             // A reliable body is its own retransmit source: the ciphertext goes
             // to the wire slot and the plaintext slot stays leased, held by the
             // ring until the seq resolves. Everything else seals in place.
+            const bool macOnly = writable->IsMacOnly();
+
             if (keepsBodyForResend)
             {
                 wirePacket->address  = writable->address;
                 wirePacket->dataSize = writable->dataSize;
-                std::memcpy(wirePacket->data, writable->data, headerSize);
-                SealSecurePacket(*wirePacket, writable->data + headerSize, headerSize,
-                                 bodyLen, materials, tagged);
+                // MAC-only covers the whole datagram, so the copy is the whole
+                // datagram rather than just the header the seal would rewrite.
+                std::memcpy(wirePacket->data, writable->data,
+                            macOnly ? writable->dataSize : headerSize);
+                if (macOnly)
+                    SealMacOnlyPacket(*wirePacket, headerSize, bodyLen, materials, tagged);
+                else
+                    SealSecurePacket(*wirePacket, writable->data + headerSize, headerSize,
+                                     bodyLen, materials, tagged);
                 common::crypto::Wipe(materials.key.data(), materials.key.size());
                 (void)pHandle.Detach();   // the ring owns the staging slot now
                 return wireHandle;
             }
 
-            SealSecurePacket(*writable, writable->data + headerSize, headerSize,
-                             bodyLen, materials, tagged);
+            if (macOnly)
+                SealMacOnlyPacket(*writable, headerSize, bodyLen, materials, tagged);
+            else
+                SealSecurePacket(*writable, writable->data + headerSize, headerSize,
+                                 bodyLen, materials, tagged);
             common::crypto::Wipe(materials.key.data(), materials.key.size());
             return pHandle;
         }
@@ -752,8 +845,8 @@ namespace bcp::flux
     {
         const bool tagged = staging.IsTagged();
         const size_t headerSize = tagged
-            ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-            : internal::MIN_SECURE_WIRE_SIZE;
+            ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+            : internal::WIRE_SECURE_HEAD_SIZE;
         if (staging.dataSize < headerSize
             || staging.dataSize > internal::MAX_WIRE_PACKET_SIZE)
             return;
@@ -769,10 +862,18 @@ namespace bcp::flux
         // slot keeps the bytes stable across the copy and seal.
         wire->address  = to;
         wire->dataSize = staging.dataSize;
-        std::memcpy(wire->data, staging.data, headerSize);
         const size_t bodyLen = staging.dataSize - headerSize;
-        SealSecurePacket(*wire, staging.data + headerSize, headerSize, bodyLen,
-                         materials, tagged);
+        if (staging.IsMacOnly())
+        {
+            std::memcpy(wire->data, staging.data, staging.dataSize);
+            SealMacOnlyPacket(*wire, headerSize, bodyLen, materials, tagged);
+        }
+        else
+        {
+            std::memcpy(wire->data, staging.data, headerSize);
+            SealSecurePacket(*wire, staging.data + headerSize, headerSize, bodyLen,
+                             materials, tagged);
+        }
 
         (void)kernel_->SendTo(wire->address.addr, wire->data, wire->dataSize);
     }
@@ -813,7 +914,7 @@ namespace bcp::flux
         PacketSlot* packet = handle.Write();
         if (!packet) return;
 
-        constexpr size_t headerSize = internal::MIN_SECURE_WIRE_SIZE
+        constexpr size_t headerSize = internal::WIRE_SECURE_HEAD_SIZE
                                     + internal::WIRE_PEER_TAG_SIZE;
         const size_t bodyLen = packet->dataSize - headerSize;
         SealSecurePacket(*packet, packet->data + headerSize, headerSize, bodyLen,
@@ -929,13 +1030,14 @@ namespace bcp::flux
 
         const bool tagged = packet->IsTagged();
         const size_t headerSize = tagged
-            ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-            : internal::MIN_SECURE_WIRE_SIZE;
+            ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+            : internal::WIRE_SECURE_HEAD_SIZE;
         if (packet->dataSize < headerSize)
             return false;
 
         common::crypto::SessionKey key;
         common::crypto::SessionKey headerKey;
+        common::crypto::SessionKey macKey;
         uint8_t senderLane = 0;
         {
             PeerHandle peerHandle = peers_.GetPeer(packet->address);
@@ -950,6 +1052,7 @@ namespace bcp::flux
             if (!peer || !peer->IsValid()) return false;
             key = peer->session;
             headerKey = peer->headerKey;
+            macKey = peer->macKey;
             senderLane = LaneFrom(peer->theirPk);
         }
 
@@ -958,17 +1061,22 @@ namespace bcp::flux
         {
             common::crypto::Wipe(key.data(), key.size());
             common::crypto::Wipe(headerKey.data(), headerKey.size());
+            common::crypto::Wipe(macKey.data(), macKey.size());
             return false;
         }
 
         // The counter is masked on the wire, so the open is what recovers it;
-        // it then feeds the replay check below.
+        // it then feeds the replay check below. A MAC-only packet is verified
+        // rather than decrypted, and everything past this point is identical
+        // because the two share a layout.
         uint64_t counter = 0;
-        const bool decrypted = OpenSecurePacket(*writablePacket, key, headerKey,
-                                                senderLane, counter);
+        const bool opened = writablePacket->IsMacOnly()
+            ? OpenMacOnlyPacket(*writablePacket, macKey, headerKey, counter)
+            : OpenSecurePacket(*writablePacket, key, headerKey, senderLane, counter);
         common::crypto::Wipe(key.data(), key.size());
         common::crypto::Wipe(headerKey.data(), headerKey.size());
-        if (!decrypted)
+        common::crypto::Wipe(macKey.data(), macKey.size());
+        if (!opened)
             return false;
 
         // Replay check, only now that the packet has proven genuine: a forgery
@@ -1149,7 +1257,7 @@ namespace bcp::flux
             PacketSlot* writablePacket = pHandle.Write();
             if (!writablePacket) return false;
 
-            constexpr size_t headerSize = internal::MIN_SECURE_WIRE_SIZE
+            constexpr size_t headerSize = internal::WIRE_SECURE_HEAD_SIZE
                                         + internal::WIRE_PEER_TAG_SIZE;
             if (writablePacket->dataSize < headerSize) return false;
 
@@ -1806,6 +1914,13 @@ namespace bcp::flux
         };
         common::crypto::DeriveSubKey(peer.headerKey.data(), peer.session.data(),
                                      HEADER_KEY_LABEL);
+
+        // Same mechanism, different label, so the two never share a domain.
+        static constexpr uint8_t MAC_KEY_LABEL[16] = {
+            'f','l','u','x','-','m','a','c','-','o','n','l','y',0,0,0
+        };
+        common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
+                                     MAC_KEY_LABEL);
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
@@ -2524,8 +2639,8 @@ namespace bcp::flux
             {
                 const bool tagged = packet->IsTagged();
                 const size_t headerSize = tagged
-                    ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-                    : internal::MIN_SECURE_WIRE_SIZE;
+                    ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+                    : internal::WIRE_SECURE_HEAD_SIZE;
                 const size_t bodyLen = packet->dataSize - headerSize;
                 packet->address = addr;
                 SealSecurePacket(*packet, packet->data + headerSize, headerSize,

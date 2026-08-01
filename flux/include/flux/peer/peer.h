@@ -56,6 +56,15 @@ namespace bcp::flux
             Derived with the session, discarded with it. */
         common::crypto::SessionKey headerKey;
 
+        /** Authenticates a MAC-only packet, which is not encrypted and so has
+            no AEAD tag to be covered by. Separate from `session` because the
+            obvious later optimisation is to swap BLAKE2b for the Poly1305 the
+            AEAD already computes, and a Poly1305 key must never be reused
+            across messages. Sharing the session key would make that change
+            silently forgeable rather than merely wrong. Derived with the
+            session, discarded with it. */
+        common::crypto::SessionKey macKey;
+
         /** Nonce counter for packets we encrypt to this peer. Travels in each
             packet, so the remote never tracks it.
 

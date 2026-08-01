@@ -53,6 +53,12 @@ namespace bcp::flux
         bool HasFlow() const;
         /** Secure packet carrying the 4-byte migration tag (CTRL_TAGGED). */
         bool IsTagged() const;
+        /** Authenticated but not encrypted. Framing is identical to an
+            encrypted packet, so every offset is the same and only the seal and
+            the open differ. IsSecure stays true for one of these: it asks
+            whether the packet carries the secure framing, not whether the
+            payload is ciphertext. */
+        bool IsMacOnly() const;
         uint16_t FlowId() const;
         /** The flow sequence number of a flow packet; 0 (the never-sent
             sentinel) when the packet carries no flow or is too short. */
@@ -74,6 +80,15 @@ namespace bcp::flux
             makes a run abandoned by a failed or reopened flow recoverable
             rather than silently spliced onto the next one. */
         FlowPart Part() const;
+
+        /** How many bytes of application payload this packet carries, and the
+            only correct way to ask.
+
+            Subtracting ContentOffset from dataSize is the obvious arithmetic
+            and it is wrong the moment anything sits after the payload, which
+            the authentication tag now does. Every reader goes through here so
+            the layout is known in one place rather than at every call site. */
+        size_t ContentLength() const;
         /** Where the flow header starts, past the cleartext header and the
             channel byte; dataSize when this packet has no flow header or is
             too short to hold one. The three flow accessors and ContentOffset

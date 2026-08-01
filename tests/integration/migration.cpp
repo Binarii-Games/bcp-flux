@@ -88,9 +88,7 @@ struct Relay
 // socket has delivered.
 static common::Error SendOp(flux::Socket& socket, const flux::Address& to, uint8_t op)
 {
-    auto stage = socket.BuildPacket().NoFlow();
-    stage.PutU8(op);
-    return stage.Send(to);
+    return socket.BuildPacket().NoFlow().PutU8(op).Send(to);
 }
 static int CollectOp(flux::Socket& socket, uint8_t op)
 {

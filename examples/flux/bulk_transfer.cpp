@@ -81,7 +81,7 @@ static void Receive(flux::Socket& socket)
 
             const size_t   offset  = packet->ContentOffset();
             const uint8_t* content = packet->Content(offset);
-            const size_t   length  = packet->dataSize - offset;
+            const size_t   length  = packet->ContentLength();
 
             for (size_t b = 0; b < length; ++b)
             {

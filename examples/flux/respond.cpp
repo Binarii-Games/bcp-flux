@@ -43,7 +43,7 @@ static void Tick(flux::Socket& socket)
             const size_t            offset = packet->ContentOffset();
 
             common::LogF(common::LogLevel::Info, "B got: %.*s",
-                         int(packet->dataSize - offset),
+                         int(packet->ContentLength()),
                          reinterpret_cast<const char*>(packet->Content(offset)));
 
             // The reply comes from the packet, not the socket. PrepareResponse
@@ -101,7 +101,7 @@ int main()
             const size_t            offset = packet->ContentOffset();
 
             common::LogF(common::LogLevel::Info, "A got: %.*s",
-                         int(packet->dataSize - offset),
+                         int(packet->ContentLength()),
                          reinterpret_cast<const char*>(packet->Content(offset)));
             got = true;
         }

@@ -55,6 +55,10 @@ namespace bcp::flux
         CTRL_HAS_FLOW = (1u << 1),
         CTRL_UNSECURE = (1u << 2),   ///< plaintext opt-out: no tag, no nonce, no integrity
         CTRL_TAGGED   = (1u << 3),   ///< secure header carries a migration peer tag
+        /** Authenticated but not encrypted. Same framing as an encrypted
+            packet, so the offsets are identical; only the transform differs.
+            The payload is readable by anyone and alterable by nobody. */
+        CTRL_MACONLY  = (1u << 4),
     };
 
     constexpr Controls operator|(Controls a, Controls b) noexcept
@@ -91,6 +95,7 @@ namespace bcp::flux
     {
         common::crypto::SessionKey key;
         common::crypto::SessionKey headerKey;   ///< masks the wire counter field
+        common::crypto::SessionKey macKey;      ///< authenticates a MAC-only packet
         uint64_t                   counter = 0;   ///< a fresh ++sendCounter per send
         uint8_t                    lane    = 0;
         PeerTag                    tag{};
@@ -553,6 +558,23 @@ namespace bcp::flux
                                const common::crypto::SecretKey& myEphSk,
                                const common::crypto::PublicKey& theirEphPk,
                                const uint8_t* transcript, size_t transcriptLen) noexcept;
+        /** Authenticates a packet without encrypting it. The whole datagram up
+            to the tag field is one contiguous range, so the controller byte is
+            covered by simply being in it, and there is no associated data to
+            assemble. The counter is masked last, with the MAC, because that is
+            the only per-packet value both ends can agree on before either has
+            verified anything. */
+        void SealMacOnlyPacket(PacketSlot& dst, size_t headerSize, size_t bodyLen,
+                               const PeerSendMaterials& materials, bool tagged) noexcept;
+
+        /** Verifies one. Unmasks the counter with the MAC read off the end,
+            recomputes over the range, and reports whether it matched. The
+            payload is never touched either way. */
+        [[nodiscard]] bool OpenMacOnlyPacket(PacketSlot& packet,
+                                             const common::crypto::SessionKey& macKey,
+                                             const common::crypto::SessionKey& headerKey,
+                                             uint64_t& outCounter) noexcept;
+
         /** The kernel_->Write + CTRL_INTERNAL|CTRL_UNSECURE + opcode preamble,
             one writer factory for the handshake senders. */
         [[nodiscard]] common::Result<PacketSlotWriter> BuildInternal(SocketOpCode op);

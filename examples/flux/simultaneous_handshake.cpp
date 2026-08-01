@@ -53,7 +53,7 @@ static void Tick(flux::Socket& socket, const char* name)
             const flux::PacketSlot* packet  = inbox[i].Read();
             const size_t            offset  = packet->ContentOffset();
             const uint8_t*          content = packet->Content(offset);
-            const size_t            length  = packet->dataSize - offset;
+            const size_t            length  = packet->ContentLength();
 
             common::LogF(common::LogLevel::Info, "%s got: %.*s",
                          name, int(length), reinterpret_cast<const char*>(content));

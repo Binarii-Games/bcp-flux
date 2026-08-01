@@ -24,7 +24,14 @@ namespace bcp::flux::internal
     static constexpr uint8_t  WIRE_PEER_TAG_SIZE            = 4;  ///< present when CTRL_TAGGED is set
     static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;
     static constexpr uint8_t  MIN_WIRE_SIZE                 = WIRE_CONTROLLER_SIZE;
-    static constexpr uint8_t  MIN_SECURE_WIRE_SIZE          = WIRE_CONTROLLER_SIZE + WIRE_TAG_SIZE + WIRE_NONCE_SIZE;
+    /** What a secure packet puts in front of the content: controller and the
+        masked counter, plus the peer tag when CTRL_TAGGED is set. The
+        authentication tag is not here. It goes after the payload, so that
+        everything a MAC has to cover is one unbroken run of bytes rather than
+        pieces on either side of it. */
+    static constexpr uint8_t  WIRE_SECURE_HEAD_SIZE        = WIRE_CONTROLLER_SIZE + WIRE_NONCE_SIZE;
+    /** Total a secure packet spends on framing, front and back. */
+    static constexpr uint8_t  MIN_SECURE_WIRE_SIZE          = WIRE_SECURE_HEAD_SIZE + WIRE_TAG_SIZE;
 
     /** First plaintext byte of a secure packet, so which kind it is shows only
         after decrypting. CTRL_HAS_FLOW stays cleartext, but packet size gives

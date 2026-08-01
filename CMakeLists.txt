@@ -218,8 +218,9 @@ register_tests("tests/integration/*.cpp" integration 240 flux tests)
 register_tests("tests/bench/*.cpp"       bench       600 flux tests)
 
 # The fault-injecting kernel sits beside the platform kernels in flux's private
-# tree, so the test that drives one needs the same view of them the library has.
+# tree, so a test that drives one needs the same view of them the library has.
 target_include_directories(flow_fault_recovery PRIVATE flux/src)
+target_include_directories(mac_only_packet PRIVATE flux/src)
 
 register_tests("external/common/tests/unit/*.cpp"  unit  240 common external/common/tests)
 register_tests("external/common/tests/bench/*.cpp" bench 600 common external/common/tests)

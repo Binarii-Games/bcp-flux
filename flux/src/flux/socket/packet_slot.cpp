@@ -36,6 +36,13 @@ namespace bcp::flux
         return (Controller()[0] & ToByte(Controls::CTRL_UNSECURE)) == 0;
     }
 
+    bool PacketSlot::IsMacOnly() const
+    {
+        if (!IsValid())
+            return false;
+        return IsSecure() && (Controller()[0] & ToByte(Controls::CTRL_MACONLY)) != 0;
+    }
+
     bool PacketSlot::HasFlow() const
     {
         if (!IsValid())
@@ -57,7 +64,7 @@ namespace bcp::flux
 
         size_t offset = internal::WIRE_CONTROLLER_SIZE;
         if (IsSecure())
-            offset += internal::WIRE_TAG_SIZE + internal::WIRE_NONCE_SIZE;
+            offset += internal::WIRE_NONCE_SIZE;
         if (IsTagged())
             offset += internal::WIRE_PEER_TAG_SIZE;
         if (IsSecure())
@@ -108,7 +115,7 @@ namespace bcp::flux
         if (!IsTagged())
             return nullptr;
         constexpr size_t offset = internal::WIRE_CONTROLLER_SIZE
-                                + internal::WIRE_TAG_SIZE + internal::WIRE_NONCE_SIZE;
+                                + internal::WIRE_NONCE_SIZE;
         if (offset + internal::WIRE_PEER_TAG_SIZE > dataSize)
             return nullptr;
         return data + offset;
@@ -119,7 +126,7 @@ namespace bcp::flux
         if (!IsSecure())
             return internal::SECURE_CHANNEL_APP;
         size_t offset = internal::WIRE_CONTROLLER_SIZE
-                      + internal::WIRE_TAG_SIZE + internal::WIRE_NONCE_SIZE;
+                      + internal::WIRE_NONCE_SIZE;
         if (IsTagged())
             offset += internal::WIRE_PEER_TAG_SIZE;
         if (offset + internal::WIRE_SECURE_CHANNEL_SIZE > dataSize)
@@ -131,7 +138,7 @@ namespace bcp::flux
     {
         size_t contentOffset = internal::WIRE_CONTROLLER_SIZE;
         if (IsSecure())
-            contentOffset += internal::WIRE_TAG_SIZE + internal::WIRE_NONCE_SIZE;
+            contentOffset += internal::WIRE_NONCE_SIZE;
         if (IsTagged())
             contentOffset += internal::WIRE_PEER_TAG_SIZE;
         if (IsSecure())
@@ -139,6 +146,15 @@ namespace bcp::flux
         if (HasFlow())
             contentOffset += internal::WIRE_FLOW_HEADER_SIZE;
         return contentOffset;
+    }
+
+    size_t PacketSlot::ContentLength() const
+    {
+        // The authentication tag sits after the payload on a secure packet, so
+        // the content stops short of the end.
+        const size_t trailer = IsSecure() ? internal::WIRE_TAG_SIZE : 0;
+        const size_t used    = ContentOffset() + trailer;
+        return used <= dataSize ? dataSize - used : 0;
     }
 
     const uint8_t* PacketSlot::Content(size_t offset) const
@@ -364,10 +380,13 @@ namespace bcp::flux
 
     bool PacketSlotWriter::ReserveSecureHeader(bool tagged)
     {
-        size_t reserved = internal::WIRE_TAG_SIZE + internal::WIRE_NONCE_SIZE;
+        size_t reserved = internal::WIRE_NONCE_SIZE;
         if (tagged)
             reserved += internal::WIRE_PEER_TAG_SIZE;
-        if (cursor_.r < reserved) return false;
+        // The tag is appended by the seal, past whatever the caller writes, so
+        // its room is taken out of the budget here without moving the cursor.
+        if (cursor_.r < reserved + internal::WIRE_TAG_SIZE) return false;
+        cursor_.r -= internal::WIRE_TAG_SIZE;
         std::memset(cursor_.p, 0, reserved);
         cursor_.p += reserved;
         cursor_.r -= reserved;

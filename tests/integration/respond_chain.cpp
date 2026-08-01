@@ -103,7 +103,7 @@ int main()
                 continue;
 
             const size_t offset = packet->ContentOffset();
-            const size_t length = packet->dataSize - offset;
+            const size_t length = packet->ContentLength();
 
             if (length == sizeof(PONG) - 1 &&
                 std::memcmp(packet->Content(offset), PONG, length) == 0)

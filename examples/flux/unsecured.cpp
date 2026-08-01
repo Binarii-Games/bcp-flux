@@ -91,7 +91,7 @@ int main()
 
             const size_t   offset = packet->ContentOffset();
             const uint8_t* body   = packet->Content(offset);
-            const size_t   length = packet->dataSize - offset;
+            const size_t   length = packet->ContentLength();
 
             const bool intact = length == sizeof(payload)
                              && std::memcmp(body, payload, length) == 0;

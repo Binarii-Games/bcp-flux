@@ -106,7 +106,7 @@ int main()
 
             const size_t   offset = packet->ContentOffset();
             const uint8_t* body   = packet->Content(offset);
-            const size_t   length = packet->dataSize - offset;
+            const size_t   length = packet->ContentLength();
             const flux::FlowPart part = packet->Part();
 
             // Three lines cover all four cases. Clearing on an opening packet
