@@ -121,11 +121,22 @@ namespace bcp::flux
             const uint32_t bits = flow->windowBits;
             if (seq > flow->recvHighest)
             {
-                const uint32_t oldFloor = flow->recvHighest >= bits
-                    ? flow->recvHighest - bits + 1 : 1;
-                const uint32_t newFloor = seq >= bits ? seq - bits + 1 : 1;
-                for (uint32_t s = oldFloor; s < newFloor; ++s)
-                    SeenClear(flow->Seen(), s, bits);
+                if (seq - flow->recvHighest >= bits)
+                {
+                    // The window slid clear past everything it held, so every
+                    // slot is stale. Clearing them one at a time would run for
+                    // the whole jump, which a wire sequence makes unbounded.
+                    // Wipe the window instead.
+                    std::memset(flow->Seen(), 0, bits / 8);
+                }
+                else
+                {
+                    const uint32_t oldFloor = flow->recvHighest >= bits
+                        ? flow->recvHighest - bits + 1 : 1;
+                    const uint32_t newFloor = seq >= bits ? seq - bits + 1 : 1;
+                    for (uint32_t s = oldFloor; s < newFloor; ++s)
+                        SeenClear(flow->Seen(), s, bits);
+                }
                 flow->recvHighest = seq;
             }
             SeenSet(flow->Seen(), seq, bits);
