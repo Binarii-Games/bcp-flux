@@ -184,13 +184,9 @@ namespace bcp::flux
                     for it. */
                 uint32_t bulkOutCount      = 0;
                 uint32_t inCount           = 0;    ///< receiving associations, socket-wide
+                uint32_t bulkInCount       = 0;    ///< of which bulk-capable; sized for the deep window
                 uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
                 uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: what one remote may create
-
-                /** How far ahead of a gap ordered delivery buffers; past it a
-                    packet is dropped and a resend fills it later. Power of two,
-                    or 0. */
-                uint32_t reorderCount      = 64;
                 /** Retained reliable bodies, held send-until-ack for retransmit.
                     Socket-wide ceiling on unacked reliable traffic; running dry
                     is backpressure. Sized apart from send slots so a busy flow

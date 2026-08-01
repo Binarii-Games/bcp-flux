@@ -143,10 +143,10 @@ namespace bcp::flux
             uint32_t outCount       = 0;
             uint32_t bulkOutCount   = 0;
             uint32_t inCount        = 0;
+            uint32_t bulkInCount    = 0;
             uint32_t maxOutPerPeer  = 0;
             uint32_t maxInPerPeer   = 0;
             uint32_t maxPeers       = 0;
-            uint32_t reorderCount   = 0;
             uint32_t stagingCount   = 0;
             uint32_t reliableWait   = 0;
             uint32_t unreliableWait = 0;
@@ -353,7 +353,7 @@ namespace bcp::flux
     private:
         common::collections::SlotPool  flowPool_;
         SplitAssocPool                 outAssocPool_;
-        common::collections::SlotPool  inAssocPool_;
+        SplitAssocPool                 inAssocPool_;
         common::collections::SlotPool  stagingPool_;
         std::unique_ptr<FlowDirEntry[]> outAssocDir_;
         std::unique_ptr<FlowDirEntry[]> inAssocDir_;
@@ -377,8 +377,6 @@ namespace bcp::flux
         uint32_t maxOutAssocPerPeer_ = 0;
         uint32_t maxInAssocPerPeer_  = 0;
         uint16_t outInflightCap_     = 0;
-        uint16_t inWindowBits_       = 0;
-        uint16_t inReorderCap_       = 0;
         uint16_t outReliableWaitCap_   = 0;
         uint16_t outUnreliableWaitCap_ = 0;
         uint32_t ackDelayMicros_       = 0;

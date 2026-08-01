@@ -68,6 +68,16 @@ namespace bcp::flux
              ? internal::FLOW_WINDOW_BULK : internal::FLOW_WINDOW;
     }
 
+    /** Reorder hold-back depth, in packets, for a mode. As deep as the window
+        so the receiver can hold everything a sender may put in flight past a
+        gap. A shallower buffer would eject in-window packets it cannot hold,
+        and the sender would resend them into the same gap until it gives up.
+        Unordered modes deliver on arrival and never hold back, so zero. */
+    [[nodiscard]] inline uint16_t ReorderCapFor(FlowMode mode) noexcept
+    {
+        return IsOrdered(mode) ? WindowFor(mode) : 0;
+    }
+
     /** Lifecycle, used at both scopes with different meanings. A flow is OPEN
         until the application closes it, and CLOSING only for the span of that
         close, so nothing opens a new association under a flow going away. An

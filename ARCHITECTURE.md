@@ -494,8 +494,9 @@ what it holds rather than appending a fresh message to the remains of the old
 one. Without it the receiver would deliver bytes that were never sent, in an
 order that looks correct.
 
-The in-flight window is the sender's ring capacity and the receiver's
-seen-bitmap width, and `WindowFor` derives it from the mode. It is not
+The in-flight window is the sender's ring capacity, the receiver's
+seen-bitmap width, and the depth of its reorder hold-back, and `WindowFor`
+derives all of it from the mode. It is not
 configuration, and nothing carries it on the wire: both ends read the same three
 mode bits and reach the same number, so they agree by construction. A declared
 window was tried and removed because nothing forced the two to match.

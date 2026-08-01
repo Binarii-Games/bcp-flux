@@ -286,10 +286,10 @@ namespace bcp::flux
         params.outCount            = f.outCount;
     params.bulkOutCount        = f.bulkOutCount;
         params.inCount             = f.inCount;
+        params.bulkInCount         = f.bulkInCount;
         params.maxOutPerPeer       = f.maxOutPerPeer;
         params.maxInPerPeer        = f.maxInPerPeer;
         params.maxPeers            = config.maxPeers;
-        params.reorderCount        = f.reorderCount;
         params.stagingCount        = f.stagingCount;
         params.reliableWait        = f.reliableWaitCount;
         params.unreliableWait      = f.unreliableWaitCount;

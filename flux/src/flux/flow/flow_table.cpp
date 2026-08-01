@@ -401,19 +401,17 @@ namespace bcp::flux
         {
             if (params.maxInPerPeer == 0)
                 return common::Error::InvalidParam;
-            inWindowBits_ = static_cast<uint16_t>(window);
-
-            inReorderCap_ = static_cast<uint16_t>(
-                params.reorderCount > 0 ? RoundUpPow2(params.reorderCount, 1, internal::FLOW_RING_MAX) : 0);
-
-            // Every inbound slot is cut for the widest window a sender can
-            // choose, because the remote picks the mode and this side has to
-            // hold whichever it picks. Unlike the sending half that costs
-            // almost nothing: the seen bitmap is bits, so the widest is 128
-            // bytes against 32, and one pool stays simpler than two.
-            const uint32_t stride = static_cast<uint32_t>(
-                InAssociation::StrideFor(internal::FLOW_WINDOW_BULK, inReorderCap_));
-            if (!inAssocPool_.Init(params.inCount, stride))
+            // The reorder hold-back is as deep as the window (ReorderCapFor), so
+            // a bulk slot now dwarfs a standard one on the hold-back ring, not
+            // just the bitmap. Two strides, like the sending pool, keep an
+            // ordered-256 flow from carrying the bulk ring. The remote picks the
+            // mode, so a slot is cut for bulk only when the acquire asks for it.
+            const uint32_t inStandardStride = static_cast<uint32_t>(
+                InAssociation::StrideFor(internal::FLOW_WINDOW, internal::FLOW_WINDOW));
+            const uint32_t inBulkStride = static_cast<uint32_t>(
+                InAssociation::StrideFor(internal::FLOW_WINDOW_BULK, internal::FLOW_WINDOW_BULK));
+            if (!inAssocPool_.Init(params.inCount, inStandardStride,
+                                   params.bulkInCount, inBulkStride))
                 return common::Error::NotInitialized;
             if (!initDir(inAssocDir_, params.maxInPerPeer))
                 return common::Error::NotInitialized;
@@ -1107,7 +1105,7 @@ namespace bcp::flux
                 // release.
                 DrainInHoldback(assoc);
                 ResetInAssoc(assoc, peerSlot, from, &peerId, flowId, mode,
-                             flowEpoch, WindowFor(mode), inReorderCap_);
+                             flowEpoch, WindowFor(mode), ReorderCapFor(mode));
             }
             inAssocPool_.UnlockWrite(existing);
 
@@ -1118,7 +1116,7 @@ namespace bcp::flux
         // This is the one path where a REMOTE makes this socket allocate, so
         // it is caps-only: a dry pool or a full directory refuses, and the
         // sender is told rather than left retransmitting into silence.
-        const uint32_t flowSlot = inAssocPool_.Acquire();
+        const uint32_t flowSlot = inAssocPool_.Acquire(mode == FlowMode::RELIABLE_ORDERED_BULK);
         if (flowSlot == common::collections::SlotPool::INVALID)
             return FlowAdmit::Rejected;
 
@@ -1127,7 +1125,7 @@ namespace bcp::flux
             InAssociation* flow = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(flowSlot));
             ResetInAssoc(flow, peerSlot, from, &peerId, flowId, mode,
-                         flowEpoch, WindowFor(mode), inReorderCap_);
+                         flowEpoch, WindowFor(mode), ReorderCapFor(mode));
             inAssocPool_.UnlockWrite(flowSlot);
         }
         if (InsertFlowSlot(dir, maxInAssocPerPeer_, flowId, flowSlot)
