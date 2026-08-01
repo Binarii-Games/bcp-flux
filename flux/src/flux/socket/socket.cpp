@@ -1762,7 +1762,6 @@ namespace bcp::flux
         // BindTag/UnbindTags take table locks, and the table's contract forbids
         // calling them with a handle held.
         bool bindWindow  = false;
-        bool dropOldTags = false;
         common::crypto::SessionKey tagSession{};
         uint32_t responderCaps;
         BuildCapsBitmap(responderCaps);
@@ -1818,8 +1817,13 @@ namespace bcp::flux
 
         if (bindWindow)
         {
-            if (dropOldTags)
-                (void)peers_.UnbindTags(slot);
+            // Clear any window a previous key left before binding this one. A
+            // first establish holds none, so this is a no-op; a re-key holds a
+            // window whose tags derive from the key just replaced, and dropping
+            // them is the only correct move, so it is not conditional. Left
+            // bound, they pile up in the shared tag index and eventually starve
+            // every peer's migration.
+            (void)peers_.UnbindTags(slot);
             BindTagWindow(slot, tagSession, LaneFrom(pk), 0);
         }
         common::crypto::Wipe(tagSession.data(), tagSession.size());
