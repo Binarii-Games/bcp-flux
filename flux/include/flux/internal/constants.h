@@ -107,9 +107,6 @@ namespace bcp::flux::internal
     static constexpr uint32_t  SEEN_STAMP_SHIFT             = 10;
     static constexpr uint32_t  MAX_EVICT_PER_UPDATE         = 16;  ///< the rest ride the next tick
 
-    // --- Workers ---
-    static constexpr uint8_t   SOCK_WORKER_COUNT            = 8;
-
     // --- Pool ---
     static constexpr uint32_t SOCK_KERNEL_ZLOCKPCKT_COUNT   = 2048;
     static constexpr uint32_t SOCK_KERNEL_SENDSLOT_COUNT    = 2048;
