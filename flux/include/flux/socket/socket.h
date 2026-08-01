@@ -229,14 +229,17 @@ namespace bcp::flux
                 field. */
             struct Liveness
             {
-                /** 0 disables the eviction sweep (default). When set, a peer
-                    from whom nothing has been RECEIVED for this long is evicted
-                    on the Update tick (at most MAX_EVICT_PER_UPDATE per call),
-                    full teardown. Received-only: our own sends prove nothing
-                    about the remote. A fresh peer gets one timeout to complete
-                    its handshake; forgeable handshake chatter does not refresh
-                    the clock. Init rejects values at/above half the stamp wrap
-                    (~24 d). */
+                /** A peer from whom nothing has been RECEIVED for this long is
+                    evicted on the Update tick (at most MAX_EVICT_PER_UPDATE per
+                    call), full teardown. Eviction is mandatory, so 0 takes
+                    internal::PEER_IDLE_TIMEOUT_DEFAULT rather than switching it
+                    off: a live peer refreshes the clock on every packet, only a
+                    silent one ages out, and reclaiming a dead entry is what lets
+                    a restarted process reconnect. Received-only, our own sends
+                    prove nothing about the remote. A fresh peer gets one timeout
+                    to complete its handshake; forgeable handshake chatter does
+                    not refresh the clock. Init rejects values at/above half the
+                    stamp wrap (~24 d). */
                 uint64_t idleTimeoutMicros   = 0;
                 /** How stale lastSeenAt may grow before the receive path pays a
                     write to refresh it; bounds stamp writes to one per grain per

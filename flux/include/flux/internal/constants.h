@@ -107,6 +107,13 @@ namespace bcp::flux::internal
     static constexpr uint32_t  SEEN_STAMP_SHIFT             = 10;
     static constexpr uint32_t  MAX_EVICT_PER_UPDATE         = 16;  ///< the rest ride the next tick
 
+    /** A peer heard from for this long is dead and its entry is reclaimed. Used
+        when Config leaves idleTimeoutMicros at zero. Idle eviction is not
+        optional: a live peer refreshes the clock on every packet, so only a
+        genuinely silent one is evicted, and reclaiming it is what frees the slot
+        for a restarted process to reconnect. */
+    static constexpr uint32_t  PEER_IDLE_TIMEOUT_DEFAULT    = 30000000;   // 30 s
+
     /** A receiving ordered flow whose cursor has not advanced for this long
         while it holds a gap is jammed, and the tick reclaims it. Used when
         Config leaves flowStallTimeoutMicros at zero. Comfortably past the
