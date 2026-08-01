@@ -153,6 +153,7 @@ namespace bcp::flux
             uint32_t ackDelayMicros = 0;
             uint32_t retryIntervalMicros = 0;
             uint8_t  maxAttempts    = 0;
+            uint32_t flowStallTimeoutMicros = 0;
         };
 
         /** One waiting packet the drain may send, peeked under the peer read
@@ -240,6 +241,21 @@ namespace bcp::flux
         [[nodiscard]] uint32_t OutAssocAt(uint32_t peerSlot, uint32_t dirIndex) noexcept;
         /** @pre caller holds the peer read lock. */
         [[nodiscard]] bool AnyAckDue(uint32_t peerSlot, uint64_t now) noexcept;
+
+        /** Whether any of this peer's receiving flows is jammed: an ordered flow
+            pinning a gap whose cursor has not advanced for the stall timeout.
+            Read-only, caller holds the peer read lock, like AnyAckDue. */
+        [[nodiscard]] bool AnyJammed(uint32_t peerSlot, uint64_t now) noexcept;
+
+        /** Reclaims this peer's jammed receiving flows: releases the held recv
+            slots and frees the association. The condition is re-checked under
+            the write lock. Caller holds the peer WRITE lock. Returns how many
+            were freed. */
+        uint32_t EvictJammedInFlows(uint32_t peerSlot, uint64_t now) noexcept;
+
+        /** How many receiving associations this peer currently has. Caller holds
+            the peer read lock. */
+        [[nodiscard]] uint32_t InAssocCountForPeer(uint32_t peerSlot) noexcept;
         /** Soonest deadline across this peer's associations, UINT64_MAX when
             none is armed.
             @pre caller holds the peer read lock. */
@@ -382,6 +398,7 @@ namespace bcp::flux
         uint32_t ackDelayMicros_       = 0;
         uint32_t retryIntervalMicros_  = 0;
         uint8_t  maxAttempts_          = 0;
+        uint64_t flowStallTimeout_     = 0;
         bool     bulkEnabled_          = false;   ///< a bulk pool was provisioned
 
         // Directory helpers over the FlowDirEntry[] segment: three scan idioms.
@@ -423,6 +440,10 @@ namespace bcp::flux
         [[nodiscard]] uint32_t DrainOutInflight(OutAssociation* flow) noexcept;
         void DrainOutWaiting(OutAssociation* flow) noexcept;
         void DrainInHoldback(InAssociation* flow) noexcept;
+
+        /** The jam predicate, shared by the read scan and the write-locked
+            eviction so both judge a flow the same way. */
+        [[nodiscard]] bool InAssocJammed(const InAssociation* flow, uint64_t now) const noexcept;
 
         /** Resolve one in-flight entry (acked or lost); accumulate feedback into
             `delta` (never touches the peer). The socket does the peer-side

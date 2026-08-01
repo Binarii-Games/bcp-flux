@@ -77,12 +77,13 @@ namespace bcp::flux
             assoc->life       = FlowLifecycle::OPEN;
             assoc->epoch      = assoc->epoch + 1;
 
-            assoc->recvNext       = 1;
-            assoc->recvHighest    = 0;
-            assoc->newSinceFlush  = 0;
-            assoc->ackArmedMicros = 0;
-            assoc->windowBits     = windowBits;
-            assoc->reorderCap     = reorderCap;
+            assoc->recvNext           = 1;
+            assoc->recvHighest        = 0;
+            assoc->newSinceFlush      = 0;
+            assoc->ackArmedMicros     = 0;
+            assoc->lastProgressMicros = common::MonotonicMicros();
+            assoc->windowBits         = windowBits;
+            assoc->reorderCap         = reorderCap;
 
             std::memset(assoc->Seen(), 0, windowBits / 8);
             HoldbackEntry* holdback = assoc->Holdback();
@@ -421,6 +422,8 @@ namespace bcp::flux
         ackDelayMicros_      = params.ackDelayMicros;
         retryIntervalMicros_ = params.retryIntervalMicros;
         maxAttempts_         = params.maxAttempts;
+        flowStallTimeout_    = params.flowStallTimeoutMicros > 0
+            ? params.flowStallTimeoutMicros : internal::FLOW_STALL_TIMEOUT_DEFAULT;
         return common::Error::Ok;
     }
 
@@ -802,6 +805,77 @@ namespace bcp::flux
             inAssocPool_.UnlockRead(dir[i].flowSlot);
         }
         return ackDue;
+    }
+
+    bool FlowTable::InAssocJammed(const InAssociation* flow, uint64_t now) const noexcept
+    {
+        // Only an ordered flow holds a gap. recvHighest >= recvNext means the
+        // cursor sits behind packets already seen, so the hold-back is pinning
+        // recv slots. If the cursor has not moved for the timeout, the sender is
+        // not filling the gap and never will.
+        return flow->reorderCap > 0
+            && flow->recvHighest >= flow->recvNext
+            && now - flow->lastProgressMicros > flowStallTimeout_;
+    }
+
+    bool FlowTable::AnyJammed(uint32_t peerSlot, uint64_t now) noexcept
+    {
+        bool jammed = false;
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        for (uint32_t i = 0; i < maxInAssocPerPeer_ && !jammed; ++i)
+        {
+            if (dir[i].flowSlot == common::collections::SlotPool::INVALID)
+                continue;
+            const InAssociation* flow = reinterpret_cast<const InAssociation*>(
+                inAssocPool_.ReadLock(dir[i].flowSlot));
+            jammed = InAssocJammed(flow, now);
+            inAssocPool_.UnlockRead(dir[i].flowSlot);
+        }
+        return jammed;
+    }
+
+    uint32_t FlowTable::EvictJammedInFlows(uint32_t peerSlot, uint64_t now) noexcept
+    {
+        // Runs under the peer's write lock, exactly like the peer-teardown
+        // sweep, so the flow locks nest correctly (peer -> flow) and no admit
+        // can publish a slot while this frees one. The condition is re-checked
+        // under the write lock, because a racing DeliverIn may have advanced
+        // the cursor since the read scan flagged this peer.
+        uint32_t evicted = 0;
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        for (uint32_t i = 0; i < maxInAssocPerPeer_; ++i)
+        {
+            const uint32_t flowSlot = dir[i].flowSlot;
+            if (flowSlot == common::collections::SlotPool::INVALID)
+                continue;
+            InAssociation* assoc = reinterpret_cast<InAssociation*>(
+                inAssocPool_.WriteLock(flowSlot));
+            const bool jammed = InAssocJammed(assoc, now);
+            if (jammed)
+            {
+                dir[i] = FlowDirEntry{ internal::INVALID_FLOW_ID, 0,
+                                       common::collections::SlotPool::INVALID };
+                DrainInHoldback(assoc);
+                assoc->life = FlowLifecycle::CLOSED;
+            }
+            inAssocPool_.UnlockWrite(flowSlot);
+            if (jammed)
+            {
+                inAssocPool_.Release(flowSlot);
+                ++evicted;
+            }
+        }
+        return evicted;
+    }
+
+    uint32_t FlowTable::InAssocCountForPeer(uint32_t peerSlot) noexcept
+    {
+        uint32_t count = 0;
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        for (uint32_t i = 0; i < maxInAssocPerPeer_; ++i)
+            if (dir[i].flowSlot != common::collections::SlotPool::INVALID)
+                ++count;
+        return count;
     }
 
     uint64_t FlowTable::NextDeadline(uint32_t peerSlot) noexcept
@@ -1520,9 +1594,15 @@ namespace bcp::flux
         uint32_t produced = 0;
         if (flow->life == FlowLifecycle::OPEN && flow->flowId == flowId)
         {
+            const uint32_t cursorBefore = flow->recvNext;
             produced = IsOrdered(flow->mode)
                 ? DeliverOrdered(*flow, incoming, seq)
                 : DeliverUnordered(*flow, incoming, seq);
+            // The cursor moving is the only progress the stall timer counts. A
+            // held or duplicate packet leaves it where it was, so a flow stuck
+            // behind a gap keeps aging toward the jam timeout.
+            if (flow->recvNext != cursorBefore)
+                flow->lastProgressMicros = common::MonotonicMicros();
         }
         inAssocPool_.UnlockWrite(assocSlot);
         return produced;

@@ -458,6 +458,13 @@ namespace bcp::flux
         uint32_t recvHighest;   ///< anything above this + 1 is a gap, the loss signal
         uint32_t newSinceFlush; ///< seqs first seen since the last ack; 0 means none owed
 
+        /** Monotonic micros the delivery cursor last advanced. An ordered flow
+            holding a gap whose cursor has not moved for the stall timeout is
+            jammed: it is pinning recv slots for a gap the sender is not
+            filling, and the tick reclaims it. Set at creation and on every
+            cursor advance. */
+        uint64_t lastProgressMicros;
+
         /** When this association first owed an ack. The deadline is this plus
             Config::timers::ackDelayMicros; 0 means nothing is owed. */
         uint64_t ackArmedMicros;

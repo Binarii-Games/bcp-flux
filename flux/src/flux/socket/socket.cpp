@@ -296,6 +296,7 @@ namespace bcp::flux
         params.ackDelayMicros      = config.timers.ackDelayMicros;
         params.retryIntervalMicros = config.timers.retryIntervalMicros;
         params.maxAttempts         = config.timers.maxAttempts;
+        params.flowStallTimeoutMicros = config.liveness.flowStallTimeoutMicros;
 
         if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyQueue_);
             error != common::Error::Ok)
@@ -2130,6 +2131,17 @@ namespace bcp::flux
         return flows_.StateOf(flow, peerHandle.GetSlotIndex());
     }
 
+    uint32_t Socket::ReceivingFlowCount(const Address& peer)
+    {
+        if (!flows_.ReceiveEnabled()) return 0;
+
+        PeerHandle peerHandle = peers_.GetPeer(peer);
+        if (peerHandle.Failed() || !peerHandle.Read())
+            return 0;
+
+        return flows_.InAssocCountForPeer(peerHandle.GetSlotIndex());
+    }
+
     void Socket::Flow_Reject(const Address& from, const uint8_t* payload, size_t len)
     {
         // The remote refused to register one of OUR flows: it is at its caps,
@@ -2488,6 +2500,7 @@ namespace bcp::flux
                 // held across either call boundary.
                 bool ackDue = false;
                 bool evictIdle = false;
+                bool jammed = false;
                 {
                     PeerHandle peerHandle = peers_.GetPeer(addr);
                     if (peerHandle.Failed() || !peerHandle.Read()) continue;
@@ -2507,6 +2520,7 @@ namespace bcp::flux
                     {
                         const uint64_t now = Now(nowOverride);   // fresh for this peer
                         ackDue = flows_.AnyAckDue(peerHandle.GetSlotIndex(), now);
+                        jammed = flows_.AnyJammed(peerHandle.GetSlotIndex(), now);
                     }
                 }
 
@@ -2537,6 +2551,19 @@ namespace bcp::flux
                     // Capacity freed above (and by acks since the last tick)
                     // goes to the packets that have waited longest.
                     DrainWaitingSends(addr);
+                }
+
+                // A jammed receiving flow pins recv slots for a gap the sender
+                // is not filling. Flagged read-only above, freed here under the
+                // peer write lock, the same context the teardown sweep runs in,
+                // so the flow locks nest peer -> flow. The free re-checks, since
+                // a racing DeliverIn may have moved the cursor meanwhile.
+                if (jammed)
+                {
+                    PeerHandle evictHandle = peers_.GetPeer(addr);
+                    if (!evictHandle.Failed() && evictHandle.Write())
+                        (void)flows_.EvictJammedInFlows(evictHandle.GetSlotIndex(),
+                                                        Now(nowOverride));
                 }
             }
         }

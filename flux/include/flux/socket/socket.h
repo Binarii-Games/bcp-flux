@@ -250,6 +250,13 @@ namespace bcp::flux
                     dropped. Known source stays forgeable (no tag, no AEAD); the
                     gate is hygiene, not authentication. */
                 bool     acceptUnsecureFromUnknown = false;
+                /** A receiving ordered flow holding a gap whose cursor has not
+                    advanced for this long is jammed: it is pinning recv slots
+                    for a gap the sender is not filling, so the tick reclaims it.
+                    0 takes internal::FLOW_STALL_TIMEOUT_DEFAULT. There is no
+                    "off": a jammed flow is pure waste, and holding it only lets
+                    a misbehaving peer keep recv slots hostage. */
+                uint32_t flowStallTimeoutMicros = 0;
             } liveness;
         };
 
@@ -338,6 +345,12 @@ namespace bcp::flux
             association exists yet, which is also what a target never sent to
             reads. */
         [[nodiscard]] FlowLifecycle GetFlowState(const FlowHandle& flow, const Address& peer);
+
+        /** How many receiving flows currently exist for this peer, the
+            associations built from its incoming traffic. Zero when the peer is
+            unknown. Read-only introspection: a jammed flow the tick has
+            reclaimed no longer counts. */
+        [[nodiscard]] uint32_t ReceivingFlowCount(const Address& peer);
 
         /** Advances this side's migration tag for every established peer, so
             packets after a deliberate local address change wear unlinkable
