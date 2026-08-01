@@ -324,14 +324,17 @@ namespace bcp::flux
             return common::Error::InvalidParam;
         seenGrainStamp_ = static_cast<uint32_t>(grainStamp);
 
-        if (config.liveness.idleTimeoutMicros != 0)
-        {
-            const uint64_t idleStamp =
-                (config.liveness.idleTimeoutMicros >> internal::SEEN_STAMP_SHIFT) + seenGrainStamp_;
-            if (idleStamp == 0 || idleStamp >= (1ull << 31))
-                return common::Error::InvalidParam;
-            evictAfterStamp_ = static_cast<uint32_t>(idleStamp);
-        }
+        // Idle eviction is mandatory, so zero takes the default rather than
+        // switching it off. A live peer refreshes the clock on every packet it
+        // sends, so only a silent one ages out, and reclaiming it is what lets a
+        // restarted process take its slot back.
+        const uint64_t idleMicros = config.liveness.idleTimeoutMicros != 0
+            ? config.liveness.idleTimeoutMicros : internal::PEER_IDLE_TIMEOUT_DEFAULT;
+        const uint64_t idleStamp =
+            (idleMicros >> internal::SEEN_STAMP_SHIFT) + seenGrainStamp_;
+        if (idleStamp == 0 || idleStamp >= (1ull << 31))
+            return common::Error::InvalidParam;
+        evictAfterStamp_ = static_cast<uint32_t>(idleStamp);
 
         acceptUnsecureFromUnknown_ = config.liveness.acceptUnsecureFromUnknown;
         return common::Error::Ok;
@@ -1714,13 +1717,17 @@ namespace bcp::flux
                     else
                     {
                         // Same ephemeral means the same attempt arriving twice,
-                        // so the answer already sent is the only correct one.
-                        // Re-keying here would strand the initiator, which
-                        // wiped its own secret when it established and can no
-                        // longer follow. A different ephemeral is a new attempt,
-                        // and the initiator is necessarily unestablished for it.
+                        // so the answer already sent is the only correct one. A
+                        // different ephemeral is a fresh attempt, and it re-keys
+                        // only an unconfirmed peer. A confirmed session has been
+                        // proven live, and no part of an HS_RES is authenticated,
+                        // so letting one re-key it would let an on-path forgery
+                        // replace a working session with garbage nobody can open.
+                        // A live peer changes only by migration; a dead one is
+                        // reconnected to after its entry idles out.
                         repeat = common::crypto::Equal(peer->hsPeerEph.data(),
                                                        ephI.data(), ephI.size());
+                        if (!repeat && peer->confirmed) return;
                         established = repeat;
                     }
                 }
@@ -2484,7 +2491,9 @@ namespace bcp::flux
         // flow state to scan. Paced and bounded internally.
         (void)RetryHandshakes();
 
-        if (!flows_.SendEnabled() && !flows_.ReceiveEnabled() && evictAfterStamp_ == 0) return;
+        // No flow gate on the sweep: idle eviction is mandatory, so the per-peer
+        // pass runs even on a socket with no flows. An empty peer table makes
+        // the loop below break at once.
 
         uint32_t evicted = 0;
         uint32_t cursor = 0;
@@ -2513,7 +2522,7 @@ namespace bcp::flux
                     // the same clock: registration stamped them, handshake
                     // chatter does not refresh (it is forgeable), so an entry
                     // that never completes gets a single timeout to live.
-                    if (evictAfterStamp_ != 0 && evicted < internal::MAX_EVICT_PER_UPDATE)
+                    if (evicted < internal::MAX_EVICT_PER_UPDATE)
                     {
                         const uint32_t nowStamp = SeenStamp(Now(nowOverride));
                         const uint32_t idleFor =
