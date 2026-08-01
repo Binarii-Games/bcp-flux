@@ -258,6 +258,10 @@ namespace bcp::flux
         bool TakeU64(uint64_t& out);
         bool TakeBytes(uint8_t* dst, size_t len);
 
+        /** The packet being walked. For a check that has to cover bytes the
+            reader already consumed, such as a MAC over the whole datagram. */
+        [[nodiscard]] const PacketSlot* Packet() const noexcept { return pkt_; }
+
         PacketSlotHandle ExtractHandle() && noexcept;
 
         bool Failed();

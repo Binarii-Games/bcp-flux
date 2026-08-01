@@ -76,6 +76,25 @@ namespace bcp::flux
             return counter;
         }
 
+        /** The challenge cookie as a MAC key, labelled so it cannot collide
+            with any other derivation.
+
+            The cookie travels in the clear, so this key is not secret and the
+            MAC it produces is not authentication: anyone on the path can
+            compute a valid one. What it catches is a corrupted or blindly
+            injected HS_RES, which is the failure that binds a peer to a public
+            key nobody holds. Real proof of identity arrives with the
+            confirmation MAC once a session key exists. */
+        common::crypto::SessionKey CookieKey(uint64_t challenge) noexcept
+        {
+            static constexpr uint8_t LABEL[8] = {'f','l','u','x','-','h','s',0};
+            common::crypto::SessionKey key{};
+            std::memcpy(key.data(), LABEL, sizeof(LABEL));
+            for (size_t i = 0; i < sizeof(challenge); ++i)
+                key[sizeof(LABEL) + i] = static_cast<uint8_t>(challenge >> (i * 8));
+            return key;
+        }
+
         /** Builds the AEAD associated data: the controller byte, plus the 4-byte
             migration tag on a tagged packet. Both are readable on the wire and
             neither is alterable.
@@ -1593,9 +1612,28 @@ namespace bcp::flux
         writer.PutU16(internal::VERSION);
         writer.PutU32(initiatorCaps);
 
+        // Cover the whole message, keyed by the cookie the responder minted and
+        // this side is echoing back. Both ends hold that value, so the check
+        // costs no exchange, and it is the only thing standing between a
+        // damaged public key and a peer entry bound to an identity nobody
+        // holds. Appended last, so the range is one unbroken run.
+        PacketSlotHandle resHandle = std::move(writer).ExtractHandle();
+        {
+            PacketSlot* raw = resHandle.Write();
+            if (!raw) return;
+            if (static_cast<size_t>(raw->dataSize) + internal::WIRE_HS_MAC_SIZE
+                > internal::MAX_WIRE_PACKET_SIZE)
+                return;
+
+            common::crypto::Mac mac;
+            common::crypto::ComputeMac(mac, CookieKey(challenge), raw->data, raw->dataSize);
+            std::memcpy(raw->data + raw->dataSize, mac.data(), mac.size());
+            raw->dataSize = static_cast<uint16_t>(raw->dataSize + internal::WIRE_HS_MAC_SIZE);
+        }
+
         // Handshake traffic bypasses the flow gate, so the only failure here
         // is a dry pool. A lost one is recovered by the handshake retry.
-        (void)sender_.Send(std::move(writer).ExtractHandle());
+        (void)sender_.Send(std::move(resHandle));
     }
 
     void Socket::Handshake_Validate(const Address& from, PacketSlotReader& reader)
@@ -1607,14 +1645,33 @@ namespace bcp::flux
         uint16_t initiatorVersion{0};
         uint32_t initiatorCaps{0};
         if (!reader.TakeU64(challenge)) return;
+
+        // The gate, first because it is the cheap one and it is what stops a
+        // flood costing this socket anything.
+        if (!challengeGenerator_.Verify(from.addr, challenge)) return;
+
+        // Then integrity, before a single field is read out. Everything below
+        // derives an identity from bytes this side did not choose, and a
+        // corrupted key here is indistinguishable from a real one: it registers
+        // a peer under an id nobody holds and locks the address out. Checking
+        // first means a damaged message never reaches that code.
+        {
+            const PacketSlot* raw = reader.Packet();
+            if (!raw || raw->dataSize < internal::WIRE_HS_MAC_SIZE) return;
+
+            const size_t covered = raw->dataSize - internal::WIRE_HS_MAC_SIZE;
+            common::crypto::Mac expected;
+            common::crypto::ComputeMac(expected, CookieKey(challenge), raw->data, covered);
+            if (!common::crypto::Equal(expected.data(), raw->data + covered,
+                                       expected.size()))
+                return;
+        }
+
         if (!reader.TakeBytes(pk.data(), pk.size())) return;
         if (!reader.TakeBytes(ephI.data(), ephI.size())) return;
         if (!reader.TakeBytes(saltI, sizeof(saltI))) return;
         if (!reader.TakeU16(initiatorVersion)) return;
         if (!reader.TakeU32(initiatorCaps)) return;
-
-        // The gate. Until this passes, the sender has cost this socket nothing.
-        if (!challengeGenerator_.Verify(from.addr, challenge)) return;
 
         const BcpId id = BcpId::Derive(pk);
 
