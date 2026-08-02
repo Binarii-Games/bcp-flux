@@ -71,6 +71,7 @@ static void Receive(flux::Socket& socket)
 
     while (expected < PAYLOAD_BYTES)
     {
+        socket.Flush();
         socket.Update();
 
         const uint32_t count = socket.Poll(inbox, 64);
@@ -157,6 +158,7 @@ int main()
         }
 
         ++refusals;
+        a.Flush();
         a.Update();
         a.Poll(sink, 64);
     }
@@ -165,6 +167,7 @@ int main()
     // flight, and their retransmits need the tick.
     while (!done)
     {
+        a.Flush();
         a.Update();
         a.Poll(sink, 64);
         std::this_thread::sleep_for(std::chrono::microseconds(200));

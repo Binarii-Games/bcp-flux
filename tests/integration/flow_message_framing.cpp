@@ -99,8 +99,10 @@ namespace
         flux::PacketSlotHandle sink[64];
         for (int i = 0; i < rounds; ++i)
         {
+            a.Flush();
             a.Update();
             a.Poll(sink, 64);
+            b.Flush();
             b.Update();
 
             const uint32_t count = b.Poll(sink, 64);

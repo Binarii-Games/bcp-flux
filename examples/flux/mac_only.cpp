@@ -60,7 +60,9 @@ int main()
     auto pump = [&](int rounds) {
         for (int i = 0; i < rounds; ++i)
         {
+            a.Flush();
             a.Update(); a.Poll(inbox, 16);
+            b.Flush();
             b.Update(); b.Poll(inbox, 16);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
@@ -94,7 +96,9 @@ int main()
     bool arrived = false;
     for (int i = 0; i < 200 && !arrived; ++i)
     {
+        a.Flush();
         a.Update(); a.Poll(inbox, 16);
+        b.Flush();
         b.Update();
 
         const uint32_t count = b.Poll(inbox, 16);

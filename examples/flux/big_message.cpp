@@ -94,8 +94,10 @@ int main()
             sent += n;
         }
 
+        a.Flush();
         a.Update();
         a.Poll(inbox, 64);
+        b.Flush();
         b.Update();
 
         const uint32_t count = b.Poll(inbox, 64);

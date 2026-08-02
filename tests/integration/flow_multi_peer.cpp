@@ -45,6 +45,7 @@ static void Drive(flux::Socket& client,
     flux::PacketSlotHandle handles[64];
     for (int i = 0; i < ticks; ++i)
     {
+        client.Flush();
         client.Update();
         client.Poll(handles, 64);
 

@@ -43,6 +43,7 @@ static void Tick(flux::Socket& socket)
 
     while (delivered < BURST)
     {
+        socket.Flush();
         socket.Update();
 
         const uint32_t count = socket.Poll(inbox, 16);
@@ -96,6 +97,7 @@ int main()
     // accounting and feed congestion control; they never cause a resend.
     while (delivered < BURST)
     {
+        a.Flush();
         a.Update();
         a.Poll(sink, 8);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

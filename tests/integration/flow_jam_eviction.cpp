@@ -63,7 +63,9 @@ namespace
         flux::PacketSlotHandle sink[64];
         for (int i = 0; i < rounds; ++i)
         {
+            a.Flush();
             a.Update(); a.Poll(sink, 64);
+            b.Flush();
             b.Update(); b.Poll(sink, 64);
             std::this_thread::sleep_for(std::chrono::microseconds(perRoundMicros));
         }
@@ -127,6 +129,7 @@ static void JammedFlowEvicted()
     uint32_t delivered = 0;
     for (int i = 0; i < 120; ++i)
     {
+        client.Flush();
         client.Update();
         delivered += server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -139,6 +142,7 @@ static void JammedFlowEvicted()
     const auto start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
     {
+        server.Flush();
         server.Update();
         server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -184,7 +188,9 @@ static void ProgressingFlowSpared()
         while (sent < BURST &&
                client.BuildPacket().WithFlow(flow).PutU32(sent).Send(serverAddr) == common::Error::Ok)
             ++sent;
+        client.Flush();
         client.Update(); client.Poll(inbox, 64);
+        server.Flush();
         server.Update();
         const uint32_t got_n = server.Poll(inbox, 64);
         for (uint32_t i = 0; i < got_n; ++i)
@@ -231,7 +237,9 @@ static void SiblingSurvives()
         while (sent < HEALTHY_N &&
                client.BuildPacket().WithFlow(healthy).PutU32(sent).Send(serverAddr) == common::Error::Ok)
             ++sent;
+        client.Flush();
         client.Update(); client.Poll(inbox, 64);
+        server.Flush();
         server.Update();
         const uint32_t got_n = server.Poll(inbox, 64);
         for (uint32_t k = 0; k < got_n; ++k)
@@ -255,6 +263,7 @@ static void SiblingSurvives()
     CHECK(SendWithLostHead(client, CLIENT, jam, serverAddr, 20));
     for (int i = 0; i < 120; ++i)
     {
+        client.Flush();
         client.Update(); server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -265,6 +274,7 @@ static void SiblingSurvives()
     const auto start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
     {
+        server.Flush();
         server.Update(); server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }

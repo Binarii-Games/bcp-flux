@@ -124,7 +124,9 @@ struct World
             relay.Pump();
             CollectOp(server, 0x01);
             CollectOp(client, 0x00);
+            client.Flush();
             client.Update();
+            server.Flush();
             server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (Established(client, Loopback(portA)) && Established(server, Loopback(portA))) break;
@@ -138,7 +140,9 @@ struct World
             relay.Pump();
             CollectOp(client, 0xFF);   // drain, count nothing
             CollectOp(server, 0xFF);
+            client.Flush();
             client.Update();
+            server.Flush();
             server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -165,7 +169,9 @@ static void move_survives_with_same_keys()
             world.relay.Pump();
             delivered += CollectOp(world.server, 0x20);
             CollectOp(world.client, 0xFF);
+            world.client.Flush();
             world.client.Update();
+            world.server.Flush();
             world.server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -214,7 +220,9 @@ static void spoofed_replay_never_redirects()
             world.relay.Pump();
             atClient += CollectOp(world.client, 0x31);
             CollectOp(world.server, 0xFF);
+            world.client.Flush();
             world.client.Update();
+            world.server.Flush();
             world.server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -258,7 +266,9 @@ static void rotated_tag_is_recognized_after_move()
             world.relay.Pump();
             delivered += CollectOp(world.server, 0x60);
             CollectOp(world.client, 0xFF);
+            world.client.Flush();
             world.client.Update();
+            world.server.Flush();
             world.server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }

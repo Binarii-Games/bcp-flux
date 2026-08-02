@@ -82,6 +82,7 @@ int main()
         while (!stopDrainer.load(std::memory_order_relaxed))
         {
             receiver.Poll(drained, 64);
+            receiver.Flush();
             receiver.Update();
             std::this_thread::yield();
         }

@@ -1609,10 +1609,81 @@ namespace bcp::flux
 
     // --- Delivery ---
 
+    bool FlowTable::SplitBatchToReady(const PacketSlot& batch) noexcept
+    {
+        const size_t header  = batch.ContentOffset();
+        const size_t content = batch.ContentLength();
+        if (header > batch.dataSize || content == 0) return false;
+        const uint8_t* list = batch.data + header;
+
+        // Every message gets a slot before any is queued, so a dry pool leaves
+        // the batch uncommitted and the sender resends it whole. Delivering
+        // half of one and dropping the rest would lose data the sender was
+        // told arrived. Acquiring the slots first also guarantees the pushes
+        // below cannot fail: the queue holds one entry per outstanding slot and
+        // these are outstanding but not yet queued.
+        uint32_t slots[internal::MAX_BATCH_MESSAGES];
+        uint32_t taken  = 0;
+        uint16_t offset = 0;
+        bool     ok     = true;
+
+        while (offset < content)
+        {
+            const uint8_t* message = nullptr;
+            uint16_t       length  = 0;
+            if (!wire::BatchNext(list, static_cast<uint16_t>(content), offset, message, length))
+            { ok = false; break; }
+            if (taken >= internal::MAX_BATCH_MESSAGES) { ok = false; break; }
+
+            const uint32_t slot = recvPool_->Acquire();
+            if (slot == common::collections::SlotPool::INVALID) { ok = false; break; }
+            slots[taken++] = slot;
+
+            PacketSlot* out = reinterpret_cast<PacketSlot*>(recvPool_->WriteLock(slot));
+            if (!out) { ok = false; break; }
+
+            // The batch's own framing becomes this message's, minus the bit
+            // saying it is a list, so what the application receives is
+            // indistinguishable from a packet that carried one message.
+            std::memcpy(out->data, batch.data, header);
+            out->data[0] = static_cast<uint8_t>(out->data[0] & ~internal::WIRE_CTRL_BATCH);
+            std::memcpy(out->data + header, message, length);
+            out->address = batch.address;
+            // The trailer is gone once decrypted, but ContentLength still
+            // subtracts it, so the room is left for the arithmetic to land on
+            // this message's length.
+            const size_t trailer = batch.IsSecure() ? internal::WIRE_TAG_SIZE : 0;
+            std::memset(out->data + header + length, 0, trailer);
+            out->dataSize = static_cast<uint16_t>(header + length + trailer);
+            recvPool_->UnlockWrite(slot);
+        }
+
+        if (!ok || taken == 0)
+        {
+            for (uint32_t i = 0; i < taken; ++i)
+                recvPool_->Release(slots[i]);
+            return false;
+        }
+
+        for (uint32_t i = 0; i < taken; ++i)
+            (void)readyQueue_->Push(slots[i]);
+        return true;
+    }
+
     bool FlowTable::QueueReady(PacketSlotHandle& handle) noexcept
     {
         const uint32_t idx = handle.GetSlotIndex();
         if (idx == common::collections::SlotPool::INVALID) return false;
+
+        const PacketSlot* packet = handle.Read();
+        if (packet && packet->IsBatch())
+        {
+            // The messages are queued in their own slots, so this one has done
+            // its job. Not detached: letting the handle release it is what
+            // returns it to the pool.
+            return SplitBatchToReady(*packet);
+        }
+
         if (!readyQueue_->Push(idx)) return false;   // full: backpressure, caller drops
         (void)handle.Detach();                       // queued; must not release the slot
         return true;
@@ -1718,7 +1789,8 @@ namespace bcp::flux
         return result;
     }
 
-    uint16_t FlowTable::TakeBatch(uint32_t assocSlot, uint8_t* out, uint16_t capacity) noexcept
+    uint16_t FlowTable::TakeBatch(uint32_t assocSlot, uint8_t* out, uint16_t capacity,
+                                  FlowMode& outMode) noexcept
     {
         if (!out) return 0;
 
@@ -1726,27 +1798,57 @@ namespace bcp::flux
             outAssocPool_.WriteLock(assocSlot));
         if (!flow) return 0;
 
+        outMode = flow->mode;
         uint16_t written = 0;
         if (flow->openBatchUsed != 0 && flow->openBatchUsed <= capacity)
         {
+            // Copied, not consumed. The batch stays until the caller reports
+            // the send actually happened, because an admission refused at the
+            // flush would otherwise throw away messages the caller was told had
+            // been accepted.
             std::memcpy(out, flow->OpenBatch(), flow->openBatchUsed);
             written = flow->openBatchUsed;
-            flow->openBatchUsed     = 0;
-            flow->openBatchHeader   = 0;
-            flow->openBatchCount    = 0;
-            flow->openBatchFirstLen = 0;
         }
 
         outAssocPool_.UnlockWrite(assocSlot);
         return written;
     }
 
-    bool FlowTable::HasOpenBatch(uint32_t assocSlot) noexcept
+    bool FlowTable::WouldAdmit(const Peer& peer, uint32_t assocSlot,
+                               uint16_t wireSize) noexcept
+    {
+        const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
+            outAssocPool_.ReadLock(assocSlot));
+        if (!flow) return false;
+        const bool ok = flow->life == FlowLifecycle::OPEN
+                     && flow->waitingCount == 0
+                     && CanSend(*flow, peer, wireSize, flow->mode != FlowMode::UNRELIABLE);
+        outAssocPool_.UnlockRead(assocSlot);
+        return ok;
+    }
+
+    void FlowTable::ClearBatch(uint32_t assocSlot, uint16_t expectedUsed) noexcept
+    {
+        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
+            outAssocPool_.WriteLock(assocSlot));
+        if (!flow) return;
+        if (flow->openBatchUsed == expectedUsed)
+        {
+            flow->openBatchUsed     = 0;
+            flow->openBatchHeader   = 0;
+            flow->openBatchCount    = 0;
+            flow->openBatchFirstLen = 0;
+        }
+        outAssocPool_.UnlockWrite(assocSlot);
+    }
+
+    bool FlowTable::PeekBatch(uint32_t assocSlot, FlowMode& outMode) noexcept
     {
         const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
             outAssocPool_.ReadLock(assocSlot));
         if (!flow) return false;
         const bool open = flow->openBatchUsed != 0;
+        outMode = flow->mode;
         outAssocPool_.UnlockRead(assocSlot);
         return open;
     }
@@ -1842,8 +1944,27 @@ namespace bcp::flux
             if (held.packetSlot == common::collections::SlotPool::INVALID
                 || held.seq != flow.recvNext)
                 break;   // gap: stop draining
-            if (!readyQueue_->Push(held.packetSlot))
-                break;   // queue full: leave the tail held
+
+            // A held batch splits on its way out, exactly as one delivered at
+            // the cursor does, so the application never meets one either way.
+            const PacketSlot* packet = reinterpret_cast<const PacketSlot*>(
+                recvPool_->ReadLock(held.packetSlot));
+            const bool batched = packet && packet->IsBatch();
+            bool queued;
+            if (batched)
+            {
+                queued = SplitBatchToReady(*packet);
+                recvPool_->UnlockRead(held.packetSlot);
+                if (queued) recvPool_->Release(held.packetSlot);   // its messages carry on without it
+            }
+            else
+            {
+                if (packet) recvPool_->UnlockRead(held.packetSlot);
+                queued = readyQueue_->Push(held.packetSlot);
+            }
+            if (!queued)
+                break;   // queue or pool full: leave the tail held
+
             held.packetSlot = common::collections::SlotPool::INVALID;
             held.seq = 0;
             ++produced;

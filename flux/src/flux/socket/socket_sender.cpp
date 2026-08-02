@@ -14,6 +14,19 @@ namespace bcp::flux
 
     common::Error SocketSender::Send(PacketSlotHandle pHandle, bool requireAuth)
     {
+        // A flow packet is a message for its flow's open batch, and only the
+        // batch reaches the wire. Anything the batch cannot take right now, a
+        // peer still handshaking or a flow with no association yet, falls
+        // through and goes out on its own as it always did.
+        common::Error status = common::Error::Ok;
+        if (sock_->OfferToBatch(pHandle, requireAuth, status))
+            return status;
+
+        return SendNow(std::move(pHandle), requireAuth);
+    }
+
+    common::Error SocketSender::SendNow(PacketSlotHandle pHandle, bool requireAuth)
+    {
         common::Error status = common::Error::Ok;
         pHandle = sock_->PreProcessOut(std::move(pHandle), status, requireAuth);
 

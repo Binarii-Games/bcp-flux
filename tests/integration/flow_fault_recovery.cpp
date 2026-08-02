@@ -234,8 +234,10 @@ namespace
                     ++sent;
             }
 
+            client.Flush();
             client.Update();
             client.Poll(sink, 64);
+            server.Flush();
             server.Update();
 
             const uint32_t count = server.Poll(sink, 64);

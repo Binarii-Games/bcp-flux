@@ -63,6 +63,7 @@ int main()
 
     for (int spin = 0; spin < 2000 && !(gotPong && gotExtra); ++spin)
     {
+        b.Flush();
         b.Update();
         const uint32_t countB = b.Poll(inbox, 8);
         for (uint32_t i = 0; i < countB; ++i)
@@ -94,6 +95,7 @@ int main()
             CHECK(!moved.PrepareResponse().Failed());
         }
 
+        a.Flush();
         a.Update();
         const uint32_t countA = a.Poll(inbox, 8);
         for (uint32_t i = 0; i < countA; ++i)

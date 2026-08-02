@@ -64,8 +64,10 @@ int main()
     flux::PacketSlotHandle inbox[8];
     for (int i = 0; i < 200 && !arrived; ++i)
     {
+        a.Flush();
         a.Update();
         a.Poll(inbox, 8);
+        b.Flush();
         b.Update();
 
         const uint32_t count = b.Poll(inbox, 8);

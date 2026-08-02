@@ -89,7 +89,9 @@ static void secure_messages_cross_intact()
     {
         Collect(client, gotByClient);
         Collect(server, gotByServer);
+        client.Flush();
         client.Update();
+        server.Flush();
         server.Update();
         if (flux_net::Established(client, serverAddr) && Received(gotByServer, parked)) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

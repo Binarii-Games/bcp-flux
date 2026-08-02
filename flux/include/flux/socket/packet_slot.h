@@ -59,6 +59,11 @@ namespace bcp::flux
             whether the packet carries the secure framing, not whether the
             payload is ciphertext. */
         bool IsMacOnly() const;
+
+        /** Whether the content is a list of length-prefixed messages rather
+            than one message. Split apart before delivery, so an application
+            never sees one of these. */
+        bool IsBatch() const;
         uint16_t FlowId() const;
         /** The flow sequence number of a flow packet; 0 (the never-sent
             sentinel) when the packet carries no flow or is too short. */

@@ -134,7 +134,9 @@ static void reliable_ordered_flow_delivers_in_order()
         relay.Pump();
         client.Poll(sink, 64);
         server.Poll(sink, 64);
+        client.Flush();
         client.Update();
+        server.Flush();
         server.Update();
         established = Established(client, relayAddr) && Established(server, relayAddr);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -172,7 +174,9 @@ static void reliable_ordered_flow_delivers_in_order()
                 if (reader.TakeU32(seq)) delivered.push_back(seq);
             }
             client.Poll(sink, 64);   // drain acks back to the sender
+            client.Flush();
             client.Update();
+            server.Flush();
             server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -219,7 +223,9 @@ static bool RunSwappedBurst(flux::FlowMode mode, uint16_t clientPort, uint16_t s
         relay.Pump();
         client.Poll(sink, 64);
         server.Poll(sink, 64);
+        client.Flush();
         client.Update();
+        server.Flush();
         server.Update();
         established = Established(client, relayAddr) && Established(server, relayAddr);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -246,7 +252,9 @@ static bool RunSwappedBurst(flux::FlowMode mode, uint16_t clientPort, uint16_t s
             if (reader.TakeU32(seq)) delivered.push_back(seq);
         }
         client.Poll(sink, 64);
+        client.Flush();
         client.Update();
+        server.Flush();
         server.Update();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

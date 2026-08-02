@@ -45,6 +45,7 @@ namespace
         for (int i = 0; i < rounds; ++i)
         {
             a.Poll(sink, 64); b.Poll(sink, 64);
+            a.Flush(); b.Flush();
             a.Update(); b.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -66,6 +67,7 @@ namespace
         bool got = false;
         for (int i = 0; i < 500 && !got; ++i)
         {
+            client.Flush(); server.Flush();
             client.Update(); server.Update();
             const uint32_t n = server.Poll(inbox, 64);
             for (uint32_t k = 0; k < n; ++k)

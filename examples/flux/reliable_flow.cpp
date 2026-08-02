@@ -57,6 +57,7 @@ static void Tick(flux::Socket& socket, const char* name, std::atomic<uint32_t>& 
 
     while (delivered < BURST)
     {
+        socket.Flush();
         socket.Update();
 
         const uint32_t count = socket.Poll(inbox, 16);
@@ -125,6 +126,7 @@ int main()
     flux::PacketSlotHandle sink[8];
     while (deliveredB < BURST || deliveredC < BURST)
     {
+        a.Flush();
         a.Update();
         a.Poll(sink, 8);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

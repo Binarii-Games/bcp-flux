@@ -37,6 +37,13 @@ namespace bcp::flux::internal
         the socket's headers for a wire constant. Controls takes its value from
         this one, so there is a single definition. */
     static constexpr uint8_t  WIRE_CTRL_BATCH               = 0x20;
+
+    /** Ceiling on messages the receive side will split one batch into. A batch
+        is bounded by the datagram, so the real ceiling is how many minimum-size
+        entries fit; this names it so the split can size a fixed array and a
+        malformed count cannot make it unbounded. */
+    static constexpr uint16_t MAX_BATCH_MESSAGES            =
+        MAX_WIRE_PACKET_SIZE / (WIRE_BATCH_LEN_SIZE + 1);
     static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;
     static constexpr uint8_t  MIN_WIRE_SIZE                 = WIRE_CONTROLLER_SIZE;
     /** What a secure packet puts in front of the content: controller and the

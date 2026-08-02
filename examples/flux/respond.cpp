@@ -34,6 +34,7 @@ static void Tick(flux::Socket& socket)
 
     for (;;)
     {
+        socket.Flush();
         socket.Update();
 
         const uint32_t count = socket.Poll(inbox, 8);
@@ -93,6 +94,7 @@ int main()
 
     while (!got)
     {
+        a.Flush();
         a.Update();
         const uint32_t count = a.Poll(inbox, 8);
         for (uint32_t i = 0; i < count && !got; ++i)

@@ -404,15 +404,44 @@ namespace bcp::flux
                                                uint16_t limit) noexcept;
 
         /** Copies the open batch out into `out` and clears it, so the caller can
-            put it through the ordinary admit and seal path.
+            put it through the ordinary admit and seal path. The mode comes back
+            with it because it decides which pool the batch needs on its way to
+            the wire, and reading it separately would mean a second lock.
+
+            @pre Caller holds the peer's lock, so the association cannot be
+                 recycled underneath and the batch cannot belong to a stranger.
 
             @return the byte count written, or 0 when no batch is open. */
         [[nodiscard]] uint16_t TakeBatch(uint32_t assocSlot, uint8_t* out,
-                                         uint16_t capacity) noexcept;
+                                         uint16_t capacity, FlowMode& outMode) noexcept;
 
-        /** Whether this association is holding an unsent batch, so Flush knows
-            there is something to do without taking the write lock. */
-        [[nodiscard]] bool HasOpenBatch(uint32_t assocSlot) noexcept;
+        /** Whether this association would admit one more packet of `wireSize`
+            right now: window, congestion budget and a free ring entry.
+
+            Batching consults this before it accepts a message, because a
+            batched send answers the caller immediately and the gate would
+            otherwise not be reached until the flush, where there is nobody left
+            to tell. A flow that cannot take another packet must refuse at the
+            Send that asked, exactly as it did before batching existed.
+
+            @pre Caller holds the peer's lock. */
+        [[nodiscard]] bool WouldAdmit(const Peer& peer, uint32_t assocSlot,
+                                      uint16_t wireSize) noexcept;
+
+        /** Clears the open batch, but only if it is still the one the caller
+            took. An append that landed in between means the batch has grown, so
+            clearing would drop a message that was never sent. */
+        void ClearBatch(uint32_t assocSlot, uint16_t expectedUsed) noexcept;
+
+        /** Whether this association is holding an unsent batch, and the mode it
+            belongs to, so a flush can get the slot the batch will need before
+            it takes the batch. Taking first and failing to find a slot would
+            throw the messages away.
+
+            The mode may have changed by the time the batch is taken, if the
+            association was recycled in between, which is why TakeBatch reports
+            the mode again for the caller to check against this one. */
+        [[nodiscard]] bool PeekBatch(uint32_t assocSlot, FlowMode& outMode) noexcept;
 
     private:
         common::collections::SlotPool  flowPool_;
@@ -506,6 +535,14 @@ namespace bcp::flux
         /** Commit one packet to the ready queue (Detaches on success so Poll
             rebuilds the handle). False = queue full, caller must not ack it. */
         [[nodiscard]] bool QueueReady(PacketSlotHandle& handle) noexcept;
+
+        /** Expands a batched packet into one ready slot per message, so what
+            the application polls is always a single message and no receiving
+            code has to know batches exist.
+
+            @return false with nothing queued when the pool cannot take them
+                    all, leaving the batch uncommitted so the sender resends. */
+        [[nodiscard]] bool SplitBatchToReady(const PacketSlot& batch) noexcept;
 
         uint32_t DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept;
         uint32_t DeliverOrdered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept;

@@ -62,8 +62,10 @@ namespace
         flux::PacketSlotHandle sink[16];
         for (int i = 0; i < rounds && !got.arrived; ++i)
         {
+            from.Flush();
             from.Update();
             from.Poll(sink, 16);
+            to.Flush();
             to.Update();
 
             const uint32_t count = to.Poll(sink, 16);
@@ -105,7 +107,9 @@ namespace
         flux::PacketSlotHandle sink[16];
         for (int i = 0; i < 400; ++i)
         {
+            a.Flush();
             a.Update(); a.Poll(sink, 16);
+            b.Flush();
             b.Update(); b.Poll(sink, 16);
         }
         for (auto& h : sink) h = flux::PacketSlotHandle::Invalid();
@@ -272,7 +276,9 @@ int main()
                     ++sent;
             }
 
+            c.Flush();
             c.Update(); c.Poll(sink, 64);
+            d.Flush();
             d.Update();
 
             const uint32_t count = d.Poll(sink, 64);

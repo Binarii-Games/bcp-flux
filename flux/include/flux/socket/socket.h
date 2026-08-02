@@ -311,6 +311,20 @@ namespace bcp::flux
                    behaviour. */
         void Update(uint64_t nowOverride = 0);
 
+        /** Puts every flow's part-filled batch on the wire.
+
+            A flow send is packed into a batch rather than sent, so several
+            small messages share one datagram, one seal and one staging slot.
+            Nothing leaves until a batch fills or this is called, which makes
+            the moment bytes go out something the caller chooses rather than
+            something a timer decides. Drive it beside Update and Poll: send
+            what the tick produced, then Flush.
+
+            There is deliberately no automatic flush. One that fired sometimes
+            would make send timing unpredictable and would hide a forgotten
+            call rather than surfacing it. */
+        void Flush();
+
         /** Soonest future deadline across all flows, absolute monotonic micros,
             or 0 when nothing is pending. Best-effort, for a blocking app to wait
             on. */
@@ -502,6 +516,23 @@ namespace bcp::flux
             status says why. */
         PacketSlotHandle PreProcessOut(PacketSlotHandle pHandle, common::Error& status,
                                        bool requireAuth = false);
+
+        /** Offers a flow packet's payload to that flow's open batch.
+
+            @return false when the batch cannot take it and the caller should
+                    send the packet the ordinary way: not a flow packet, the
+                    peer still handshaking (the ordinary path parks it), or no
+                    association yet (the ordinary path creates one). True means
+                    the message is accounted for and `status` says how it went.
+
+            Locks in the standard order, packet then peer then flow, and holds
+            no peer lock across a send. */
+        [[nodiscard]] bool OfferToBatch(PacketSlotHandle& pHandle, bool requireAuth,
+                                        common::Error& status);
+
+        /** Takes one association's open batch under the peer borrow and sends it
+            with nothing held. Gather under the lock, send after release. */
+        common::Error FlushOneBatch(const Address& to, uint32_t assocSlot);
 
         /** Retransmit: re-seal a retained body from its staging slot under a
             fresh nonce (same seq) to the peer's CURRENT address. Locks staging

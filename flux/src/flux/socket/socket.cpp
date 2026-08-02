@@ -7,6 +7,7 @@
 #include <flux/socket/platform/posix_socket.h>
 #include <flux/internal/constants.h>
 #include <flux/wire/packet_builder.h>
+#include <flux/wire/batch.h>
 #include <flux/socket/packet_slot.h>
 #include <flux/socket/pending_packet.h>
 #include <flux/peer/peer_handle.h>
@@ -652,6 +653,163 @@ namespace bcp::flux
         return flows_.AcquireStagingWriter();
     }
 
+    bool Socket::OfferToBatch(PacketSlotHandle& pHandle, bool requireAuth,
+                              common::Error& status)
+    {
+        if (!initialized_.load(std::memory_order_acquire) || !flows_.SendEnabled())
+            return false;
+
+        const PacketSlot* packet = pHandle.Read();
+        if (!packet || !packet->HasFlow() || packet->IsInternal() || !packet->IsSecure())
+            return false;
+
+        // A message the caller framed itself as part of a larger one keeps its
+        // own packet. The framing bits live on the packet and describe its first
+        // and last message, so several hand-framed pieces sharing one could not
+        // each say what they are. Batching is for whole messages.
+        const uint8_t flowData = packet->FlowData();
+        if ((flowData & (FLOW_PART_MORE | FLOW_PART_CONT)) != 0)
+            return false;
+
+        const uint16_t flowId = packet->FlowId();
+        const Address  to     = packet->address;
+
+        // Under the peer borrow only long enough to find the association. The
+        // append takes the flow lock after this closes, which keeps the order
+        // packet then peer then flow.
+        uint32_t assocSlot = common::collections::SlotPool::INVALID;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(to);
+            if (peerHandle.Failed()) return false;
+            const Peer* peer = peerHandle.Read();
+            if (!peer || !peer->IsValid()) return false;   // handshaking: the ordinary path parks it
+            if (requireAuth && !peer->authenticated) return false;   // and reports it
+            assocSlot = flows_.FindOutAssoc(peerHandle.GetSlotIndex(), flowId);
+
+            // The gate has to answer the caller, not the flush. A batched send
+            // returns Ok the moment it is packed, so if this flow could not
+            // admit another packet the message must go the ordinary way and let
+            // the caller see the refusal, exactly as it did before batching.
+            if (assocSlot != common::collections::SlotPool::INVALID
+             && !flows_.WouldAdmit(*peer, assocSlot, packet->dataSize))
+                return false;
+        }
+        if (assocSlot == common::collections::SlotPool::INVALID)
+            return false;   // first send on this flow: the ordinary path creates the association
+
+        FlowTable::BatchAdmit admitted =
+            flows_.AppendToBatch(assocSlot, *packet, internal::MAX_WIRE_PACKET_SIZE);
+
+        if (admitted == FlowTable::BatchAdmit::Sealed)
+        {
+            // Full. Send what is there, then this message opens the next batch.
+            status = FlushOneBatch(to, assocSlot);
+            if (status != common::Error::Ok) return true;
+            admitted = flows_.AppendToBatch(assocSlot, *packet, internal::MAX_WIRE_PACKET_SIZE);
+        }
+
+        if (admitted != FlowTable::BatchAdmit::Appended)
+            return false;   // it will not batch at all, so let it fly on its own
+
+        status = common::Error::Ok;
+        return true;
+    }
+
+    common::Error Socket::FlushOneBatch(const Address& to, uint32_t assocSlot)
+    {
+        // The slot comes first, then the batch. Taking the batch empties it, so
+        // a dry pool after that point would throw away messages the caller was
+        // told had been accepted. This way a dry pool simply leaves the batch
+        // where it is, to go out on the next flush.
+        FlowMode mode = FlowMode::RELIABLE_ORDERED;
+        if (!flows_.PeekBatch(assocSlot, mode)) return common::Error::Ok;
+
+        // A reliable batch is its own retransmit source and must outlive the
+        // send, so it goes to staging. An unreliable one is gone once on the
+        // wire and takes an ordinary kernel slot. Acquired with no peer lock
+        // held, since a slot lock is taken before a peer lock, never after.
+        common::Result<PacketSlotWriter> out = mode == FlowMode::UNRELIABLE
+            ? kernel_->Write() : flows_.AcquireStagingWriter();
+        if (out.isErr()) return out.error;   // batch untouched, retried next flush
+
+        PacketSlotHandle handle = std::move(out.Take()).ExtractHandle();
+        PacketSlot* slot = handle.Write();
+        if (!slot) return common::Error::InvalidState;
+
+        // Gather under the borrow, send after it closes.
+        FlowMode taken = mode;
+        uint16_t size  = 0;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(to);
+            if (peerHandle.Failed() || !peerHandle.Read()) return common::Error::Ok;
+            size = flows_.TakeBatch(assocSlot, slot->data,
+                                    internal::MAX_WIRE_PACKET_SIZE, taken);
+        }
+        if (size == 0) return common::Error::Ok;
+        if (taken != mode)
+            return common::Error::InvalidState;   // recycled under us: wrong pool, drop rather than mis-send
+
+        slot->dataSize = size;
+        slot->address  = to;
+
+        // SendNow, not Send: this came out of a batch and offering it back to
+        // the one it came from would loop.
+        const common::Error sent = sender_.SendNow(std::move(handle));
+
+        // Only now is the batch spent. A refusal here means nothing reached the
+        // wire, so leaving it in place sends it on the next flush instead of
+        // discarding messages the caller was told had been accepted.
+        if (sent == common::Error::Ok)
+            flows_.ClearBatch(assocSlot, size);
+        return sent;
+    }
+
+    void Socket::Flush()
+    {
+        // Associations one peer can have a batch flushed for in a single pass.
+        // The rest ride the next one, which costs a loop of latency and cannot
+        // lose anything, since an unflushed batch stays where it is.
+        static constexpr uint32_t MAX_FLUSH_PER_PEER = 32;
+
+        if (!initialized_.load(std::memory_order_acquire) || !flows_.SendEnabled())
+            return;
+
+        uint32_t cursor = 0;
+        for (;;)
+        {
+            Address batch[32];
+            const uint32_t count = peers_.CollectAddresses(cursor, batch, 32);
+            if (count == 0) break;
+
+            for (uint32_t b = 0; b < count; ++b)
+            {
+                // One borrow per peer, not one per flow. Which associations are
+                // holding anything is decided here under that single borrow,
+                // and only those are sent afterwards with nothing held. A flush
+                // on a socket with nothing waiting costs a peer read and a
+                // handful of association reads, which matters because this is
+                // called every time round the caller's loop.
+                uint32_t holding[MAX_FLUSH_PER_PEER];
+                uint32_t count_ = 0;
+                {
+                    PeerHandle peerHandle = peers_.GetPeer(batch[b]);
+                    if (peerHandle.Failed() || !peerHandle.Read()) continue;
+                    const uint32_t peerSlot = peerHandle.GetSlotIndex();
+                    for (uint32_t i = 0; i < flows_.MaxOutPerPeer()
+                                      && count_ < MAX_FLUSH_PER_PEER; ++i)
+                    {
+                        const uint32_t assocSlot = flows_.OutAssocAt(peerSlot, i);
+                        if (assocSlot == common::collections::SlotPool::INVALID) continue;
+                        FlowMode mode = FlowMode::RELIABLE_ORDERED;
+                        if (flows_.PeekBatch(assocSlot, mode)) holding[count_++] = assocSlot;
+                    }
+                }
+                for (uint32_t k = 0; k < count_; ++k)
+                    (void)FlushOneBatch(batch[b], holding[k]);
+            }
+        }
+    }
+
     PacketSlotHandle Socket::PreProcessOut(PacketSlotHandle pHandle, common::Error& status,
                                             bool requireAuth)
     {
@@ -1214,6 +1372,15 @@ namespace bcp::flux
         const uint8_t  flowData = packet->FlowData();
         const Address  from     = packet->address;
         if (flowId == internal::INVALID_FLOW_ID || seq == 0) return 0;
+
+        // A batch is only as trustworthy as its length chain. Checked here,
+        // before the flow machinery sees it, so a damaged one is never
+        // committed to the seen bitmap and the sender resends it rather than
+        // being told it arrived.
+        if (packet->IsBatch()
+         && !wire::BatchValidate(packet->Content(packet->ContentOffset()),
+                                 static_cast<uint16_t>(packet->ContentLength())))
+            return 0;
 
         uint32_t flowSlot = common::collections::SlotPool::INVALID;
         bool     reject   = false;
@@ -2103,6 +2270,12 @@ namespace bcp::flux
     {
         if (!initialized_.load(std::memory_order_acquire) || !flows_.SendEnabled())
             return common::Error::NotInitialized;
+
+        // Anything still sitting in a batch goes now. Its association is about
+        // to be torn down and the batch would go with it, which on a reliable
+        // flow would silently lose messages the caller was told were accepted.
+        Flush();
+
         if (!flows_.BeginClose(flow))
             return common::Error::InvalidState;   // stale handle, or already closing
 
