@@ -1,8 +1,10 @@
 // A receiving ordered flow that pins recv slots behind a gap the sender never
-// fills is jammed. The tick reclaims it after Config::liveness stall timeout.
-// The contract (ARCHITECTURE 3.6, "Delivering an in-flow packet"): a stuck
-// cursor holding a gap is reclaimed; a flow still making progress, or one that
-// finished, is left alone.
+// fills is jammed. After Config::liveness stall timeout the tick frees what it
+// buffered and leaves the association standing. The contract (ARCHITECTURE 3.6,
+// "Delivering an in-flow packet"): a stuck cursor holding a gap gives up its
+// buffered packets, keeps its cursor and epoch so the sender can resend into
+// the same gap, and a flow still making progress or already finished is left
+// alone.
 //
 // A jam is held open by giving the sender a very long retransmit interval, so
 // the one dropped cursor packet is not resent within the test. The receiver's
@@ -104,8 +106,9 @@ namespace
     }
 }
 
-// 1. A jammed flow is reclaimed once the stall timeout passes.
-static void JammedFlowEvicted()
+// 1. A jammed flow gives up what it buffered once the stall timeout passes, and
+//    keeps its association.
+static void JammedFlowKeepsAssociation()
 {
     const uint16_t CLIENT = 20860, SERVER = 20861;
     flux::Socket client, server;
@@ -131,7 +134,8 @@ static void JammedFlowEvicted()
     {
         client.Flush();
         client.Update();
-        delivered += server.Poll(inbox, 64);
+        flux::PollCursor cursor = server.Poll(inbox, 64);
+        delivered += cursor.PacketCount();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
@@ -148,7 +152,11 @@ static void JammedFlowEvicted()
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
-    CHECK(server.ReceivingFlowCount(clientAddr) == 0);  // reclaimed
+    // The buffered packets are gone, but the association is not. Destroying it
+    // would restart this side at sequence one while the sender is far past
+    // that, and nothing either of them sent afterwards could line up again.
+    CHECK(server.ReceivingFlowCount(clientAddr) == 1);
+    CHECK(Established(server, clientAddr));
 
     client.Shutdown();
     server.Shutdown();
@@ -192,10 +200,10 @@ static void ProgressingFlowSpared()
         client.Update(); client.Poll(inbox, 64);
         server.Flush();
         server.Update();
-        const uint32_t got_n = server.Poll(inbox, 64);
-        for (uint32_t i = 0; i < got_n; ++i)
+        flux::PollCursor cursor = server.Poll(inbox, 64);
+        while (cursor.Next())
         {
-            flux::PacketSlotReader r{ std::move(inbox[i]) };
+            flux::PacketSlotReader& r = cursor.Message();
             uint32_t v = 0;
             if (r.TakeU32(v) && v < BURST && !got[v]) { got[v] = true; ++delivered; }
         }
@@ -213,7 +221,7 @@ static void ProgressingFlowSpared()
     server.Shutdown();
 }
 
-// 3. Evicting one peer's jammed flow leaves its healthy sibling and the peer
+// 3. Reclaiming one peer's jammed flow leaves its healthy sibling and the peer
 //    itself untouched.
 static void SiblingSurvives()
 {
@@ -241,10 +249,10 @@ static void SiblingSurvives()
         client.Update(); client.Poll(inbox, 64);
         server.Flush();
         server.Update();
-        const uint32_t got_n = server.Poll(inbox, 64);
-        for (uint32_t k = 0; k < got_n; ++k)
+        flux::PollCursor cursor = server.Poll(inbox, 64);
+        while (cursor.Next())
         {
-            flux::PacketSlotReader r{ std::move(inbox[k]) };
+            flux::PacketSlotReader& r = cursor.Message();
             uint32_t v = 0;
             if (r.TakeU32(v) && v < HEALTHY_N && !got[v]) { got[v] = true; ++healthyDelivered; }
         }
@@ -279,7 +287,7 @@ static void SiblingSurvives()
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
-    CHECK(server.ReceivingFlowCount(clientAddr) == 1);   // healthy survives
+    CHECK(server.ReceivingFlowCount(clientAddr) == 2);   // both stand
     CHECK(Established(server, clientAddr));               // peer intact
 
     client.Shutdown();
@@ -288,7 +296,7 @@ static void SiblingSurvives()
 
 int main()
 {
-    JammedFlowEvicted();
+    JammedFlowKeepsAssociation();
     ProgressingFlowSpared();
     SiblingSurvives();
     return test::report();

@@ -129,14 +129,14 @@ namespace
         flux::PacketSlotHandle inbox[64];
         while (!stop.load(std::memory_order_relaxed))
         {
-            const uint32_t count = socket.Poll(inbox, 64);
-            for (uint32_t i = 0; i < count; ++i)
+            flux::PollCursor cursor = socket.Poll(inbox, 64);
+            while (cursor.Next())
             {
-                const flux::PacketSlot* packet = inbox[i].Read();
-                if (!packet) { inbox[i] = flux::PacketSlotHandle::Invalid(); continue; }
+                const flux::PacketSlot* packet = cursor.Packet().Read();
+                if (!packet) continue;
 
-                const uint8_t* body   = packet->Content(packet->ContentOffset());
-                const size_t   length = packet->ContentLength();
+                const uint8_t* body   = cursor.Message().Content();
+                const size_t   length = cursor.Message().ContentLength();
                 if (body && length == 6 + FILL_BYTES)
                 {
                     Received got{};
@@ -152,8 +152,10 @@ namespace
                     out.push_back(got);
                     collected.fetch_add(1, std::memory_order_relaxed);
                 }
-                inbox[i] = flux::PacketSlotHandle::Invalid();
             }
+            // Released once the cursor is spent, because a message read out of
+            // a batch lives in the slot the cursor is walking.
+            for (auto& handle : inbox) handle = flux::PacketSlotHandle::Invalid();
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         for (auto& handle : inbox) handle = flux::PacketSlotHandle::Invalid();
@@ -164,8 +166,8 @@ namespace
         flux::PacketSlotHandle inbox[64];
         while (!stop.load(std::memory_order_relaxed))
         {
-            const uint32_t count = socket.Poll(inbox, 64);
-            for (uint32_t i = 0; i < count; ++i) inbox[i] = flux::PacketSlotHandle::Invalid();
+            socket.Poll(inbox, 64);
+            for (auto& handle : inbox) handle = flux::PacketSlotHandle::Invalid();
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         for (auto& handle : inbox) handle = flux::PacketSlotHandle::Invalid();

@@ -191,7 +191,7 @@ namespace bcp::flux
         peers_.Shutdown();
         flows_.Shutdown();
         pendingPool_.Shutdown();
-        readyQueue_.Shutdown();
+        readyLanes_.Shutdown();
         if (kernel_)
         {
             kernel_->Close();
@@ -219,7 +219,18 @@ namespace bcp::flux
 
         // The ready path holds recv-slot indices, so it can never need more
         // entries than there are recv slots.
-        if (!readyQueue_.Init(config.recvSlotCount))
+        // Rounding a lane count up would hand out fewer identities than lanes,
+        // and the leftover lane fills with packets nobody ever pops until the
+        // receive pool is dry and the socket goes quiet. Refuse instead.
+        if (config.pollLanes == 0 || config.pollLanes > ReadyLanes::MAX_LANES
+            || (config.pollLanes & (config.pollLanes - 1)) != 0)
+            return common::Error::InvalidParam;
+
+        // A lane per draining thread, each sized for the whole receive pool.
+        // Sharing one pool's worth between them would let a push fail on a busy
+        // lane while another sat empty, and a push that fails is a packet
+        // dropped after the sender was told it arrived.
+        if (!readyLanes_.Init(config.pollLanes, config.recvSlotCount))
             return common::Error::NotInitialized;
         if (listener_.Init(kernel_.get()) != common::Error::Ok)
             return common::Error::NotInitialized;
@@ -313,7 +324,7 @@ namespace bcp::flux
         params.maxAttempts         = config.timers.maxAttempts;
         params.flowStallTimeoutMicros = config.liveness.flowStallTimeoutMicros;
 
-        if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyQueue_);
+        if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyLanes_);
             error != common::Error::Ok)
             return error;
 
@@ -1094,7 +1105,7 @@ namespace bcp::flux
         return PreProcessOut(std::move(pHandle), status, requireAuth);
     }
 
-    void Socket::SealStagingToWire(const Address& to, const PacketSlot& staging,
+    bool Socket::SealStagingToWire(const Address& to, const PacketSlot& staging,
                                     const PeerSendMaterials& materials)
     {
         const bool tagged = staging.IsTagged();
@@ -1103,13 +1114,13 @@ namespace bcp::flux
             : internal::WIRE_SECURE_HEAD_SIZE;
         if (staging.dataSize < headerSize
             || staging.dataSize > internal::MAX_WIRE_PACKET_SIZE)
-            return;
+            return false;
 
         common::Result<PacketSlotWriter> out = kernel_->Write();
-        if (out.isErr()) return;
+        if (out.isErr()) return false;   // send pool dry: nothing went anywhere
         PacketSlotHandle wireHandle = std::move(out.Take()).ExtractHandle();
         PacketSlot* wire = wireHandle.Write();
-        if (!wire) return;
+        if (!wire) return false;
 
         // Fresh nonce, current tag, current address `to`; the body's seq is
         // whatever the caller left there. The caller's lock on the staging
@@ -1129,10 +1140,11 @@ namespace bcp::flux
                              materials, tagged);
         }
 
-        (void)kernel_->SendTo(wire->address.addr, wire->data, wire->dataSize);
+        return kernel_->SendTo(wire->address.addr, wire->data, wire->dataSize)
+               == common::Error::Ok;
     }
 
-    void Socket::ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
+    bool Socket::ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
                                 uint32_t expectedSeq, const PeerSendMaterials& materials)
     {
         // The staging slot travels as a bare index; touchable only through a
@@ -1140,13 +1152,18 @@ namespace bcp::flux
         // exit. Handle read-lock first, THEN flow (staging->peer->flow order).
         PacketSlotHandle stagingHandle{stagingSlot, flows_.StagingPool()};
         const PacketSlot* staging = stagingHandle.Read();
-        if (!staging) return;
+        if (!staging) return false;
 
         // Validate the ring still owns this slot at this seq: a concurrent ack
         // may have resolved it (and recycled the slot) since the caller scanned.
+        // A seq the ring no longer owns was resolved while this pass ran. That
+        // is not a failed attempt, and the entry it would refund no longer
+        // exists, so it reports sent.
+        bool sent = true;
         if (flows_.ResendStillValid(flowSlot, expectedSeq, stagingSlot))
-            SealStagingToWire(to, *staging, materials);
+            sent = SealStagingToWire(to, *staging, materials);
         (void)stagingHandle.Detach();   // the ring keeps the lease
+        return sent;
     }
 
     void Socket::SendSecureControl(const Address& to, const PeerSendMaterials& materials,
@@ -1181,14 +1198,15 @@ namespace bcp::flux
 
 // --- Receive path ---
 
-    uint32_t Socket::Poll(PacketSlotHandle* outPackets, size_t max)
+    PollCursor Socket::Poll(PacketSlotHandle* outPackets, size_t max,
+                            ThreadIdentity identity)
     {
         // Per-Poll-pass migration budget on this thread's stack. Under the
         // fully-concurrent contract several threads may Poll at once, so the
         // budget must not be a shared member; the immutable per-socket ceiling
         // seeds a fresh local each pass.
         if (!initialized_.load(std::memory_order_relaxed))
-            return 0;
+            return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
 
         uint32_t migrateBudget = migrateBudgetPerPoll_;
 
@@ -1239,16 +1257,25 @@ namespace bcp::flux
         // handle over it. Leftovers stay queued for the next Poll. Delivered
         // handles are stamped with this socket, which is what lets
         // PrepareResponse build a reply from the packet alone.
+        // Claim before draining, and the cursor holds it until the caller is
+        // done reading. A lane nobody claims is simply taken by whichever
+        // thread arrives next, so no lane silts up because a thread stopped
+        // calling, and preferring the caller's last lane keeps a thread on one
+        // lane while nothing contends.
+        const uint32_t lane = readyLanes_.Claim(identity.lane);
+        if (lane == ReadyLanes::NO_LANE)
+            return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
+
         size_t delivered = 0;
         uint32_t idx = 0;
-        while (delivered < max && readyQueue_.Pop(idx))
+        while (delivered < max && readyLanes_.Pop(lane, idx))
         {
             outPackets[delivered] = PacketSlotHandle{ idx, recvPool_ };
             outPackets[delivered].BindSocket(this);
             ++delivered;
         }
 
-        return static_cast<uint32_t>(delivered);
+        return PollCursor{&readyLanes_, lane, outPackets, static_cast<uint32_t>(delivered)};
     }
 
     bool Socket::PreProcessIn(PacketSlotHandle& pHandle, uint32_t& migrateBudget)
@@ -1366,7 +1393,7 @@ namespace bcp::flux
         if (!packet) return;
         const Address from = packet->address;
 
-        PacketSlotReader reader{std::move(pHandle)};
+        PacketSlotReader reader{pHandle};
         uint8_t opcode;
         if (!reader.TakeU8(opcode)) return;
 
@@ -1415,7 +1442,12 @@ namespace bcp::flux
     {
         const uint32_t idx = handle.GetSlotIndex();
         if (idx == common::collections::SlotPool::INVALID) return false;
-        if (!readyQueue_.Push(idx)) return false;   // full: backpressure, caller drops
+        const PacketSlot* packet = handle.Read();
+        if (!packet) return false;
+        // A non-flow packet carries no sequence, so there is no order to keep.
+        // Hashing the address only keeps one sender's traffic landing together.
+        const uint32_t lane = readyLanes_.LaneOf(packet->address.hash());
+        if (!readyLanes_.Push(lane, idx)) return false;   // full: backpressure, caller drops
         (void)handle.Detach();                      // queued; must not release the slot
         return true;
     }
@@ -1441,8 +1473,9 @@ namespace bcp::flux
                                  static_cast<uint16_t>(packet->ContentLength())))
             return 0;
 
-        uint32_t flowSlot = common::collections::SlotPool::INVALID;
-        bool     reject   = false;
+        uint32_t flowSlot  = common::collections::SlotPool::INVALID;
+        uint32_t flowEpoch = 0;
+        bool     reject    = false;
         PeerSendMaterials rejectMaterials;
         {
             PeerHandle peerHandle = peers_.GetPeer(from);
@@ -1454,8 +1487,8 @@ namespace bcp::flux
             if (!peer || !peer->IsValid()) return 0;
 
             const uint32_t peerSlot = peerHandle.GetSlotIndex();
-            if (flows_.AdmitIn(peerSlot, from, peer->id, flowId, flowData, flowSlot)
-                == FlowAdmit::Rejected)
+            if (flows_.AdmitIn(peerSlot, from, peer->id, flowId, flowData,
+                               flowSlot, flowEpoch) == FlowAdmit::Rejected)
             {
                 // An undecodable flow data byte, or caps. Tell the sender so it
                 // stops rather than retransmitting into silence.
@@ -1480,7 +1513,7 @@ namespace bcp::flux
 
         if (flowSlot == common::collections::SlotPool::INVALID) return 0;
 
-        return flows_.DeliverIn(flowSlot, flowId, seq, incoming);
+        return flows_.DeliverIn(flowSlot, flowId, flowEpoch, seq, incoming);
     }
 
     bool Socket::TryMigrate(PacketSlotHandle& pHandle, uint32_t& migrateBudget)
@@ -2428,9 +2461,11 @@ namespace bcp::flux
     void Socket::Flow_Ack(const Address& from, const uint8_t* payload, size_t len)
     {
         // Answers OUR sent packets: OUT side. Body is a run of
-        // [flowId(2)][epoch(1)][rangeCount(1)][first(4),last(4)]*count for one
-        // peer. The epoch names which generation of that id the ranges belong
-        // to, and an entry naming any other one resolves nothing.
+        // [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][first(4),last(4)]*count
+        // for one peer. The epoch names which generation of that id the entry
+        // belongs to, and an entry naming any other one resolves nothing.
+        // recvNext is the remote's delivery cursor: everything below it has
+        // been handed to its application and can never be asked for again.
         if (!flows_.SendEnabled()) return;
         const uint64_t now = common::MonotonicMicros();
 
@@ -2446,13 +2481,17 @@ namespace bcp::flux
         const uint32_t peerSlot = peerHandle.GetSlotIndex();
 
         size_t off = 0;
-        while (off + 4 <= len)
+        while (off + internal::WIRE_ACK_ENTRY_HEAD_SIZE <= len)
         {
             const uint16_t flowId = static_cast<uint16_t>(payload[off])
                                   | static_cast<uint16_t>(payload[off + 1]) << 8;
             const uint8_t flowEpoch = payload[off + 2] & FLOW_EPOCH_MASK;
             uint8_t rangeCount = payload[off + 3];
-            off += 4;
+            const uint32_t remoteRecvNext = static_cast<uint32_t>(payload[off + 4])
+                                          | static_cast<uint32_t>(payload[off + 5]) << 8
+                                          | static_cast<uint32_t>(payload[off + 6]) << 16
+                                          | static_cast<uint32_t>(payload[off + 7]) << 24;
+            off += internal::WIRE_ACK_ENTRY_HEAD_SIZE;
             if (rangeCount > internal::FLOW_ACK_RANGE_COUNT) break;   // malformed: apply what we have
 
             AckRange ranges[internal::FLOW_ACK_RANGE_COUNT];
@@ -2472,7 +2511,8 @@ namespace bcp::flux
             }
             if (truncated) break;
 
-            flows_.ApplyAckRanges(peerSlot, flowId, flowEpoch, ranges, rangeCount, now, ccDelta);
+            flows_.ApplyAckRanges(peerSlot, flowId, flowEpoch, remoteRecvNext,
+                                  ranges, rangeCount, now, ccDelta);
         }
 
         // Apply the gathered feedback once, on the same handle upgraded to
@@ -2819,9 +2859,9 @@ namespace bcp::flux
                 // a racing DeliverIn may have moved the cursor meanwhile.
                 if (jammed)
                 {
-                    PeerHandle evictHandle = peers_.GetPeer(addr);
-                    if (!evictHandle.Failed() && evictHandle.Write())
-                        (void)flows_.EvictJammedInFlows(evictHandle.GetSlotIndex(),
+                    PeerHandle reclaimHandle = peers_.GetPeer(addr);
+                    if (!reclaimHandle.Failed() && reclaimHandle.Write())
+                        (void)flows_.ReclaimJammedInFlows(reclaimHandle.GetSlotIndex(),
                                                         Now(nowOverride));
                 }
             }
@@ -2913,8 +2953,17 @@ namespace bcp::flux
         // does nothing, so the next tick uses the new address. Resends therefore
         // always target the live location, never the one frozen into the staging
         // slot at first send.
+        // An attempt is only spent when the bytes leave. A dry send pool or a
+        // refused syscall costs the flow nothing, or a peer under load would
+        // exhaust its retries against its own backpressure and fail a flow that
+        // never had a packet dropped.
+        uint32_t unsentSeqs[FlowTable::RESENDS_PER_ASSOC_PER_TICK];
+        uint32_t unsentN = 0;
         for (uint32_t i = 0; i < resendN; ++i)
-            ResendStaging(addr, flowSlot, resendSlots[i], resendSeqs[i], resendMaterials[i]);
+            if (!ResendStaging(addr, flowSlot, resendSlots[i], resendSeqs[i], resendMaterials[i]))
+                unsentSeqs[unsentN++] = resendSeqs[i];
+        if (unsentN > 0)
+            flows_.RefundResendAttempts(flowSlot, unsentSeqs, unsentN);
         for (uint32_t i = 0; i < resendN; ++i)
             common::crypto::Wipe(resendMaterials[i].key.data(), resendMaterials[i].key.size());
     }

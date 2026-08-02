@@ -100,15 +100,14 @@ int main()
         b.Flush();
         b.Update();
 
-        const uint32_t count = b.Poll(inbox, 64);
-        for (uint32_t i = 0; i < count; ++i)
+        flux::PollCursor cursor = b.Poll(inbox, 64);
+        while (cursor.Next())
         {
-            const flux::PacketSlot* packet = inbox[i].Read();
+            const flux::PacketSlot* packet = cursor.Packet().Read();
             if (!packet) continue;
 
-            const size_t   offset = packet->ContentOffset();
-            const uint8_t* body   = packet->Content(offset);
-            const size_t   length = packet->ContentLength();
+            const uint8_t* body   = cursor.Message().Content();
+            const size_t   length = cursor.Message().ContentLength();
             const flux::FlowPart part = packet->Part();
 
             // Three lines cover all four cases. Clearing on an opening packet

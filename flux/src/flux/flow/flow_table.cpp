@@ -49,6 +49,7 @@ namespace bcp::flux
 
             assoc->nextSeq      = 1;
             assoc->unresolved   = 0;
+            assoc->ackBase      = 1;
             assoc->srttMicros   = 0;
             assoc->rttvarMicros = 0;
             assoc->inflightCap  = inflightCap;
@@ -67,7 +68,8 @@ namespace bcp::flux
 
             InFlightEntry* inFlight = assoc->InFlight();
             for (uint32_t i = 0; i < inflightCap; ++i)
-                inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID, 0, 0 };
+                inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID,
+                                             0, 0, false };
             WaitingEntry* waiting = assoc->Waiting();
             for (uint32_t i = 0; i < waitingCap; ++i)
                 waiting[i] = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };
@@ -158,6 +160,14 @@ namespace bcp::flux
         bool AlreadySeen(const InAssociation* flow, uint32_t seq)
         {
             const uint32_t bits = flow->windowBits;
+            // Above everything seen so far is new by definition, and the bitmap
+            // cannot say otherwise: it is indexed seq & (bits - 1), so a
+            // sequence one window ahead lands on the bit an old one set and
+            // would read as a duplicate. CommitSeen is what retires those stale
+            // bits as the window slides, and it runs only once a packet is
+            // accepted, so treating this as seen would keep the window from
+            // ever moving again.
+            if (seq > flow->recvHighest) return false;
             const uint32_t floor = flow->recvHighest >= bits
                 ? flow->recvHighest - bits + 1 : 1;
             if (seq < floor) return true;                       // below window
@@ -203,6 +213,18 @@ namespace bcp::flux
             for (uint8_t i = 0; i < count; ++i)
                 if (seq >= ranges[i].first && seq <= ranges[i].last) return true;
             return false;
+        }
+
+        /** Age of a timestamp, floored at zero.
+
+            Both clocks are unsigned and a reader takes its `now` before it
+            takes the lock the timestamp is written under, so a writer that
+            lands in between leaves `then` in the future. Subtracting straight
+            would wrap to nearly 2^64 and read as older than any timeout, which
+            turns a flow that is making progress into one that looks stalled. */
+        uint64_t Elapsed(uint64_t now, uint64_t then) noexcept
+        {
+            return now > then ? now - then : 0;
         }
 
         /** RTT smoothing (Jacobson/Karels), microseconds. */
@@ -287,6 +309,7 @@ namespace bcp::flux
             entry.packetSlot   = stagingSlot;   // INVALID for an unreliable flow
             entry.wireSize     = wireSize;
             entry.retries      = 0;
+            entry.acked        = false;
 
             flow.unresolved += 1;
             peer.bytesInFlight += wireSize;      // congestion spend
@@ -322,14 +345,14 @@ namespace bcp::flux
     common::Error FlowTable::Init(const Params& params,
                                   common::collections::SlotPool* recvPool,
                                   common::collections::SlotPool* sendPool,
-                                  common::collections::FifoQueue<uint32_t>* readyQueue) noexcept
+                                  ReadyLanes* readyLanes) noexcept
     {
         if (params.outCount == 0 && params.inCount == 0)
             return common::Error::Ok;   // flows disabled entirely
 
         recvPool_   = recvPool;
         sendPool_   = sendPool;
-        readyQueue_ = readyQueue;
+        readyLanes_ = readyLanes;
 
         // Fixed, not configured: nothing carries the window on the wire, so two
         // sockets that disagreed could never find out. See internal::FLOW_WINDOW.
@@ -413,6 +436,7 @@ namespace bcp::flux
         {
             if (params.maxInPerPeer == 0)
                 return common::Error::InvalidParam;
+
             // The reorder hold-back is as deep as the window (ReorderCapFor), so
             // a bulk slot now dwarfs a standard one on the hold-back ring, not
             // just the bitmap. Two strides, like the sending pool, keep an
@@ -454,7 +478,7 @@ namespace bcp::flux
         // SendEnabled and ReceiveEnabled report the table disabled.
         recvPool_   = nullptr;
         sendPool_   = nullptr;
-        readyQueue_ = nullptr;
+        readyLanes_ = nullptr;
         maxOutAssocPerPeer_ = 0;
         maxInAssocPerPeer_  = 0;
     }
@@ -832,7 +856,7 @@ namespace bcp::flux
             const InAssociation* flow = reinterpret_cast<const InAssociation*>(
                 inAssocPool_.ReadLock(dir[i].flowSlot));
             if (flow->newSinceFlush > 0 &&
-                now - flow->ackArmedMicros >= ackDelayMicros_)
+                Elapsed(now, flow->ackArmedMicros) >= ackDelayMicros_)
                 ackDue = true;
             inAssocPool_.UnlockRead(dir[i].flowSlot);
         }
@@ -847,7 +871,7 @@ namespace bcp::flux
         // not filling the gap and never will.
         return flow->reorderCap > 0
             && flow->recvHighest >= flow->recvNext
-            && now - flow->lastProgressMicros > flowStallTimeout_;
+            && Elapsed(now, flow->lastProgressMicros) > flowStallTimeout_;
     }
 
     bool FlowTable::AnyJammed(uint32_t peerSlot, uint64_t now) noexcept
@@ -866,14 +890,19 @@ namespace bcp::flux
         return jammed;
     }
 
-    uint32_t FlowTable::EvictJammedInFlows(uint32_t peerSlot, uint64_t now) noexcept
+    uint32_t FlowTable::ReclaimJammedInFlows(uint32_t peerSlot, uint64_t now) noexcept
     {
         // Runs under the peer's write lock, exactly like the peer-teardown
-        // sweep, so the flow locks nest correctly (peer -> flow) and no admit
-        // can publish a slot while this frees one. The condition is re-checked
-        // under the write lock, because a racing DeliverIn may have advanced
-        // the cursor since the read scan flagged this peer.
-        uint32_t evicted = 0;
+        // sweep, so the flow locks nest correctly (peer -> flow). The condition
+        // is re-checked under the write lock, because a racing DeliverIn may
+        // have advanced the cursor since the read scan flagged this peer.
+        //
+        // Only the buffered packets go. The association stays, because its
+        // cursor, epoch and identity are what let the sender resend into the
+        // same gap. Rebuilding it would start the receiver at sequence one
+        // against a sender already far past that, and every packet after would
+        // land outside the window with no way for either side to notice.
+        uint32_t reclaimed = 0;
         FlowDirEntry* dir = InDirFor(peerSlot);
         for (uint32_t i = 0; i < maxInAssocPerPeer_; ++i)
         {
@@ -882,22 +911,20 @@ namespace bcp::flux
                 continue;
             InAssociation* assoc = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(flowSlot));
-            const bool jammed = InAssocJammed(assoc, now);
-            if (jammed)
+            if (InAssocJammed(assoc, now))
             {
-                dir[i] = FlowDirEntry{ internal::INVALID_FLOW_ID, 0,
-                                       common::collections::SlotPool::INVALID };
-                DrainInHoldback(assoc);
-                assoc->life = FlowLifecycle::CLOSED;
+                if (DropInHoldback(assoc) > 0) ++reclaimed;
+                // Tell the sender where the cursor actually is. It has been
+                // holding copies on the strength of acks this side just took
+                // back, and this is the only signal that they are owed again.
+                ArmAck(assoc);
+                // Restart the clock so the next sweep measures the new stall
+                // rather than re-firing on this one.
+                assoc->lastProgressMicros = now;
             }
             inAssocPool_.UnlockWrite(flowSlot);
-            if (jammed)
-            {
-                inAssocPool_.Release(flowSlot);
-                ++evicted;
-            }
         }
-        return evicted;
+        return reclaimed;
     }
 
     uint32_t FlowTable::InAssocCountForPeer(uint32_t peerSlot) noexcept
@@ -948,7 +975,7 @@ namespace bcp::flux
                     const InFlightEntry* ring = flow->InFlight();
                     uint64_t oldest = 0;
                     for (uint32_t k = 0; k < cap; ++k)
-                        if (ring[k].seq != 0 &&
+                        if (ring[k].seq != 0 && !ring[k].acked &&
                             (oldest == 0 || ring[k].sentAtMicros < oldest))
                             oldest = ring[k].sentAtMicros;
                     if (oldest != 0) consider(oldest + rto);
@@ -963,7 +990,7 @@ namespace bcp::flux
     size_t FlowTable::BuildPeerAckBody(uint32_t peerSlot, uint8_t* out, size_t cap) noexcept
     {
         // One packet carries every association of this peer that owes acks.
-        // Each entry: [flowId(2)][epoch(1)][rangeCount(1)][first,last]*count.
+        // Each entry: [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][first,last]*count.
         // The epoch is what stops an ack outliving the generation it describes:
         // an id closed and reopened numbers from one again, and without it the
         // sender would resolve the new generation's packets against sequences
@@ -985,14 +1012,23 @@ namespace bcp::flux
                 AckRange ranges[internal::FLOW_ACK_RANGE_COUNT];
                 const uint8_t rc = BuildAckRanges(flow, ranges,
                                                   internal::FLOW_ACK_RANGE_COUNT);
-                const size_t need = 4 + static_cast<size_t>(rc) * 8;
-                if (rc > 0 && bodyLen + need <= cap)
+                const size_t need = internal::WIRE_ACK_ENTRY_HEAD_SIZE
+                                  + static_cast<size_t>(rc) * 8;
+                // Written even with no ranges. The cursor is the half that
+                // cannot be inferred, and a flow that has just given up its
+                // buffered packets has nothing to list and everything to say.
+                if (bodyLen + need <= cap)
                 {
-                    const uint16_t flowId = flow->flowId;
+                    const uint16_t flowId   = flow->flowId;
+                    const uint32_t recvNext = flow->recvNext;
                     out[bodyLen++] = static_cast<uint8_t>(flowId);
                     out[bodyLen++] = static_cast<uint8_t>(flowId >> 8);
                     out[bodyLen++] = flow->flowEpoch;
                     out[bodyLen++] = rc;
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext);
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext >> 8);
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext >> 16);
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext >> 24);
                     for (uint8_t r = 0; r < rc; ++r)
                     {
                         const uint32_t first = ranges[r].first, last = ranges[r].last;
@@ -1011,13 +1047,15 @@ namespace bcp::flux
                 // else the body is full: this flow's acks ride the next flush
             }
             inAssocPool_.UnlockWrite(flowSlot);
-            if (bodyLen + 3 + 8 > cap) break;   // no room for another entry
+            if (bodyLen + internal::WIRE_ACK_ENTRY_HEAD_SIZE + 8 > cap)
+                break;   // no room for another entry
         }
 
         return bodyLen;
     }
 
     void FlowTable::ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
+                                   uint32_t remoteRecvNext,
                                    const AckRange* ranges, uint8_t count, uint64_t now,
                                    CongestionDelta& delta) noexcept
     {
@@ -1035,8 +1073,16 @@ namespace bcp::flux
             const uint32_t cap = flow->inflightCap;
             InFlightEntry* ring = flow->InFlight();
             for (uint32_t i = 0; i < cap; ++i)
-                if (ring[i].seq != 0 && SeqInRanges(ring[i].seq, ranges, count))
+            {
+                if (ring[i].seq == 0) continue;
+                // Below the cursor is proof of delivery whatever the ranges
+                // say. The list is capped and built from the top, so the runs
+                // it drops are the oldest ones, which is exactly the stretch
+                // the send window is waiting on.
+                if (ring[i].seq < remoteRecvNext || SeqInRanges(ring[i].seq, ranges, count))
                     ResolveOutEntry(flow, ring[i], true, now, delta);
+            }
+            ReleaseAckedRun(*flow, remoteRecvNext);
         }
         outAssocPool_.UnlockWrite(flowSlot);
     }
@@ -1246,15 +1292,30 @@ namespace bcp::flux
 
     FlowAdmit FlowTable::AdmitIn(uint32_t peerSlot, const Address& from, const BcpId& peerId,
                                  uint16_t flowId, uint8_t flowData,
-                                 uint32_t& outAssoc) noexcept
+                                 uint32_t& outAssoc, uint32_t& outEpoch) noexcept
     {
         outAssoc = common::collections::SlotPool::INVALID;
+        outEpoch = 0;
 
         // First packet of a flow registers it: the flow data byte carries
         // everything registration needs.
         const FlowAdmit admit = AdmitInFlow(peerSlot, from, peerId, flowId, flowData);
-        if (admit == FlowAdmit::Registered || admit == FlowAdmit::Existing)
-            outAssoc = FindFlowSlot(InDirFor(peerSlot), maxInAssocPerPeer_, flowId);
+        if (admit != FlowAdmit::Registered && admit != FlowAdmit::Existing)
+            return admit;
+
+        outAssoc = FindFlowSlot(InDirFor(peerSlot), maxInAssocPerPeer_, flowId);
+        if (outAssoc == common::collections::SlotPool::INVALID)
+            return admit;
+
+        // The caller drops the peer lock before delivering, and the slot can be
+        // freed and handed to another peer in that gap. Its generation goes
+        // with the index so delivery can tell it is still the association this
+        // lookup found. Flow ids are each remote's own choice, so two peers
+        // sharing one is ordinary and the id alone proves nothing.
+        const InAssociation* flow = reinterpret_cast<const InAssociation*>(
+            inAssocPool_.ReadLock(outAssoc));
+        if (flow) outEpoch = flow->epoch;
+        inAssocPool_.UnlockRead(outAssoc);
         return admit;
     }
 
@@ -1369,12 +1430,14 @@ namespace bcp::flux
         InFlightEntry* ring = flow->InFlight();
         for (uint32_t i = 0; i < flow->inflightCap; ++i)
         {
-            if (ring[i].seq != 0) drainedBytes += ring[i].wireSize;   // still in flight: refund
+            if (ring[i].seq != 0 && !ring[i].acked)
+                drainedBytes += ring[i].wireSize;   // still in flight: refund
             if (ring[i].packetSlot != common::collections::SlotPool::INVALID)
                 stagingPool_.Release(ring[i].packetSlot);
             ring[i].packetSlot = common::collections::SlotPool::INVALID;
             ring[i].seq        = 0;
             ring[i].wireSize   = 0;
+            ring[i].acked      = false;
         }
         flow->unresolved = 0;
         return drainedBytes;
@@ -1398,6 +1461,28 @@ namespace bcp::flux
         }
     }
 
+    uint32_t FlowTable::DropInHoldback(InAssociation* flow) noexcept
+    {
+        if (flow->reorderCap == 0) return 0;
+        uint32_t dropped = 0;
+        HoldbackEntry* ring = flow->Holdback();
+        for (uint32_t i = 0; i < flow->reorderCap; ++i)
+        {
+            if (ring[i].packetSlot == common::collections::SlotPool::INVALID)
+                continue;
+
+            recvPool_->Release(ring[i].packetSlot);
+            // The bit has to go with the bytes. A sequence left marked seen is
+            // a sequence the resend is discarded as a duplicate, and the sender
+            // has no other way to learn this side no longer holds it.
+            SeenClear(flow->Seen(), ring[i].seq, flow->windowBits);
+            ring[i].packetSlot = common::collections::SlotPool::INVALID;
+            ring[i].seq = 0;
+            ++dropped;
+        }
+        return dropped;
+    }
+
     void FlowTable::DrainInHoldback(InAssociation* flow) noexcept
     {
         if (flow->reorderCap == 0) return;
@@ -1416,7 +1501,10 @@ namespace bcp::flux
     void FlowTable::ResolveOutEntry(OutAssociation* flow, InFlightEntry& entry,
                                     bool acked, uint64_t nowMicros, CongestionDelta& delta) noexcept
     {
-        if (entry.seq == 0) return;   // already resolved: idempotent
+        // Idempotent. A freed entry reads as seq 0, but an acknowledged one
+        // keeps its sequence while its copy is retained, and acks repeat, so
+        // that flag is the other half of the guard.
+        if (entry.seq == 0 || entry.acked) return;
 
         delta.resolvedBytes += entry.wireSize;
         if (acked)
@@ -1436,11 +1524,85 @@ namespace bcp::flux
         }
 
         if (flow->unresolved > 0) --flow->unresolved;
+
+        // Only an ordered flow retains. Its receiver buffers packets behind a
+        // gap and can be told to drop them, so an acknowledgement is not the
+        // end of the sender's obligation. An unordered receiver hands every
+        // packet straight to the application and keeps nothing it could lose,
+        // so the acknowledgement is final and the copy goes now. Its cursor
+        // never moves either, so a retained copy there would never be freed.
+        if (acked && IsOrdered(flow->mode))
+        {
+            // The window slot is free but the copy is not. ReleaseAckedRun
+            // frees it once the receiver reports a cursor past this sequence.
+            entry.acked = true;
+            return;
+        }
+
         if (entry.packetSlot != common::collections::SlotPool::INVALID)
             stagingPool_.Release(entry.packetSlot);   // different pool: safe under flow lock
         entry.seq        = 0;
         entry.packetSlot = common::collections::SlotPool::INVALID;
         entry.wireSize   = 0;
+        entry.acked      = false;
+    }
+
+    void FlowTable::RefundResendAttempts(uint32_t assocSlot, const uint32_t* seqs,
+                                         uint32_t count) noexcept
+    {
+        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
+            outAssocPool_.WriteLock(assocSlot));
+        if (!flow) return;
+
+        const uint32_t mask = flow->inflightCap - 1;
+        InFlightEntry* ring = flow->InFlight();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            InFlightEntry& entry = ring[seqs[i] & mask];
+            // An ack may have resolved it while the send was attempted, and the
+            // slot may already belong to a later sequence. Only the entry still
+            // carrying this seq is the one that was charged.
+            if (entry.seq != seqs[i] || entry.acked) continue;
+            if (entry.retries > 0) --entry.retries;
+            entry.sentAtMicros = 0;   // overdue against any timeout: retry next tick
+        }
+        outAssocPool_.UnlockWrite(assocSlot);
+    }
+
+    void FlowTable::ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept
+    {
+        const uint32_t mask = flow.inflightCap - 1;
+        InFlightEntry* ring = flow.InFlight();
+
+        // Nothing outstanding can sit further back than the ring is wide, so a
+        // base further behind than that is stale and catches up over several
+        // acks rather than in one long scan.
+        // A copy is kept until the receiver says its cursor has passed the
+        // sequence. An acknowledgement only means the packet arrived, and a
+        // receiver can still drop what it has buffered ahead of a gap, so
+        // acknowledgement alone is not permission to forget it.
+        uint32_t steps = flow.inflightCap;
+        while (flow.ackBase != flow.nextSeq && flow.ackBase < remoteRecvNext && steps-- > 0)
+        {
+            InFlightEntry& entry = ring[flow.ackBase & mask];
+            if (entry.seq == flow.ackBase)
+            {
+                if (!entry.acked) break;   // still outstanding, nothing above it can go
+
+                if (entry.packetSlot != common::collections::SlotPool::INVALID)
+                    stagingPool_.Release(entry.packetSlot);
+                entry.seq          = 0;
+                entry.packetSlot   = common::collections::SlotPool::INVALID;
+                entry.wireSize     = 0;
+                entry.retries      = 0;
+                entry.sentAtMicros = 0;
+                entry.acked        = false;
+            }
+            // An entry that does not carry this sequence was given up rather
+            // than acked, and is already gone.
+            flow.ackBase += 1;
+            if (flow.ackBase == 0) flow.ackBase = 1;
+        }
     }
 
     void FlowTable::RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
@@ -1459,7 +1621,24 @@ namespace bcp::flux
         {
             InFlightEntry& entry = ring[i];
             if (entry.seq == 0) continue;
-            if (now - entry.sentAtMicros < rto) continue;
+            if (entry.acked)
+            {
+                // A receiver short of memory drops what it buffered ahead of a
+                // gap and has no way to say so. Once a retained copy is this
+                // old the flow is stalled anyway, so re-offering costs a packet
+                // and is the only path by which a dropped one comes back. It is
+                // not a loss: no budget trim, no retry spent.
+                if (Elapsed(now, entry.sentAtMicros) < flowStallTimeout_) continue;
+                if (entry.packetSlot != common::collections::SlotPool::INVALID
+                    && resendCount < RESENDS_PER_ASSOC_PER_TICK)
+                {
+                    resendSeqs[resendCount]    = entry.seq;
+                    resendSlots[resendCount++] = entry.packetSlot;
+                    entry.sentAtMicros = now;
+                }
+                continue;
+            }
+            if (Elapsed(now, entry.sentAtMicros) < rto) continue;
 
             // RTO fired: a loss on this path either way.
             if (mode == FlowMode::UNRELIABLE)
@@ -1610,92 +1789,31 @@ namespace bcp::flux
 
     // --- Delivery ---
 
-    bool FlowTable::SplitBatchToReady(const PacketSlot& batch) noexcept
-    {
-        const size_t header  = batch.ContentOffset();
-        const size_t content = batch.ContentLength();
-        if (header > batch.dataSize || content == 0) return false;
-        const uint8_t* list = batch.data + header;
-
-        // Every message gets a slot before any is queued, so a dry pool leaves
-        // the batch uncommitted and the sender resends it whole. Delivering
-        // half of one and dropping the rest would lose data the sender was
-        // told arrived. Acquiring the slots first also guarantees the pushes
-        // below cannot fail: the queue holds one entry per outstanding slot and
-        // these are outstanding but not yet queued.
-        uint32_t slots[internal::MAX_BATCH_MESSAGES];
-        uint32_t taken  = 0;
-        uint16_t offset = 0;
-        bool     ok     = true;
-
-        while (offset < content)
-        {
-            const uint8_t* message = nullptr;
-            uint16_t       length  = 0;
-            if (!wire::BatchNext(list, static_cast<uint16_t>(content), offset, message, length))
-            { ok = false; break; }
-            if (taken >= internal::MAX_BATCH_MESSAGES) { ok = false; break; }
-
-            const uint32_t slot = recvPool_->Acquire();
-            if (slot == common::collections::SlotPool::INVALID) { ok = false; break; }
-            slots[taken++] = slot;
-
-            PacketSlot* out = reinterpret_cast<PacketSlot*>(recvPool_->WriteLock(slot));
-            if (!out) { ok = false; break; }
-
-            // The batch's own framing becomes this message's, minus the bit
-            // saying it is a list, so what the application receives is
-            // indistinguishable from a packet that carried one message.
-            std::memcpy(out->data, batch.data, header);
-            out->data[0] = static_cast<uint8_t>(out->data[0] & ~internal::WIRE_CTRL_BATCH);
-            std::memcpy(out->data + header, message, length);
-            out->address = batch.address;
-            // The trailer is gone once decrypted, but ContentLength still
-            // subtracts it, so the room is left for the arithmetic to land on
-            // this message's length.
-            const size_t trailer = batch.IsSecure() ? internal::WIRE_TAG_SIZE : 0;
-            std::memset(out->data + header + length, 0, trailer);
-            out->dataSize = static_cast<uint16_t>(header + length + trailer);
-            recvPool_->UnlockWrite(slot);
-        }
-
-        if (!ok || taken == 0)
-        {
-            for (uint32_t i = 0; i < taken; ++i)
-                recvPool_->Release(slots[i]);
-            return false;
-        }
-
-        for (uint32_t i = 0; i < taken; ++i)
-            (void)readyQueue_->Push(slots[i]);
-        return true;
-    }
-
-    bool FlowTable::QueueReady(PacketSlotHandle& handle) noexcept
+    bool FlowTable::QueueReady(PacketSlotHandle& handle, uint32_t peerSlot) noexcept
     {
         const uint32_t idx = handle.GetSlotIndex();
         if (idx == common::collections::SlotPool::INVALID) return false;
 
-        const PacketSlot* packet = handle.Read();
-        if (packet && packet->IsBatch())
-        {
-            // The messages are queued in their own slots, so this one has done
-            // its job. Not detached: letting the handle release it is what
-            // returns it to the pool.
-            return SplitBatchToReady(*packet);
-        }
-
-        if (!readyQueue_->Push(idx)) return false;   // full: backpressure, caller drops
+        // Everything from this peer takes the same lane, and a lane has one
+        // reader, which is what carries the sequence order built above all the
+        // way out to the application.
+        if (!readyLanes_->Push(readyLanes_->LaneOf(peerSlot), idx))
+            return false;   // full: backpressure, caller drops
         (void)handle.Detach();                       // queued; must not release the slot
         return true;
     }
 
-    uint32_t FlowTable::DeliverIn(uint32_t assocSlot, uint16_t flowId, uint32_t seq,
-                                  PacketSlotHandle& incoming) noexcept
+    uint32_t FlowTable::DeliverIn(uint32_t assocSlot, uint16_t flowId, uint32_t assocEpoch,
+                                  uint32_t seq, PacketSlotHandle& incoming) noexcept
     {
         InAssociation* flow = reinterpret_cast<InAssociation*>(inAssocPool_.WriteLock(assocSlot));
         uint32_t produced = 0;
-        if (flow->life == FlowLifecycle::OPEN && flow->flowId == flowId)
+        // The generation is what separates this association from a later tenant
+        // of the same slot. Without it a packet admitted just before the peer
+        // aged out would commit into whichever peer took the slot next, marking
+        // its bitmap and acking a sequence it never saw.
+        if (flow->epoch == assocEpoch
+            && flow->life == FlowLifecycle::OPEN && flow->flowId == flowId)
         {
             const uint32_t cursorBefore = flow->recvNext;
             produced = IsOrdered(flow->mode)
@@ -1891,7 +2009,7 @@ namespace bcp::flux
             return 0;
         }
         // Commit only if it actually queues (two-step: queued == acked).
-        if (!QueueReady(incoming))
+        if (!QueueReady(incoming, flow.peerSlot))
             return 0;   // ready queue full: uncommitted, unacked -> dropped/resent
         CommitSeen(&flow, seq);
         ArmAck(&flow);
@@ -1913,7 +2031,7 @@ namespace bcp::flux
         {
             // Queue the cursor packet first; only advance and commit if it took
             // (full queue -> leave everything untouched, unacked).
-            if (!QueueReady(incoming))
+            if (!QueueReady(incoming, flow.peerSlot))
                 return 0;
             CommitSeen(&flow, seq);
             ArmAck(&flow);
@@ -1960,25 +2078,8 @@ namespace bcp::flux
                 || held.seq != flow.recvNext)
                 break;   // gap: stop draining
 
-            // A held batch splits on its way out, exactly as one delivered at
-            // the cursor does, so the application never meets one either way.
-            const PacketSlot* packet = reinterpret_cast<const PacketSlot*>(
-                recvPool_->ReadLock(held.packetSlot));
-            const bool batched = packet && packet->IsBatch();
-            bool queued;
-            if (batched)
-            {
-                queued = SplitBatchToReady(*packet);
-                recvPool_->UnlockRead(held.packetSlot);
-                if (queued) recvPool_->Release(held.packetSlot);   // its messages carry on without it
-            }
-            else
-            {
-                if (packet) recvPool_->UnlockRead(held.packetSlot);
-                queued = readyQueue_->Push(held.packetSlot);
-            }
-            if (!queued)
-                break;   // queue or pool full: leave the tail held
+            if (!readyLanes_->Push(readyLanes_->LaneOf(flow.peerSlot), held.packetSlot))
+                break;   // queue full: leave the tail held
 
             held.packetSlot = common::collections::SlotPool::INVALID;
             held.seq = 0;

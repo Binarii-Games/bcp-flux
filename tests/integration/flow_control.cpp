@@ -166,10 +166,10 @@ static void reliable_ordered_flow_delivers_in_order()
         {
             relay.Pump();
             flux::PacketSlotHandle handles[64];
-            uint32_t count = server.Poll(handles, 64);
-            for (uint32_t h = 0; h < count; ++h)
+            flux::PollCursor cursor = server.Poll(handles, 64);
+            while (cursor.Next())
             {
-                flux::PacketSlotReader reader{std::move(handles[h])};
+                flux::PacketSlotReader& reader = cursor.Message();
                 uint32_t seq = 0;
                 if (reader.TakeU32(seq)) delivered.push_back(seq);
             }
@@ -244,10 +244,10 @@ static bool RunSwappedBurst(flux::FlowMode mode, uint16_t clientPort, uint16_t s
     {
         relay.Pump();
         flux::PacketSlotHandle handles[64];
-        uint32_t count = server.Poll(handles, 64);
-        for (uint32_t h = 0; h < count; ++h)
+        flux::PollCursor cursor = server.Poll(handles, 64);
+        while (cursor.Next())
         {
-            flux::PacketSlotReader reader{std::move(handles[h])};
+            flux::PacketSlotReader& reader = cursor.Message();
             uint32_t seq = 0;
             if (reader.TakeU32(seq)) delivered.push_back(seq);
         }

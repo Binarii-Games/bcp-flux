@@ -47,14 +47,13 @@ static void Tick(flux::Socket& socket, const char* name)
         socket.Flush();
         socket.Update();
 
-        const uint32_t count = socket.Poll(inbox, 8);
-        for (uint32_t i = 0; i < count; ++i)
+        flux::PollCursor cursor = socket.Poll(inbox, 8);
+        while (cursor.Next())
         {
-            // ContentOffset is where the wire header ends and the payload starts.
-            const flux::PacketSlot* packet  = inbox[i].Read();
-            const size_t            offset  = packet->ContentOffset();
-            const uint8_t*          content = packet->Content(offset);
-            const size_t            length  = packet->ContentLength();
+            // The cursor sits on one message, and Content is its payload.
+            const flux::PacketSlot* packet  = cursor.Packet().Read();
+            const uint8_t*          content = cursor.Message().Content();
+            const size_t            length  = cursor.Message().ContentLength();
 
             common::LogF(common::LogLevel::Info, "%s got: %.*s",
                          name, int(length), reinterpret_cast<const char*>(content));

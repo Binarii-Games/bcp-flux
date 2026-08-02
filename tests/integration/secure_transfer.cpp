@@ -38,15 +38,15 @@ struct Message
     }
 };
 
-// Drains everything a socket has ready, decoding each packet back into a
-// Message, and appends them to `out`.
+// Drains everything a socket has ready, decoding each delivered message back
+// into a Message, and appends them to `out`.
 static void Collect(flux::Socket& socket, std::vector<Message>& out)
 {
     flux::PacketSlotHandle handles[64];
-    uint32_t count = socket.Poll(handles, 64);
-    for (uint32_t i = 0; i < count; ++i)
+    flux::PollCursor cursor = socket.Poll(handles, 64);
+    while (cursor.Next())
     {
-        flux::PacketSlotReader reader{std::move(handles[i])};
+        flux::PacketSlotReader& reader = cursor.Message();
         Message message{};
         uint16_t length = 0;
         if (!reader.TakeU8(message.op))  continue;

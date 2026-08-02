@@ -4,6 +4,8 @@
 
 #include <flux/socket/socket.h>          // Controls / ToByte
 #include <flux/internal/constants.h>
+#include <flux/socket/ready_lanes.h>
+#include <flux/wire/batch.h>
 #include <flux/wire/packet_builder.h>
 #include <common/wire/bytes_reader.h>
 
@@ -455,38 +457,76 @@ namespace bcp::flux
     }
 
     // --- Reader ---
-    PacketSlotReader::PacketSlotReader(PacketSlotHandle handle) noexcept 
-        : handle_(std::move(handle))
+    PacketSlotReader::PacketSlotReader(PacketSlotHandle& handle) noexcept
+        : pkt_(nullptr)
+        , cursor_{.p = nullptr, .r = 0}
+        , failReason_(handle.FailReason())
+        , content_(nullptr)
+        , contentLen_(0)
+        , walkOffset_(0)
+        , message_(nullptr)
+        , messageLen_(0)
     {
-        if (handle_.Failed())
-        {
-            pkt_ = nullptr;
-            cursor_ = common::BytesReader
-            {
-                .p = nullptr,
-                .r = 0
-            };
+        if (handle.Failed())
             return;
-        }
-        pkt_ = handle_.Read();
+
+        pkt_ = handle.Read();
+        if (!pkt_)
+            return;
+
         const size_t offset = pkt_->ContentOffset();
         if (offset > pkt_->dataSize)
-        {
-            cursor_ = common::BytesReader
-            {
-                .p = nullptr,
-                .r = 0
-            };
             return;
+
+        content_ = pkt_->Content(offset);
+        // ContentLength, not dataSize - offset: a secure packet ends in the
+        // AEAD tag, which is framing and not payload, so a length-driven or
+        // read-to-exhaustion caller must not see it.
+        contentLen_ = static_cast<uint16_t>(pkt_->ContentLength());
+
+        if (pkt_->IsBatch())
+        {
+            // Reading an entry the chain does not account for means trusting
+            // bytes chosen by whatever damaged it, so a batch that does not
+            // walk cleanly yields nothing at all.
+            if (!wire::BatchValidate(content_, contentLen_)
+                || !wire::BatchNext(content_, contentLen_, walkOffset_, message_, messageLen_))
+            {
+                content_ = nullptr;
+                message_ = nullptr;
+                messageLen_ = 0;
+                failReason_ = common::Error::InvalidHeader;
+                return;
+            }
         }
+        else
+        {
+            message_    = content_;
+            messageLen_ = contentLen_;
+            walkOffset_ = contentLen_;
+        }
+
         cursor_ = common::BytesReader
         {
-            .p = pkt_->Content(offset),
-            // ContentLength, not dataSize - offset: a secure packet ends in the
-            // AEAD tag, which is framing and not payload, so a length-driven or
-            // read-to-exhaustion caller must not see it.
-            .r = pkt_->ContentLength()
+            .p = message_,
+            .r = messageLen_
         };
+    }
+
+    bool PacketSlotReader::NextMessage() noexcept
+    {
+        if (!content_ || walkOffset_ >= contentLen_)
+            return false;
+
+        if (!wire::BatchNext(content_, contentLen_, walkOffset_, message_, messageLen_))
+            return false;
+
+        cursor_ = common::BytesReader
+        {
+            .p = message_,
+            .r = messageLen_
+        };
+        return true;
     }
 
     bool PacketSlotReader::TakeU8(uint8_t& out)
@@ -514,25 +554,87 @@ namespace bcp::flux
         return cursor_.TakeBytes(dst, len);
     }
 
-    PacketSlotHandle PacketSlotReader::ExtractHandle() && noexcept
+    // --- PollCursor ---
+    PollCursor::PollCursor(ReadyLanes* lanes, uint32_t lane,
+                           PacketSlotHandle* slots, uint32_t count) noexcept
+        : lanes_(lanes)
+        , lane_(lane)
+        , slots_(slots)
+        , count_(slots ? count : 0)
+        , index_(0)
+        , opened_(false)
+        , none_(PacketSlotHandle::Invalid())
+        , reader_(none_)
     {
-        // Lost handle ownership, make the reader clearly unusable
-        pkt_ = nullptr;
-        cursor_ = common::BytesReader
+    }
+
+    PollCursor::~PollCursor()
+    {
+        if (lanes_) lanes_->Release(lane_);
+    }
+
+    PollCursor::PollCursor(PollCursor&& o) noexcept
+        : lanes_(o.lanes_)
+        , lane_(o.lane_)
+        , slots_(o.slots_)
+        , count_(o.count_)
+        , index_(o.index_)
+        , opened_(o.opened_)
+        , none_(PacketSlotHandle::Invalid())
+        , reader_(none_)
+    {
+        reader_ = o.reader_;
+        o.lanes_ = nullptr;   // the claim moves with the cursor
+    }
+
+    PollCursor& PollCursor::operator=(PollCursor&& o) noexcept
+    {
+        if (this == &o) return *this;
+        if (lanes_) lanes_->Release(lane_);
+        lanes_  = o.lanes_;
+        lane_   = o.lane_;
+        slots_  = o.slots_;
+        count_  = o.count_;
+        index_  = o.index_;
+        opened_ = o.opened_;
+        reader_ = o.reader_;
+        o.lanes_ = nullptr;
+        return *this;
+    }
+
+    bool PollCursor::Next() noexcept
+    {
+        while (index_ < count_)
         {
-            .p = nullptr,
-            .r = 0
-        };
-        return std::move(handle_);
+            if (!opened_)
+            {
+                opened_ = true;
+                reader_ = PacketSlotReader{slots_[index_]};
+                if (!reader_.Failed())
+                    return true;
+            }
+            else if (reader_.NextMessage())
+            {
+                return true;
+            }
+
+            // A packet that would not open is skipped whole: its framing is
+            // damaged, so there is no next message to move to.
+            ++index_;
+            opened_ = false;
+        }
+
+        reader_ = PacketSlotReader{none_};
+        return false;
     }
 
     bool PacketSlotReader::Failed()
     {
-        return handle_.Failed();
+        return failReason_ != common::Error::Ok;
     }
 
     common::Error PacketSlotReader::FailReason()
     {
-        return handle_.FailReason();
+        return failReason_;
     }
 }

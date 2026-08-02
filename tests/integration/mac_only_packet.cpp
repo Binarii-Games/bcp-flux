@@ -68,18 +68,18 @@ namespace
             to.Flush();
             to.Update();
 
-            const uint32_t count = to.Poll(sink, 16);
-            for (uint32_t k = 0; k < count; ++k)
+            flux::PollCursor cursor = to.Poll(sink, 16);
+            while (cursor.Next())
             {
-                const flux::PacketSlot* packet = sink[k].Read();
+                const flux::PacketSlot* packet = cursor.Packet().Read();
                 if (!packet) continue;
 
                 got.framing    = packet->ContentOffset();
                 got.wireSize   = packet->dataSize;
                 got.macOnlyBit = packet->IsMacOnly();
-                const size_t length = packet->ContentLength();
-                got.body.assign(packet->Content(got.framing),
-                                packet->Content(got.framing) + length);
+                const size_t length = cursor.Message().ContentLength();
+                got.body.assign(cursor.Message().Content(),
+                                cursor.Message().Content() + length);
                 got.arrived = true;
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -281,12 +281,12 @@ int main()
             d.Flush();
             d.Update();
 
-            const uint32_t count = d.Poll(sink, 64);
-            for (uint32_t i = 0; i < count; ++i)
+            flux::PollCursor cursor = d.Poll(sink, 64);
+            while (cursor.Next())
             {
-                const flux::PacketSlot* packet = sink[i].Read();
+                const flux::PacketSlot* packet = cursor.Packet().Read();
                 if (!packet) continue;
-                const uint8_t* body = packet->Content(packet->ContentOffset());
+                const uint8_t* body = cursor.Message().Content();
                 const int index = body[0] | (body[1] << 8);
                 if (index != got) ordered = false; else ++got;
             }

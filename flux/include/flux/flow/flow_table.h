@@ -14,6 +14,7 @@
 #include <flux/flow/flow_handle.h>
 #include <flux/peer/peer_id.h>
 #include <flux/socket/packet_slot.h>
+#include <flux/socket/ready_lanes.h>
 
 namespace bcp::flux
 {
@@ -187,7 +188,7 @@ namespace bcp::flux
         [[nodiscard]] common::Error Init(const Params& params,
                                          common::collections::SlotPool* recvPool,
                                          common::collections::SlotPool* sendPool,
-                                         common::collections::FifoQueue<uint32_t>* readyQueue) noexcept;
+                                         ReadyLanes* readyLanes) noexcept;
 
         /** Frees every pool and directory this table owns and forgets the pools
             it borrows, so a later Init starts clean. Idempotent. The caller must
@@ -261,11 +262,15 @@ namespace bcp::flux
             Read-only, caller holds the peer read lock, like AnyAckDue. */
         [[nodiscard]] bool AnyJammed(uint32_t peerSlot, uint64_t now) noexcept;
 
-        /** Reclaims this peer's jammed receiving flows: releases the held recv
-            slots and frees the association. The condition is re-checked under
-            the write lock. Caller holds the peer WRITE lock. Returns how many
-            were freed. */
-        uint32_t EvictJammedInFlows(uint32_t peerSlot, uint64_t now) noexcept;
+        /** Frees the recv slots this peer's jammed receiving flows are holding
+            behind their gaps, and re-arms their acks so the sender learns the
+            cursor did not move. The associations stay: their cursor and epoch
+            are what let the sender resend into the same gap. The jam condition
+            is re-checked under the write lock. Caller holds the peer WRITE
+            lock.
+
+            @return how many associations gave up at least one packet. */
+        uint32_t ReclaimJammedInFlows(uint32_t peerSlot, uint64_t now) noexcept;
 
         /** How many receiving associations this peer currently has. Caller holds
             the peer read lock. */
@@ -281,15 +286,29 @@ namespace bcp::flux
             @pre caller holds the peer read lock. */
         [[nodiscard]] size_t BuildPeerAckBody(uint32_t peerSlot, uint8_t* out, size_t cap) noexcept;
 
+        /** Gives back the attempts charged to sequences whose retransmit never
+            reached the wire, and re-arms them so the next tick retries at once.
+            An attempt is spent on a datagram that left, not on one the send
+            pool had no room to build.
+
+            @pre The caller holds no lock on this association. */
+        void RefundResendAttempts(uint32_t assocSlot, const uint32_t* seqs,
+                                  uint32_t count) noexcept;
+
         /** Resolves the acked sequences and accumulates the congestion effect,
             which the caller applies to the peer after upgrading to write. Only
             association state is mutated here, so the read lock is enough.
+
+            remoteRecvNext is the remote's delivery cursor. Every sequence below
+            it resolves whatever the ranges say, which is what lets a capped
+            range list still free the oldest runs.
 
             An ack naming any epoch but the association's own resolves nothing:
             it describes a generation of this flow id that has already been
             closed, and its sequence numbers mean something else now.
             @pre caller holds the peer read lock. */
         void ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
+                            uint32_t remoteRecvNext,
                             const AckRange* ranges, uint8_t count, uint64_t now,
                             CongestionDelta& delta) noexcept;
 
@@ -321,7 +340,7 @@ namespace bcp::flux
             @pre caller holds the peer write lock. */
         [[nodiscard]] FlowAdmit AdmitIn(uint32_t peerSlot, const Address& from, const BcpId& peerId,
                                         uint16_t flowId, uint8_t flowData,
-                                        uint32_t& outAssoc) noexcept;
+                                        uint32_t& outAssoc, uint32_t& outEpoch) noexcept;
 
         /** Fails one target of a flow, draining its rings and refunding what it
             held. The flow stays open for every other peer.
@@ -377,7 +396,8 @@ namespace bcp::flux
 
         /** Orders, dedupes and hands the packet to the ready queue, returning
             how many packets that made deliverable. No peer lock held. */
-        [[nodiscard]] uint32_t DeliverIn(uint32_t assocSlot, uint16_t flowId, uint32_t seq,
+        [[nodiscard]] uint32_t DeliverIn(uint32_t assocSlot, uint16_t flowId, uint32_t assocEpoch,
+                                         uint32_t seq,
                                          PacketSlotHandle& incoming) noexcept;
 
         // --- Batching. The association's own lock covers the open batch, since
@@ -469,7 +489,7 @@ namespace bcp::flux
 
         common::collections::SlotPool* recvPool_  = nullptr;   ///< borrowed from the kernel
         common::collections::SlotPool* sendPool_  = nullptr;   ///< borrowed from the kernel
-        common::collections::FifoQueue<uint32_t>* readyQueue_ = nullptr;   ///< borrowed from the socket
+        ReadyLanes* readyLanes_ = nullptr;   ///< borrowed from the socket
 
         uint32_t maxOutAssocPerPeer_ = 0;
         uint32_t maxInAssocPerPeer_  = 0;
@@ -520,10 +540,17 @@ namespace bcp::flux
 
         [[nodiscard]] uint32_t DrainOutInflight(OutAssociation* flow) noexcept;
         void DrainOutWaiting(OutAssociation* flow) noexcept;
+        /** Frees every packet this association is buffering behind its gap and
+            clears their bits from the seen window, so a resend is not taken for
+            a duplicate. The association itself is untouched.
+
+            @return how many packets were dropped. */
+        uint32_t DropInHoldback(InAssociation* flow) noexcept;
+
         void DrainInHoldback(InAssociation* flow) noexcept;
 
         /** The jam predicate, shared by the read scan and the write-locked
-            eviction so both judge a flow the same way. */
+            reclaim so both judge a flow the same way. */
         [[nodiscard]] bool InAssocJammed(const InAssociation* flow, uint64_t now) const noexcept;
 
         /** Resolve one in-flight entry (acked or lost); accumulate feedback into
@@ -532,21 +559,19 @@ namespace bcp::flux
         void ResolveOutEntry(OutAssociation* flow, InFlightEntry& entry,
                              bool acked, uint64_t nowMicros, CongestionDelta& delta) noexcept;
 
+        /** Free the retained copies below the receiver's reported cursor and
+            advance ackBase past them. An acknowledged packet is kept until then
+            because a receiver holding it behind a gap can still be made to drop
+            it, and the sender would be the only one carrying it. */
+        void ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept;
+
         void RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
                                 /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots,
                                 uint32_t& resendCount, /*out*/ bool& exhausted) noexcept;
 
         /** Commit one packet to the ready queue (Detaches on success so Poll
             rebuilds the handle). False = queue full, caller must not ack it. */
-        [[nodiscard]] bool QueueReady(PacketSlotHandle& handle) noexcept;
-
-        /** Expands a batched packet into one ready slot per message, so what
-            the application polls is always a single message and no receiving
-            code has to know batches exist.
-
-            @return false with nothing queued when the pool cannot take them
-                    all, leaving the batch uncommitted so the sender resends. */
-        [[nodiscard]] bool SplitBatchToReady(const PacketSlot& batch) noexcept;
+        [[nodiscard]] bool QueueReady(PacketSlotHandle& handle, uint32_t peerSlot) noexcept;
 
         uint32_t DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept;
         uint32_t DeliverOrdered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept;

@@ -86,8 +86,12 @@ A transport protocol: connectionless with a handshake, zero-allocation on the
 packet path, encrypted, endianness-explicit, with mixed-reliability flows and
 address migration.
 
-Its entities are peers and sockets. There is no concept of a node, a route, a
-resolver, or a service name. Naming and routing belong to a layer above.
+Its entities are peers and sockets. There is no concept of a node, a route, or
+a service name, and naming and routing belong to a layer above. The one
+exception is `Address::From`, which will resolve a hostname through the
+platform's `getaddrinfo` as a convenience for callers that have a name rather
+than a literal. That call blocks and allocates, so it belongs to setup and never
+to a packet path.
 
 | Sub-namespace | Holds |
 |---|---|
@@ -183,7 +187,7 @@ stores it, matches it, and surfaces it to the layer above.
 
 ### 3.2 Memory: the pools
 
-Nothing on the packet path allocates. There are nine pools, each with one
+Nothing on the packet path allocates. There are eleven pools, each with one
 owner:
 
 | Pool | Owner | Holds |
@@ -191,7 +195,7 @@ owner:
 | recv | `ISocketKernel` | inbound packets |
 | send | `ISocketKernel` | outbound packets |
 | pending | `Socket` | packets parked behind an unfinished handshake |
-| staging | `FlowTable` | retained reliable bodies, held send-until-ack |
+| staging | `FlowTable` | retained reliable bodies, held until the receiver's cursor passes |
 | flow | `FlowTable` | `Flow` slots, one per open flow |
 | out-association | `FlowTable` | `OutAssociation` slots |
 | in-association | `FlowTable` | `InAssociation` slots |
@@ -221,8 +225,15 @@ All three are move-only, and a moved-from handle is left unusable.
 `PacketSlotHandle` is the unit of packet ownership. An invalid index yields a
 failed handle whose `Read()` and `Write()` return `nullptr`. `Detach()` gives
 up ownership and returns the bare index, which is how a reliable body outlives
-the send that wrote it. `PacketSlotWriter` and `PacketSlotReader` wrap a handle
-with a byte cursor.
+the send that wrote it. `PacketSlotWriter` wraps a handle with a byte cursor.
+`PacketSlotReader` borrows one instead of owning it, because a packet carrying
+several messages is read by one reader per message while a single handle keeps
+the slot, so the reader has to be something the packet's owner outlives.
+
+`PollCursor` is what `Poll` returns. It borrows the array `Poll` filled and
+steps through every message in every packet it holds, which is what lets a
+caller read one loop whether the messages arrived one per datagram or packed
+together. It owns nothing and releases nothing.
 
 `PeerHandle` arrives read-locked with the key verified under that lock.
 `RemovePeer` frees a slot only after taking its write lock, so a peer is never
@@ -436,27 +447,70 @@ seat the newest, so an unreliable send is never refused for capacity. The ring
 is strict FIFO: while anything waits, a new packet joins the back, otherwise
 its sequence would outrun older data.
 
-#### Receiving: one gate, four sinks, two passes
+#### Receiving: one gate, three sinks, one bypass, two passes
 
-`Poll` pass 1 runs the kernel batch through `PreProcessIn` (known-peer check
-for unsecured traffic, decryption for secure, then replay and liveness), which
-routes everything it admits to one of four sinks:
+Handshake traffic goes to `ProcessInternal` before the gate runs at all. It is
+unauthenticated by construction, so a known-peer check, a decrypt and a replay
+window have nothing to apply to it. The bypass is narrow: a packet claiming to
+be internal and secure at once is forged or corrupt, and is dropped.
 
-1. `ProcessInternal`: handshake traffic
-2. `ProcessSecureControl`: path validation, flow reject, flow ack
-3. `ProcessFlowIn`: flow data
-4. `QueueReady`: non-flow application data
+Everything else runs through `PreProcessIn` (known-peer check for unsecured
+traffic, decryption for secure, then replay and liveness), which routes what it
+admits to one of three sinks:
+
+1. `ProcessSecureControl`: path validation, flow reject, flow ack
+2. `ProcessFlowIn`: flow data
+3. `QueueReady`: non-flow application data
 
 Pass 2 drains the ready queue into the caller's buffer. Packets never leave the
 receive pool, and the application receives handles into it.
 
-A packet carrying a list of messages is split before it is queued, one entry per
-message, each wearing the batch's own framing minus the bit that said it was a
-list. So what an application polls is always a single message and no receiving
-code has to know batches exist. The length chain is validated first, and a chain
-that overruns or leaves a tail drops the whole packet before anything is
-committed to the seen bitmap, so the sender resends it rather than being told it
-arrived.
+A packet carrying a list of messages is queued whole, as one entry, exactly like
+a packet carrying one. Nothing is copied and nothing is expanded, so a datagram
+holding sixteen messages costs one slot rather than seventeen. The unpacking
+happens where the application reads: `PollCursor` walks the list and hands back
+one message at a time, so a caller still sees a flat run of messages and never
+has to know which of them travelled together. The length chain is validated
+before the first message is handed out, and a chain that overruns or leaves a
+tail yields nothing from that packet, because reading an entry the chain does
+not account for means trusting bytes chosen by whatever damaged it.
+
+#### Lanes: what keeps an ordered flow ordered on the way out
+
+Packets reach the ready queues in sequence already. `DeliverOrdered` queues only
+at the cursor, anything ahead of it waits in the reorder ring, and the drain that
+follows a filled gap runs under the same association lock that moved the cursor.
+So the order going in is correct whichever thread put them there.
+
+Taking them out is where it can be lost. One queue read by several threads hands
+each of them whatever they win, and two threads then walk their own packets at
+their own speed, so the application sees sequence four before sequence one even
+though the queue held them the right way round.
+
+Lanes fix that by giving each draining thread its own queue. A peer's packets
+always take the same lane, chosen by hashing its slot index, so one thread sees
+all of them and sees them in order. The slot index is used because it does not
+change while the peer lives: a peer that moves to a new address keeps its lane,
+and no state is ever handed between threads.
+
+`Config::pollLanes` sets how many, defaulting to one, which is the single queue
+this has always been.
+
+A lane is claimed for the life of the `PollCursor`, not merely for the drain.
+That span is what the guarantee rests on: the order survives only while one
+thread is the only one working a peer's traffic, and the application reads that
+traffic after `Poll` has returned. Nothing is registered. `Poll` takes whichever
+lane is free, preferring the one the caller passes back, so a thread settles on
+one lane while nothing contends and a lane whose usual thread stops calling is
+taken by another rather than filling untouched.
+
+Each lane is sized for the whole receive pool rather than a share of it, because
+all the traffic can come from peers landing in one lane, and a push that fails is
+a packet dropped after its sender was told it arrived.
+
+A packet with no flow carries no sequence and so has no order to keep. It takes
+the lane its source address hashes to, which only keeps one sender's traffic
+landing together.
 
 #### Delivering an in-flow packet: two deliverers
 
@@ -468,6 +522,48 @@ other two modes, delivering on arrival, except that `UNRELIABLE` drops a packet
 older than the newest it has delivered. Both consult the seen bitmap, because a
 retransmit wears a fresh nonce and only the bitmap tells "sequence 6, again"
 from "sequence 6, finally".
+
+#### A stalled flow gives up its buffer, not its identity
+
+An ordered flow whose cursor has not moved for the stall timeout is pinning
+receive slots for a gap nobody is filling. The tick frees everything it
+buffered and clears those sequences from the seen bitmap, so a resend is not
+mistaken for a duplicate. The association itself stays, with its cursor, epoch
+and identity intact.
+
+Keeping it is the whole point. An association rebuilt from scratch starts at
+sequence one while the sender is already hundreds ahead, so every packet after
+that lands outside the window and neither side has any way to notice. Holding
+the cursor still means the sender resends into the same gap it always had.
+
+That works because an acknowledgement no longer frees the sender's copy. A
+sequence is acknowledged when the receiver has it, which is not the same as the
+receiver having delivered it: a packet buffered ahead of a gap is acknowledged
+and can still be dropped. So the copy is kept until the receiver reports a
+cursor past that sequence, which is the point where it can no longer ask for it.
+
+#### The acknowledgement carries a cursor as well as ranges
+
+An entry is `[flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)]` followed by that
+many `[first(4)][last(4)]` pairs.
+
+`recvNext` is the receiver's delivery cursor. Everything below it has reached
+the application and can never be requested again, so it is what the sender
+releases against. It is one fixed field, it only ever climbs, and a report that
+is lost costs nothing because the next one carries the same or better.
+
+The ranges are the packets held above that cursor, and they are an optimisation:
+they let the sender stop retransmitting something the receiver already holds.
+Losing one costs a redundant retransmit and nothing more. That distinction is
+why the list may be capped at all. It is built from the newest sequence
+downward, so a cap discards the oldest runs, and those are the ones nearest the
+cursor. Were the cursor not carried separately, the truncation would be
+throwing away exactly the information the send window is waiting on.
+
+A flow that has just given up its buffered packets sends an entry with no ranges
+at all. The cursor is then the whole message, and it is the only way the sender
+learns that copies it had already released on the strength of an acknowledgement
+are owed again.
 
 ### 3.7 Lifecycles
 
@@ -616,7 +712,9 @@ lock and is applied to the peer under the peer lock.
 
 #### Peer eviction
 
-Optional, off by default. A peer from whom nothing has been received for the
+Always on. A zero timeout selects the default rather than switching it off, so
+there is no configuration in which a silent peer is kept forever. A peer from
+whom nothing has been received for the
 configured timeout is torn down on the tick, bounded per call. Received traffic
 is the only signal, because this socket's own sends prove nothing, and
 forgeable handshake chatter does not refresh the clock. Liveness stamps are

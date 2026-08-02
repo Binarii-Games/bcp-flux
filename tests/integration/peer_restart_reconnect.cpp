@@ -69,10 +69,10 @@ namespace
         {
             client.Flush(); server.Flush();
             client.Update(); server.Update();
-            const uint32_t n = server.Poll(inbox, 64);
-            for (uint32_t k = 0; k < n; ++k)
+            flux::PollCursor cursor = server.Poll(inbox, 64);
+            while (cursor.Next())
             {
-                flux::PacketSlotReader r{ std::move(inbox[k]) };
+                flux::PacketSlotReader& r = cursor.Message();
                 uint32_t v = 0;
                 if (r.TakeU32(v) && v == value) got = true;
             }

@@ -57,6 +57,27 @@ the timers (acks, retransmits, handshake retries), `Poll` hands you what
 arrived, and `Flush` puts what you sent on the wire. Call them from any threads,
 at any cadence, all three are safe concurrently.
 
+Polling from more than one thread needs one more step, because an ordered flow
+is only ordered to a single reader. Set `config.pollLanes` to the number of
+threads that will poll, and hand each thread's lane back to its next `Poll`:
+
+```cpp
+flux::ThreadIdentity me{};
+for (;;)
+{
+    flux::PollCursor cursor = socket.Poll(inbox, 8, me);
+    me.lane = cursor.Lane();           // come back to this lane next time
+    while (cursor.Next()) { /* ... */ }  // the lane is yours until the cursor dies
+}
+```
+
+`Poll` takes whichever lane is free, preferring the one you pass, and holds it
+until the cursor goes out of scope. So a peer's packets reach one thread at a
+time and arrive in sequence, a thread that keeps passing its lane back stays on
+it, and a lane whose thread stops calling is picked up by another instead of
+filling. Left at the default of one lane, `Poll` behaves exactly as above and
+the identity can be left off.
+
 `Flush` matters: a send on a flow is packed together with others going the same
 way, so several small messages leave as one datagram. They wait until you flush,
 which means the moment your bytes go out is yours to pick rather than a timer's.
@@ -70,17 +91,21 @@ for (;;)
     socket.Flush();    // send what this round produced
     socket.Update();
 
-    const uint32_t count = socket.Poll(inbox, 8);
-    for (uint32_t i = 0; i < count; ++i)
+    flux::PollCursor cursor = socket.Poll(inbox, 8);
+    while (cursor.Next())
     {
-        const flux::PacketSlot* packet  = inbox[i].Read();
-        const size_t            offset  = packet->ContentOffset();
-        const uint8_t*          payload = packet->Content(offset);
-        const size_t            length  = packet->dataSize - offset;
-        // read the payload here, the handle frees its slot when it dies
+        const uint8_t* payload = cursor.Message().Content();
+        const uint16_t length  = cursor.Message().ContentLength();
+        // read the payload here, the handles free their slots when they die
     }
 }
 ```
+
+`Poll` fills the array with packets and hands back a cursor over the messages
+inside them. One datagram can carry several, so the loop runs once per message
+rather than once per packet, and a caller never has to know which arrived
+together. `cursor.Packet()` reaches the packet a message came in when you want
+its address or its flow.
 
 The payload is never copied out. A handle points into the socket's receive
 pool and returns its slot when it goes out of scope.

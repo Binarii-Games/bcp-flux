@@ -34,6 +34,7 @@
 #include <flux/crypto/identity.h>
 #include <flux/socket/i_socket_kernel.h>
 #include <flux/socket/packet_slot.h>
+#include <flux/socket/ready_lanes.h>
 #include <flux/socket/socket_listener.h>
 #include <flux/socket/socket_sender.h>
 #include <flux/peer/peer.h>
@@ -108,6 +109,22 @@ namespace bcp::flux
         PeerTag                    tag{};
     };
 
+    /** The lane a thread last drained, handed back to Poll so it returns to the
+        same one.
+
+        Nothing is registered and nothing is owed: Poll takes whichever lane is
+        free, preferring this. A thread that keeps passing back what Poll gave it
+        stays on one lane, which is what keeps its peers' state in one cache, and
+        a lane whose usual thread stops calling is simply taken by another rather
+        than filling up untouched.
+
+        Default-constructed names lane zero, which is the only lane when Config
+        leaves pollLanes at one, so a single-threaded caller never mentions it. */
+    struct ThreadIdentity
+    {
+        uint32_t lane = 0;
+    };
+
     class Socket
     {
         // Both reach the socket's private send machinery: the builder picks a
@@ -142,6 +159,18 @@ namespace bcp::flux
             uint32_t    pendingPacketCount = 1024;   ///< pending pool, shared by all peers
             uint32_t    recvSlotCount      = internal::SOCK_KERNEL_ZLOCKPCKT_COUNT;
             uint32_t    sendSlotCount      = internal::SOCK_KERNEL_SENDSLOT_COUNT;
+
+            /** How many threads will drain delivered packets. One means Poll
+                behaves exactly as it always has and the identity argument can be
+                left off.
+
+                Above one it must be a power of two, and Init refuses anything
+                else rather than rounding, because a rounded-up count leaves a
+                lane no thread was told to drain. Every lane needs its own
+                thread: an undrained one fills until the receive pool is dry and
+                then the socket stops hearing anyone. Each lane is sized for the
+                whole receive pool, so this multiplies queue memory. */
+            uint32_t    pollLanes          = 1;
 
             /** Long-term identity (see Identity::Generate), copied by Init; the
                 caller may Wipe its own copy after. Null = anonymous (fresh
@@ -193,11 +222,27 @@ namespace bcp::flux
                 uint32_t inCount           = 0;    ///< receiving associations, socket-wide
                 uint32_t bulkInCount       = 0;    ///< of which bulk-capable; sized for the deep window
                 uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
-                uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: what one remote may create
-                /** Retained reliable bodies, held send-until-ack for retransmit.
-                    Socket-wide ceiling on unacked reliable traffic; running dry
-                    is backpressure. Sized apart from send slots so a busy flow
-                    can never starve handshakes, acks, or unreliable traffic. */
+                /** DEFENSIVE: what one remote may create. It also bounds how
+                    much of the receive pool that remote can pin, because each
+                    receiving association can hold a full window of packets
+                    behind a gap it never fills. maxInPerPeer times the window
+                    is the worst case for one peer, and at the defaults that is
+                    the whole pool, so a socket exposed to untrusted remotes
+                    wants this low, recvSlotCount high, or both. */
+                uint32_t maxInPerPeer      = 8;
+                /** Retained reliable bodies, kept as retransmit sources. Held
+                    from send until the receiver reports a delivery cursor past
+                    them, which is later than the acknowledgement: a packet can
+                    be acknowledged while merely buffered, and a buffer can be
+                    dropped. Running dry is backpressure rather than loss. Sized apart from send
+                    slots so a busy flow can never starve handshakes, acks, or
+                    unreliable traffic.
+
+                    A body is retained from send until the receiver's cursor
+                    passes it, so a flow whose receiver has stalled holds on to
+                    everything in its window. Few enough of those and the pool
+                    is gone, and then every reliable send on the socket fails,
+                    including the ones to peers that are perfectly healthy. */
                 uint32_t stagingCount      = 512;
                 /** In-flight byte budget never drops below this on a loss run:
                     throttled, never strangled. 0 takes CC_MIN_BUDGET_DEFAULT;
@@ -297,8 +342,14 @@ namespace bcp::flux
 
         /** Pass 1 processes the kernel batch (decrypt, dispatch, commit); pass
             2 drains the ready queue into `outPackets`. Packets never leave the
-            recv pool. Safe to call concurrently. */
-        uint32_t Poll(PacketSlotHandle* outPackets, size_t max);
+            recv pool. Safe to call concurrently.
+
+            The cursor walks the messages those packets carried, so a caller
+            reads one loop and never handles a batch itself. It borrows
+            `outPackets`, which therefore has to outlive it. */
+        PollCursor Poll(PacketSlotHandle* outPackets, size_t max,
+                        ThreadIdentity identity = {});
+
 
         /** The tick: flush owed acks, retransmit, retry open/close, evict idle
             peers. Flux owns no thread, so time-based work happens only here.
@@ -350,10 +401,9 @@ namespace bcp::flux
             first packet that arrives and refuses only when it is at its caps,
             which fails that one target rather than the flow.
 
-            The in-flight window is internal::FLOW_WINDOW, the same for every
-            flow and every socket, so nothing about it is declared here or on the
-            wire. The id is the app's to choose and must be free on this
-            socket. */
+            The in-flight window comes from the mode (see WindowFor), so
+            nothing about it is declared here or on the wire. The id is the
+            app's to choose and must be free on this socket. */
         [[nodiscard]] FlowHandle OpenFlow(uint16_t flowId, FlowMode mode);
 
         /** Closes the flow and every target it was talking to, releasing their
@@ -436,7 +486,7 @@ namespace bcp::flux
         // The recv/ready path. The flow table borrows all three.
         common::collections::SlotPool* recvPool_ = nullptr;   ///< borrowed from the kernel
         common::collections::SlotPool* sendPool_ = nullptr;   ///< borrowed from the kernel
-        common::collections::FifoQueue<uint32_t> readyQueue_;   ///< recv-slot indices awaiting Poll
+        ReadyLanes readyLanes_;   ///< recv-slot indices awaiting Poll, split per draining thread
 
         // Fixed-at-Init scalars.
         uint32_t                       minCongestionBudget_ = internal::CC_MIN_BUDGET_DEFAULT;
@@ -444,7 +494,7 @@ namespace bcp::flux
             table because a handshake happens whether or not flows are
             configured, and the table is empty when they are not. */
         uint32_t                       handshakeRetryMicros_ = 0;
-        uint32_t                       evictAfterStamp_ = 0;   ///< idleTimeout + grain, SeenStamp units; 0 = off
+        uint32_t                       evictAfterStamp_ = 0;   ///< idleTimeout + grain, in SeenStamp units; never zero once Init succeeds
         uint32_t                       seenGrainStamp_  = 0;
         bool                           acceptUnsecureFromUnknown_ = false;
 
@@ -548,7 +598,7 @@ namespace bcp::flux
             then flow (the global order) and validates the ring still owns the
             slot at `expectedSeq` before sending. Materials, including `to`, come
             from the caller. */
-        void ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
+        bool ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
                            uint32_t expectedSeq, const PeerSendMaterials& materials);
 
         /** Seals a retained plaintext into a fresh wire slot bound for `to` and
@@ -558,7 +608,7 @@ namespace bcp::flux
 
             @pre Caller holds the source slot's lock and keeps its lease (the
                  in-flight ring owns it). */
-        void SealStagingToWire(const Address& to, const PacketSlot& staging,
+        bool SealStagingToWire(const Address& to, const PacketSlot& staging,
                                const PeerSendMaterials& materials);
 
         /** Builds and sends one secure-channel control packet, wire-identical to

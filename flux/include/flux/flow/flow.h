@@ -143,8 +143,8 @@ namespace bcp::flux
 
     /** The flow data byte carried after the sequence in every flow packet:
         mode in bits 0-2, epoch in bits 3-5, more-follows in bit 6, and
-        message-starts in bit 7. The in-flight window is a socket-wide constant,
-        so nothing about it travels.
+        message-starts in bit 7. The in-flight window comes from the mode bits
+        already here, so nothing about it travels separately.
 
         The byte rides every packet, not just the first, so a receiver can
         register the flow from whichever packet arrives first, and so a
@@ -280,8 +280,15 @@ namespace bcp::flux
         an unreliable flow's entries never hold a packet slot to mark it with.
 
         packetSlot is the retained plaintext in the staging pool, this packet's
-        retransmit source, released when the seq resolves. INVALID on an
-        unreliable flow, whose entries track loss and budget only. */
+        retransmit source. INVALID on an unreliable flow, whose entries track
+        loss and budget only.
+
+        An acknowledgement frees the window slot but not the copy. A receiver
+        that buffered a packet ahead of a gap can be made to drop it again under
+        memory pressure, so the copy is held until the receiver reports a
+        delivery cursor past this sequence, which is the point past which it can
+        no longer ask for it. Only an ordered flow retains: an unordered
+        receiver buffers nothing, so its acknowledgement is final. */
     struct InFlightEntry
     {
         uint64_t sentAtMicros;
@@ -289,6 +296,7 @@ namespace bcp::flux
         uint32_t packetSlot;
         uint16_t wireSize;     ///< refunded to the congestion budget on resolve
         uint8_t  retries;      ///< give-up counter; the flow fails at the cap
+        bool     acked;        ///< resolved, copy retained until the run below it clears
     };
 
     /** One packet received ahead of order, held until the gap before it fills.
@@ -384,6 +392,11 @@ namespace bcp::flux
 
         uint32_t nextSeq;
         uint32_t unresolved;    ///< stamped and unacked; the send gate refuses at inflightCap
+
+        /** Lowest sequence whose ring entry may still hold a retained copy.
+            Everything below it has been released, so it is the floor a
+            receiver can no longer ask about. */
+        uint32_t ackBase;
 
         uint32_t srttMicros;    ///< 0 until the first sample
         uint32_t rttvarMicros;
@@ -490,7 +503,7 @@ namespace bcp::flux
         The seen bitmap is this side's memory of which seqs arrived. It exists
         because a retransmit wears a fresh nonce and passes the replay window
         looking new, so only this can tell "seq 6 again" from "seq 6 finally".
-        Its width is the socket-wide in-flight window, which both ends share, so
+        Its width is the in-flight window for this mode, which both ends derive, so
         a seq below the floor is provably resolved and can only be a stale
         duplicate.
 
@@ -523,7 +536,7 @@ namespace bcp::flux
             Config::timers::ackDelayMicros; 0 means nothing is owed. */
         uint64_t ackArmedMicros;
 
-        uint16_t windowBits;    ///< seen-bitmap width, the socket-wide window
+        uint16_t windowBits;    ///< seen-bitmap width, the window for this mode
         uint16_t reorderCap;
 
         uint64_t* Seen()

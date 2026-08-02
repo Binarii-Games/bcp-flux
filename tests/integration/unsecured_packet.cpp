@@ -70,17 +70,17 @@ int main()
         b.Flush();
         b.Update();
 
-        const uint32_t count = b.Poll(inbox, 8);
-        for (uint32_t k = 0; k < count; ++k)
+        flux::PollCursor cursor = b.Poll(inbox, 8);
+        while (cursor.Next())
         {
-            const flux::PacketSlot* packet = inbox[k].Read();
+            const flux::PacketSlot* packet = cursor.Packet().Read();
             if (!packet) continue;
 
             framing  = packet->ContentOffset();
             wireSize = packet->dataSize;
             gotLen   = wireSize - framing;
             if (gotLen <= sizeof(got))
-                std::memcpy(got, packet->Content(framing), gotLen);
+                std::memcpy(got, cursor.Message().Content(), gotLen);
             arrived = true;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(200));

@@ -38,12 +38,6 @@ namespace bcp::flux::internal
         this one, so there is a single definition. */
     static constexpr uint8_t  WIRE_CTRL_BATCH               = 0x20;
 
-    /** Ceiling on messages the receive side will split one batch into. A batch
-        is bounded by the datagram, so the real ceiling is how many minimum-size
-        entries fit; this names it so the split can size a fixed array and a
-        malformed count cannot make it unbounded. */
-    static constexpr uint16_t MAX_BATCH_MESSAGES            =
-        MAX_WIRE_PACKET_SIZE / (WIRE_BATCH_LEN_SIZE + 1);
     static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;
     static constexpr uint8_t  MIN_WIRE_SIZE                 = WIRE_CONTROLLER_SIZE;
     /** What a secure packet puts in front of the content: controller and the
@@ -103,8 +97,15 @@ namespace bcp::flux::internal
     static constexpr uint8_t  HANDSHAKE_MAX_ATTEMPTS        = 8;
     static constexpr uint32_t HANDSHAKE_RETRY_DEFAULT       = 200000;  ///< used when Config leaves it at zero
 
-    /** Per flow, per FLOW_ACK packet. Bounds wire bytes only: acks are
-        cumulative, so a range that misses one report rides the next. */
+    /** Bytes in front of a FLOW_ACK entry's ranges:
+        [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)]. */
+    static constexpr uint8_t  WIRE_ACK_ENTRY_HEAD_SIZE      = 8;
+
+    /** Ranges per flow, per FLOW_ACK packet, bounding wire bytes. The list is
+        built from the newest seq downward, so what a cap discards is always the
+        oldest run. That is why the entry carries recvNext: the cursor is the
+        part the sender cannot afford to lose, and it is one fixed field rather
+        than a list that can be cut short. */
     static constexpr uint8_t  FLOW_ACK_RANGE_COUNT          = 16;
 
     // --- Congestion control ---

@@ -15,6 +15,7 @@
 
 namespace bcp::flux
 {
+    class ReadyLanes;
     class Socket;
     namespace wire { class PacketBuilder; }
 
@@ -23,7 +24,7 @@ namespace bcp::flux
         the RAII accessors that lock, read, and write one of these.
 
         Wire layout, driven by independent controller bits:
-          secure    (CTRL_UNSECURE clear): [Controller(1)][Tag(16)][NonceCounter(8)][PeerTag(4)?] || [Channel(1)][...]
+          secure    (CTRL_UNSECURE clear): [Controller(1)][NonceCounter(8)][PeerTag(4)?] || [Channel(1)][...][Tag(16)]
           unsecured (CTRL_UNSECURE set):   [Controller(1)][...]
         [PeerTag(4)?] is present when CTRL_TAGGED is set (the migration handle).
         On a secure packet everything after the header (the ||) is ciphertext:
@@ -61,8 +62,8 @@ namespace bcp::flux
         bool IsMacOnly() const;
 
         /** Whether the content is a list of length-prefixed messages rather
-            than one message. Split apart before delivery, so an application
-            never sees one of these. */
+            than one message. The packet is delivered whole and PollCursor walks
+            the list, so a caller reading messages never has to ask. */
         bool IsBatch() const;
         uint16_t FlowId() const;
         /** The flow sequence number of a flow packet; 0 (the never-sent
@@ -247,15 +248,26 @@ namespace bcp::flux
     };
 
     
-    class PacketSlotReader 
+    class PacketSlotReader
     {
     private:
         const PacketSlot* pkt_;
-        PacketSlotHandle handle_;
         common::BytesReader cursor_;
+        common::Error failReason_;
+        const uint8_t* content_;
+        uint16_t contentLen_;
+        uint16_t walkOffset_;
+        const uint8_t* message_;
+        uint16_t messageLen_;
 
     public:
-        PacketSlotReader(PacketSlotHandle handle) noexcept;
+        /** Walks a packet the caller owns, one message at a time. The handle
+            keeps the slot and its read lock, so it has to outlive the reader.
+
+            A packet carrying one message and a batch carrying many read the
+            same way: the reader opens on the first message either way, and the
+            Take calls see that message alone. */
+        PacketSlotReader(PacketSlotHandle& handle) noexcept;
 
         bool TakeU8(uint8_t& out);
         bool TakeU16(uint16_t& out);
@@ -263,13 +275,83 @@ namespace bcp::flux
         bool TakeU64(uint64_t& out);
         bool TakeBytes(uint8_t* dst, size_t len);
 
+        /** The message the reader is on, and its length. */
+        [[nodiscard]] const uint8_t* Content() const noexcept { return message_; }
+        [[nodiscard]] uint16_t ContentLength() const noexcept { return messageLen_; }
+
+        /** Moves to the next message, rewinding the Take cursor to its start.
+
+            @return false once the last message has been read, which is
+                    immediately for a packet that carries only one. */
+        [[nodiscard]] bool NextMessage() noexcept;
+
         /** The packet being walked. For a check that has to cover bytes the
             reader already consumed, such as a MAC over the whole datagram. */
         [[nodiscard]] const PacketSlot* Packet() const noexcept { return pkt_; }
 
-        PacketSlotHandle ExtractHandle() && noexcept;
-
         bool Failed();
         common::Error FailReason();
+    };
+
+
+    /** Walks every message Poll delivered, across every packet it delivered
+        them in.
+
+        A packet holds one message or a batch of them, and the difference is
+        not the caller's problem: one loop over the cursor sees each message
+        once, in arrival order, whichever way they travelled. The cursor reads
+        the array Poll filled and owns nothing of it, so it must not outlive it.
+
+        It does own one thing: the claim on the lane those packets came from,
+        held from Poll until this dies. That span is deliberate. Ordering only
+        survives if a single thread is the only one working a peer's traffic
+        from the queue through to the last byte read out of it, so the claim has
+        to cover the reading and not merely the draining. Let the cursor go and
+        another thread may take the lane. */
+    class PollCursor
+    {
+    private:
+        ReadyLanes* lanes_;
+        uint32_t lane_;
+        PacketSlotHandle* slots_;
+        uint32_t count_;
+        uint32_t index_;
+        bool opened_;
+        PacketSlotHandle none_;
+        PacketSlotReader reader_;
+
+    public:
+        PollCursor(ReadyLanes* lanes, uint32_t lane,
+                   PacketSlotHandle* slots, uint32_t count) noexcept;
+        ~PollCursor();
+
+        PollCursor(const PollCursor&) = delete;
+        PollCursor& operator=(const PollCursor&) = delete;
+        PollCursor(PollCursor&& o) noexcept;
+        PollCursor& operator=(PollCursor&& o) noexcept;
+
+        /** The lane this drained, to hand back to the next Poll so a thread
+            keeps returning to the same one. */
+        [[nodiscard]] uint32_t Lane() const noexcept { return lane_; }
+
+        /** Moves to the next message, opening the next packet when the current
+            one is spent.
+
+            @return false once every message in every packet has been seen. */
+        [[nodiscard]] bool Next() noexcept;
+
+        /** The message the cursor is on. Valid after Next returned true. */
+        [[nodiscard]] PacketSlotReader& Message() noexcept { return reader_; }
+
+        /** The packet that message arrived in, for a reply or for its address
+            and flow. Several messages can report the same packet, and a spent
+            cursor reports an invalid one. */
+        [[nodiscard]] PacketSlotHandle& Packet() noexcept
+        {
+            return index_ < count_ ? slots_[index_] : none_;
+        }
+
+        /** Packets delivered, not messages. */
+        [[nodiscard]] uint32_t PacketCount() const noexcept { return count_; }
     };
 }

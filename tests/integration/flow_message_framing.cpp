@@ -105,14 +105,13 @@ namespace
             b.Flush();
             b.Update();
 
-            const uint32_t count = b.Poll(sink, 64);
-            for (uint32_t k = 0; k < count; ++k)
+            flux::PollCursor cursor = b.Poll(sink, 64);
+            while (cursor.Next())
             {
-                const flux::PacketSlot* packet = sink[k].Read();
+                const flux::PacketSlot* packet = cursor.Packet().Read();
                 if (!packet) continue;
-                const size_t offset = packet->ContentOffset();
-                into.Take(packet->Part(), packet->Content(offset),
-                          packet->ContentLength());
+                into.Take(packet->Part(), cursor.Message().Content(),
+                          cursor.Message().ContentLength());
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }

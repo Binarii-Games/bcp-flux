@@ -74,15 +74,14 @@ static void Receive(flux::Socket& socket)
         socket.Flush();
         socket.Update();
 
-        const uint32_t count = socket.Poll(inbox, 64);
-        for (uint32_t i = 0; i < count; ++i)
+        flux::PollCursor cursor = socket.Poll(inbox, 64);
+        while (cursor.Next())
         {
-            const flux::PacketSlot* packet = inbox[i].Read();
+            const flux::PacketSlot* packet = cursor.Packet().Read();
             if (!packet) continue;
 
-            const size_t   offset  = packet->ContentOffset();
-            const uint8_t* content = packet->Content(offset);
-            const size_t   length  = packet->ContentLength();
+            const uint8_t* content = cursor.Message().Content();
+            const size_t   length  = cursor.Message().ContentLength();
 
             for (size_t b = 0; b < length; ++b)
             {
@@ -92,7 +91,7 @@ static void Receive(flux::Socket& socket)
         }
         receivedBytes = expected;
 
-        if (count == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+        if (cursor.PacketCount() == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 
     common::LogF(common::LogLevel::Info, "B received %zu bytes, contents %s",

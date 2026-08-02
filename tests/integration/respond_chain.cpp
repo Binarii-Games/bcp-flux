@@ -65,52 +65,51 @@ int main()
     {
         b.Flush();
         b.Update();
-        const uint32_t countB = b.Poll(inbox, 8);
-        for (uint32_t i = 0; i < countB; ++i)
+        flux::PollCursor cursorB = b.Poll(inbox, 8);
+        while (cursorB.Next())
         {
             if (answered)
                 continue;
             answered = true;
 
             // The reply chain: no address anywhere, the handle carries it.
-            CHECK(inbox[i].PrepareResponse().NoFlow()
+            CHECK(cursorB.Packet().PrepareResponse().NoFlow()
                       .PutBytes(PONG, sizeof(PONG) - 1).Respond()
                   == common::Error::Ok);
 
             // Each PrepareResponse mints a fresh one-shot builder, so one
             // packet can be answered more than once.
-            CHECK(inbox[i].PrepareResponse().NoFlow().PutU8(EXTRA).Respond()
+            CHECK(cursorB.Packet().PrepareResponse().NoFlow().PutU8(EXTRA).Respond()
                   == common::Error::Ok);
 
             // The secured terminal carries the SendSecured contract: nothing
             // pinned A's identity, so the reply is refused, not delivered.
-            CHECK(inbox[i].PrepareResponse().NoFlow().PutU8(EXTRA).RespondSecured()
+            CHECK(cursorB.Packet().PrepareResponse().NoFlow().PutU8(EXTRA).RespondSecured()
                   == common::Error::NotAuthenticated);
 
             // Moving the handle moves the reply capability with it; the
             // moved-from handle keeps nothing to send through.
-            flux::PacketSlotHandle moved = std::move(inbox[i]);
-            CHECK(inbox[i].PrepareResponse().NoFlow().PutU8(1).Respond()
+            flux::PacketSlotHandle moved = std::move(cursorB.Packet());
+            CHECK(cursorB.Packet().PrepareResponse().NoFlow().PutU8(1).Respond()
                   == common::Error::InvalidState);
             CHECK(!moved.PrepareResponse().Failed());
         }
 
         a.Flush();
         a.Update();
-        const uint32_t countA = a.Poll(inbox, 8);
-        for (uint32_t i = 0; i < countA; ++i)
+        flux::PollCursor cursorA = a.Poll(inbox, 8);
+        while (cursorA.Next())
         {
-            const flux::PacketSlot* packet = inbox[i].Read();
+            const flux::PacketSlot* packet = cursorA.Packet().Read();
             if (!packet)
                 continue;
 
-            const size_t offset = packet->ContentOffset();
-            const size_t length = packet->ContentLength();
+            const size_t length = cursorA.Message().ContentLength();
 
             if (length == sizeof(PONG) - 1 &&
-                std::memcmp(packet->Content(offset), PONG, length) == 0)
+                std::memcmp(cursorA.Message().Content(), PONG, length) == 0)
                 gotPong = true;
-            else if (length == 1 && packet->Content(offset)[0] == EXTRA)
+            else if (length == 1 && cursorA.Message().Content()[0] == EXTRA)
                 gotExtra = true;
         }
 

@@ -87,15 +87,15 @@ int main()
         b.Flush();
         b.Update();
 
-        const uint32_t count = b.Poll(inbox, 8);
-        for (uint32_t k = 0; k < count; ++k)
+        flux::PollCursor cursor = b.Poll(inbox, 8);
+        while (cursor.Next())
         {
-            const flux::PacketSlot* packet = inbox[k].Read();
+            const flux::PacketSlot* packet = cursor.Packet().Read();
             if (!packet) continue;
 
             const size_t   offset = packet->ContentOffset();
-            const uint8_t* body   = packet->Content(offset);
-            const size_t   length = packet->ContentLength();
+            const uint8_t* body   = cursor.Message().Content();
+            const size_t   length = cursor.Message().ContentLength();
 
             const bool intact = length == sizeof(payload)
                              && std::memcmp(body, payload, length) == 0;

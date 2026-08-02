@@ -52,10 +52,10 @@ static void Drive(flux::Socket& client,
         for (size_t s = 0; s < serverCount; ++s)
         {
             servers[s]->Update();
-            const uint32_t count = servers[s]->Poll(handles, 64);
-            for (uint32_t h = 0; h < count; ++h)
+            flux::PollCursor cursor = servers[s]->Poll(handles, 64);
+            while (cursor.Next())
             {
-                flux::PacketSlotReader reader{ std::move(handles[h]) };
+                flux::PacketSlotReader& reader = cursor.Message();
                 uint32_t value = 0;
                 if (reader.TakeU32(value))
                     buckets[s].push_back(value);

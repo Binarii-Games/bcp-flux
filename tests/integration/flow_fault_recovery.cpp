@@ -240,14 +240,13 @@ namespace
             server.Flush();
             server.Update();
 
-            const uint32_t count = server.Poll(sink, 64);
-            for (uint32_t i = 0; i < count; ++i)
+            flux::PollCursor cursor = server.Poll(sink, 64);
+            while (cursor.Next())
             {
-                const flux::PacketSlot* packet = sink[i].Read();
+                const flux::PacketSlot* packet = cursor.Packet().Read();
                 if (!packet) continue;
 
-                const size_t   offset = packet->ContentOffset();
-                const uint8_t* body   = packet->Content(offset);
+                const uint8_t* body = cursor.Message().Content();
                 const int index = static_cast<int>(body[0])
                                 | static_cast<int>(body[1]) << 8;
 

@@ -21,7 +21,7 @@ namespace common = bcp::common;
 static constexpr uint16_t PORT_A = 9810;
 static constexpr uint16_t PORT_B = 9811;
 
-// Pumps both sockets, collecting the u32 payload of every flow packet the
+// Pumps both sockets, collecting the u32 payload of every flow message the
 // server delivers.
 static void Drive(flux::Socket& client, flux::Socket& server,
                   std::vector<uint32_t>& delivered, int ticks)
@@ -35,10 +35,10 @@ static void Drive(flux::Socket& client, flux::Socket& server,
         server.Update();
         client.Poll(handles, 64);
 
-        const uint32_t count = server.Poll(handles, 64);
-        for (uint32_t h = 0; h < count; ++h)
+        flux::PollCursor cursor = server.Poll(handles, 64);
+        while (cursor.Next())
         {
-            flux::PacketSlotReader reader{ std::move(handles[h]) };
+            flux::PacketSlotReader& reader = cursor.Message();
             uint32_t value = 0;
             if (reader.TakeU32(value))
                 delivered.push_back(value);

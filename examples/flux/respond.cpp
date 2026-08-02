@@ -37,22 +37,19 @@ static void Tick(flux::Socket& socket)
         socket.Flush();
         socket.Update();
 
-        const uint32_t count = socket.Poll(inbox, 8);
-        for (uint32_t i = 0; i < count; ++i)
+        flux::PollCursor cursor = socket.Poll(inbox, 8);
+        while (cursor.Next())
         {
-            const flux::PacketSlot* packet = inbox[i].Read();
-            const size_t            offset = packet->ContentOffset();
-
             common::LogF(common::LogLevel::Info, "B got: %.*s",
-                         int(packet->ContentLength()),
-                         reinterpret_cast<const char*>(packet->Content(offset)));
+                         int(cursor.Message().ContentLength()),
+                         reinterpret_cast<const char*>(cursor.Message().Content()));
 
             // The reply comes from the packet, not the socket. PrepareResponse
             // hands back the ordinary builder already aimed at the sender, so
             // the chain is the usual one and ends with Respond() in place of
             // Send(address). RespondSecured() exists too, with the SendSecured
             // contract.
-            inbox[i].PrepareResponse()
+            cursor.Packet().PrepareResponse()
                 .NoFlow()
                 .PutBytes(PONG, sizeof(PONG) - 1)
                 .Respond();
@@ -96,15 +93,12 @@ int main()
     {
         a.Flush();
         a.Update();
-        const uint32_t count = a.Poll(inbox, 8);
-        for (uint32_t i = 0; i < count && !got; ++i)
+        flux::PollCursor cursor = a.Poll(inbox, 8);
+        while (!got && cursor.Next())
         {
-            const flux::PacketSlot* packet = inbox[i].Read();
-            const size_t            offset = packet->ContentOffset();
-
             common::LogF(common::LogLevel::Info, "A got: %.*s",
-                         int(packet->ContentLength()),
-                         reinterpret_cast<const char*>(packet->Content(offset)));
+                         int(cursor.Message().ContentLength()),
+                         reinterpret_cast<const char*>(cursor.Message().Content()));
             got = true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

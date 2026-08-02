@@ -93,11 +93,11 @@ static common::Error SendOp(flux::Socket& socket, const flux::Address& to, uint8
 static int CollectOp(flux::Socket& socket, uint8_t op)
 {
     flux::PacketSlotHandle handles[64];
-    uint32_t count = socket.Poll(handles, 64);
+    flux::PollCursor cursor = socket.Poll(handles, 64);
     int seen = 0;
-    for (uint32_t i = 0; i < count; ++i)
+    while (cursor.Next())
     {
-        flux::PacketSlotReader reader{std::move(handles[i])};
+        flux::PacketSlotReader& reader = cursor.Message();
         uint8_t got = 0;
         if (reader.TakeU8(got) && got == op) ++seen;
     }
