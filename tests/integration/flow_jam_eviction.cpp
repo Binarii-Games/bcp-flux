@@ -119,13 +119,15 @@ static void JammedFlowEvicted()
     CHECK(SendWithLostHead(client, CLIENT, flow, serverAddr, 20));
 
     // The head is lost, so the receiver holds seq 2.. behind the gap and
-    // delivers nothing. The flow exists and is pinning slots.
+    // delivers nothing. Ingest with Poll only: the flow is created on receipt,
+    // but eviction runs on the server tick, so leaving the server un-ticked here
+    // means nothing can reclaim the flow before we observe it, however slow the
+    // runner. The tick starts in the eviction phase below.
     flux::PacketSlotHandle inbox[64];
     uint32_t delivered = 0;
-    for (int i = 0; i < 120; ++i)   // ~120 ms, under the sender's 10 s retry
+    for (int i = 0; i < 120; ++i)
     {
         client.Update();
-        server.Update();
         delivered += server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -246,13 +248,14 @@ static void SiblingSurvives()
 
     Pump(client, server, 20);   // quiesce before staging the jam
 
-    // A second flow, jammed the same way as test 1.
+    // A second flow, jammed the same way as test 1. Ingest with Poll only, so
+    // the un-ticked server cannot reclaim it before we observe both flows.
     flux::FlowHandle jam = client.OpenFlow(31, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!jam.Failed());
     CHECK(SendWithLostHead(client, CLIENT, jam, serverAddr, 20));
     for (int i = 0; i < 120; ++i)
     {
-        client.Update(); server.Update(); server.Poll(inbox, 64);
+        client.Update(); server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
