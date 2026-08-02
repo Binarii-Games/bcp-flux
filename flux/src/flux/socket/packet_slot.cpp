@@ -475,7 +475,10 @@ namespace bcp::flux
         cursor_ = common::BytesReader
         {
             .p = pkt_->Content(offset),
-            .r = (pkt_->dataSize - offset)
+            // ContentLength, not dataSize - offset: a secure packet ends in the
+            // AEAD tag, which is framing and not payload, so a length-driven or
+            // read-to-exhaustion caller must not see it.
+            .r = pkt_->ContentLength()
         };
     }
 
