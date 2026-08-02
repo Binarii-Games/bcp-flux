@@ -59,6 +59,13 @@ namespace bcp::flux
             packet, so the offsets are identical; only the transform differs.
             The payload is readable by anyone and alterable by nobody. */
         CTRL_MACONLY  = (1u << 4),
+        /** The content is a list of messages, each behind a two-byte length,
+            rather than one message filling it. Set only from the second message
+            on, so a packet carrying one is byte-identical to an unbatched one
+            and costs nothing. Every message in the list belongs to the same
+            flow with the same security, which is why they share this
+            controller instead of each carrying one. */
+        CTRL_BATCH    = (1u << 5),
     };
 
     constexpr Controls operator|(Controls a, Controls b) noexcept

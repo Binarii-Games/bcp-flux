@@ -54,6 +54,13 @@ namespace bcp::flux
             assoc->waitingHead  = 0;
             assoc->waitingCount = 0;
 
+            // No batch is open on a fresh association. A recycled slot may carry
+            // the previous tenant's index here, and acting on that would append
+            // into a slot this flow does not own.
+            assoc->openBatchSlot     = common::collections::SlotPool::INVALID;
+            assoc->openBatchCount    = 0;
+            assoc->openBatchFirstLen = 0;
+
             InFlightEntry* inFlight = assoc->InFlight();
             for (uint32_t i = 0; i < inflightCap; ++i)
                 inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID, 0, 0 };

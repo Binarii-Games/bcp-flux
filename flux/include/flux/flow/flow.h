@@ -394,6 +394,31 @@ namespace bcp::flux
         uint32_t waitingHead;   ///< masked by waitingCap - 1; only advances
         uint32_t waitingCount;
 
+        /** The batch being filled, and the whole of the batching state. Sends
+            append into this slot until it is sealed, by a message that will not
+            fit or by Flush, and sealing is what hands it to the ordinary admit
+            path. So the batch takes the flow's next sequence and every ack,
+            retransmit and dedupe below stays exactly as it was: the reliability
+            machinery only ever sees one wire packet per sequence and never
+            learns how many messages rode inside it.
+
+            One open batch per flow, never more. Two would let a later message
+            seal into an earlier sequence, which is reordering the packer
+            invented rather than the network.
+
+            SlotPool::INVALID means none is open. The slot comes from staging on
+            a reliable flow, so it is already the retransmit source and sealing
+            copies nothing.
+
+            firstLen is kept because the first message is written with no length
+            in front of it, which is what makes a one-message batch identical on
+            the wire to an unbatched packet. When a second message arrives the
+            first has to be shifted to make room for its length, and this is
+            where that length comes from. */
+        uint32_t openBatchSlot;
+        uint16_t openBatchCount;
+        uint16_t openBatchFirstLen;
+
         InFlightEntry* InFlight()
         {
             return reinterpret_cast<InFlightEntry*>(

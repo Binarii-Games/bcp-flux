@@ -22,6 +22,14 @@ namespace bcp::flux::internal
     static constexpr uint8_t  WIRE_FLOW_HEADER_SIZE         =
         WIRE_FLOW_ID_SIZE + WIRE_FLOW_SEQ_SIZE + WIRE_FLOW_DATA_SIZE;
     static constexpr uint8_t  WIRE_PEER_TAG_SIZE            = 4;  ///< present when CTRL_TAGGED is set
+
+    /** Length in front of each message when CTRL_BATCH is set. Two bytes covers
+        anything that fits a datagram, and a fixed width keeps the walk a bounds
+        check rather than a decode. The lengths must consume the content
+        exactly: a walk that overruns or leaves a tail means the framing cannot
+        be trusted, so the whole packet is dropped rather than partly
+        delivered. */
+    static constexpr uint8_t  WIRE_BATCH_LEN_SIZE           = 2;
     static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;
     static constexpr uint8_t  MIN_WIRE_SIZE                 = WIRE_CONTROLLER_SIZE;
     /** What a secure packet puts in front of the content: controller and the
