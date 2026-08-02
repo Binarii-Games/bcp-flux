@@ -157,9 +157,15 @@ inline. Caps are powers of two fixed at `Init` and stamped into the slot, so a
 slot describes its own layout:
 
 ```
-[OutAssociation][InFlightEntry × inflightCap][WaitingEntry × waitingCap]
+[OutAssociation][InFlightEntry × inflightCap][WaitingEntry × waitingCap][open batch]
 [InAssociation ][seen bitmap               ][HoldbackEntry × reorderCap]
 ```
+
+The open batch is the packet a sending association is filling, sized for the
+largest one this socket would put on the wire. It is inline rather than a
+pooled slot so that the association's own lock covers it: finding a pooled slot
+would mean taking the association lock and then the slot's, which is the
+reverse of the order the send path takes everywhere else.
 
 #### PacketSlot
 
@@ -240,13 +246,20 @@ holds takes the handle, never an address or slot index:
 
 ### 3.4 Concurrency
 
-Flux owns no thread. Work happens on a caller's thread through three entry
+Flux owns no thread. Work happens on a caller's thread through four entry
 points, all safe to call concurrently:
 
 - `Poll` processes inbound packets and drains ready ones to the application.
 - `Update` runs the tick: flush owed acks, retransmit, drain waiting sends,
   evict idle peers. All time-based work lives here.
+- `Flush` puts every flow's part-filled batch on the wire.
 - Sending, through `PacketBuilder`.
+
+A send on a flow is packed into a batch and waits for `Flush`, so a caller
+drives all three round its loop and nothing leaves without the last of them.
+There is deliberately no automatic flush. One that fired sometimes would make
+send timing unpredictable and would hide a forgotten call rather than surfacing
+it, and the moment bytes go out is the caller's to choose.
 
 Flow state lives in `FlowTable`, which owns the flow, association and staging
 pools and every algorithm that reads only those: sequence numbering, the send
@@ -285,28 +298,41 @@ Two layouts, split by the `UNSECURE` bit of the leading controller byte. A `?`
 marks a conditional field, and everything after the `‖` is ciphertext:
 
 ```
-secure    [Controller(1)][Tag(16)][NonceCounter(8)][PeerTag(4)]? ‖ [Channel(1)]([FlowId(2)][FlowSeq(4)][FlowData(1)])?[payload]
-unsecured [Controller(1)][payload]
+secure    [Controller(1)][NonceCounter(8)][PeerTag(4)]? ‖ [Channel(1)]([FlowId(2)][FlowSeq(4)][FlowData(1)])?[content] [Tag(16)]
+unsecured [Controller(1)][content]
 ```
 
 | Field | Bytes | Present | What it is |
 |---|---|---|---|
-| Controller | 1 | always | four independent bit flags, listed below |
-| Tag | 16 | secure | the AEAD authentication tag over the packet |
+| Controller | 1 | always | six independent bit flags, listed below |
 | NonceCounter | 8 | secure | the sender's counter, masked, the wire half of the nonce |
 | PeerTag | 4 | secure, `TAGGED` set | the migration tag |
 | Channel | 1 | secure, inside the seal | 0 for application data, otherwise an internal control op |
 | FlowId | 2 | `HAS_FLOW` set | the sender's flow id |
 | FlowSeq | 4 | `HAS_FLOW` set | the packet's sequence on that flow, starting at 1 |
 | FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, epoch in bits 3-5, more-follows in bit 6, continues in bit 7 |
-| payload | rest | always | application bytes, or the control op's body |
+| content | rest | always | one message, or a list of them when `BATCH` is set |
+| Tag | 16 | secure | the AEAD authentication tag, after the content rather than before it |
+
+The tag sits at the end so that everything it covers is one unbroken run of
+bytes rather than pieces on either side of it.
+
+Content is one message filling it, or, when `CTRL_BATCH` is set, a list of
+messages each behind a two-byte little-endian length. The first message in a
+list carries no length of its own, so a packet holding a single message is
+byte-identical to an unbatched one and a caller sending one message at a time
+pays nothing. The lengths must account for the content exactly, and a chain that
+overruns or leaves a tail is refused whole.
 
 The controller bits: `CTRL_INTERNAL` marks handshake traffic, consumed and
 never delivered. `CTRL_HAS_FLOW` says the flow header sits inside the seal.
 `CTRL_UNSECURE` marks the plaintext opt-out, which carries no tag, no nonce,
-and no integrity. `CTRL_TAGGED` says the peer tag follows the nonce. The
-controller byte and peer tag are authenticated associated data: readable on the
-wire, not alterable.
+and no integrity. `CTRL_TAGGED` says the peer tag follows the nonce.
+`CTRL_MACONLY` marks a packet authenticated but not encrypted, framed exactly
+like an encrypted one so every offset is identical and only the transform
+differs. `CTRL_BATCH` says the content is that list. The controller byte and
+peer tag are authenticated associated data: readable on the wire, not
+alterable.
 
 The nonce counter must travel, but in the clear it is a serial number that
 would link a peer across a migration. So the field carries the counter XORed
@@ -358,6 +384,29 @@ kind decides the pool: a reliable flow body is its own retransmit source and
 goes to a retained staging slot, everything else goes to a kernel send slot and
 is released once on the wire.
 
+A send on a flow does not reach the wire by itself. It is packed into that
+flow's open batch and waits there for `Flush`, so several small messages leave
+as one datagram, under one seal, holding one staging slot. Nothing else is
+batched: handshake traffic, secure control, retransmits and the waiting-ring
+drain all go straight out, and so does a message the caller framed itself as
+part of a larger one, since the framing bits describe a packet's first and last
+message and hand-framed pieces cannot share one.
+
+The batch is a wire packet on its flow and takes that flow's next sequence
+number, which is what leaves acknowledgement, retransmission, duplicate
+detection, ordering and the windows untouched. They still see one packet per
+sequence and never learn how many messages rode inside it.
+
+Because a batched send answers the caller the moment it is packed, the
+admission gate is consulted before the message is accepted rather than when the
+batch is flushed. A flow that cannot take another packet refuses at the `Send`
+that asked, exactly as it did before batching. A flush whose send is refused
+leaves the batch in place, since nothing reached the wire.
+
+Closing a flow flushes first. The batch lives on the association and would
+otherwise be torn down with it, losing messages the caller was told had been
+accepted.
+
 Replying starts from the received packet: `PacketSlotHandle::PrepareResponse()`
 returns the same builder aimed at that packet's source, and the chain ends in
 `Respond()` or `RespondSecured()`. `Poll` stamps its socket into every handle
@@ -400,6 +449,14 @@ routes everything it admits to one of four sinks:
 
 Pass 2 drains the ready queue into the caller's buffer. Packets never leave the
 receive pool, and the application receives handles into it.
+
+A packet carrying a list of messages is split before it is queued, one entry per
+message, each wearing the batch's own framing minus the bit that said it was a
+list. So what an application polls is always a single message and no receiving
+code has to know batches exist. The length chain is validated first, and a chain
+that overruns or leaves a tail drops the whole packet before anything is
+committed to the seen bitmap, so the sender resends it rather than being told it
+arrived.
 
 #### Delivering an in-flow packet: two deliverers
 

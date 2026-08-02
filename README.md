@@ -54,13 +54,20 @@ if (socket.Init(config) != common::Error::Ok)
 
 Flux owns no thread, so the socket only works when you call it. `Update` runs
 the timers (acks, retransmits, handshake retries), `Poll` hands you what
-arrived. Call them from any threads, at any cadence, both are safe concurrently.
+arrived, and `Flush` puts what you sent on the wire. Call them from any threads,
+at any cadence, all three are safe concurrently.
+
+`Flush` matters: a send on a flow is packed together with others going the same
+way, so several small messages leave as one datagram. They wait until you flush,
+which means the moment your bytes go out is yours to pick rather than a timer's.
+Miss it and they sit there.
 
 ```cpp
 flux::PacketSlotHandle inbox[8];
 
 for (;;)
 {
+    socket.Flush();    // send what this round produced
     socket.Update();
 
     const uint32_t count = socket.Poll(inbox, 8);
