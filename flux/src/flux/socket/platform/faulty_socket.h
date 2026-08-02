@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 
 #include <flux/internal/constants.h>
 
@@ -38,7 +39,12 @@ namespace bcp::flux::platform
         hears everything and is heard by nothing, which is what breaks a
         handshake rather than merely slowing it.
 
-        Not thread-safe. A test drives one socket from one thread. */
+        Thread-safe by a single lock over the whole operation, because a test
+        that drives one socket from several threads is exactly the test worth
+        writing and the alternative is faults and concurrency never appearing
+        together. The lock is coarse on purpose: this is a test tool, the
+        underlying socket is non-blocking so nothing waits under it, and being
+        obviously correct is worth more here than being quick. */
     class FaultySocket : public FaultyBase
     {
     public:
@@ -97,7 +103,8 @@ namespace bcp::flux::platform
         [[nodiscard]] static FaultySocket* ForPort(uint16_t port) noexcept;
 
         void SetProfile(const Profile& profile) noexcept;
-        [[nodiscard]] const Profile& GetProfile() const noexcept { return profile_; }
+        [[nodiscard]] Profile GetProfile() const noexcept
+        { std::lock_guard<std::recursive_mutex> guard(mutex_); return profile_; }
 
         // --- Scripted faults. Exact, consumed once, checked before the rates. ---
 
@@ -115,12 +122,15 @@ namespace bcp::flux::platform
             unestablished for as long as it likes and then let it through. */
         void BlockHandshakes(bool blocked) noexcept;
 
-        [[nodiscard]] Stats GetStats() const noexcept { return stats_; }
-        void ResetStats() noexcept { stats_ = Stats{}; }
+        [[nodiscard]] Stats GetStats() const noexcept
+        { std::lock_guard<std::recursive_mutex> guard(mutex_); return stats_; }
+        void ResetStats() noexcept
+        { std::lock_guard<std::recursive_mutex> guard(mutex_); stats_ = Stats{}; }
 
         /** How many packets this socket has handled, which is the ordinal
             DropAt counts against. */
-        [[nodiscard]] uint64_t Ordinal() const noexcept { return ordinal_; }
+        [[nodiscard]] uint64_t Ordinal() const noexcept
+        { std::lock_guard<std::recursive_mutex> guard(mutex_); return ordinal_; }
 
         [[nodiscard]] common::Error Init(int port, uint32_t recvSlotCount = 4096,
                                          uint32_t sendSlotCount = 4096) override;
@@ -133,6 +143,12 @@ namespace bcp::flux::platform
                                                            uint32_t maxCount) override;
 
     private:
+        /** Guards every field below and the whole of each public operation, so
+            two threads cannot interleave inside the held ring or the RNG and
+            produce faults neither of them asked for. Recursive because the
+            public entry points call one another. */
+        mutable std::recursive_mutex mutex_;
+
         /** A packet the socket is sitting on, either because it was delayed or
             because it was reordered behind later ones. */
         struct Held

@@ -1,5 +1,7 @@
 #include <flux/socket/platform/faulty_socket.h>
 
+#include <mutex>
+
 #include <cstring>
 
 #include <common/platform.h>
@@ -36,6 +38,7 @@ namespace bcp::flux::platform
 
     common::Error FaultySocket::Init(int port, uint32_t recvSlotCount, uint32_t sendSlotCount)
     {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
         rng_ = profile_.seed != 0 ? profile_.seed : DEFAULT_SEED;
         const common::Error opened = FaultyBase::Init(port, recvSlotCount, sendSlotCount);
         if (opened != common::Error::Ok) return opened;
@@ -53,6 +56,7 @@ namespace bcp::flux::platform
 
     void FaultySocket::Close()
     {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
         for (uint32_t i = 0; i < MAX_HELD; ++i)
             held_[i].occupied = false;
         for (uint32_t i = 0; i < MAX_BOUND; ++i)
@@ -62,17 +66,19 @@ namespace bcp::flux::platform
 
     void FaultySocket::SetProfile(const Profile& profile) noexcept
     {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
         profile_ = profile;
         rng_ = profile.seed != 0 ? profile.seed : DEFAULT_SEED;
     }
 
-    void FaultySocket::DropNext(uint32_t count) noexcept    { dropNext_    += count; }
-    void FaultySocket::CorruptNext(uint32_t count) noexcept { corruptNext_ += count; }
-    void FaultySocket::DropAt(uint64_t ordinal) noexcept    { dropAt_       = ordinal; }
-    void FaultySocket::BlockHandshakes(bool blocked) noexcept { blockHandshakes_ = blocked; }
+    void FaultySocket::DropNext(uint32_t count) noexcept    { std::lock_guard<std::recursive_mutex> guard(mutex_); dropNext_    += count; }
+    void FaultySocket::CorruptNext(uint32_t count) noexcept { std::lock_guard<std::recursive_mutex> guard(mutex_); corruptNext_ += count; }
+    void FaultySocket::DropAt(uint64_t ordinal) noexcept    { std::lock_guard<std::recursive_mutex> guard(mutex_); dropAt_       = ordinal; }
+    void FaultySocket::BlockHandshakes(bool blocked) noexcept { std::lock_guard<std::recursive_mutex> guard(mutex_); blockHandshakes_ = blocked; }
 
     void FaultySocket::DelayNext(uint32_t count, uint32_t micros) noexcept
     {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
         delayNext_   += count;
         delayMicros_  = micros;
     }
@@ -191,6 +197,7 @@ namespace bcp::flux::platform
     common::Error FaultySocket::SendTo(const sockaddr_storage& target,
                                        const uint8_t* data, uint16_t size)
     {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
         // Anything owed from an earlier call goes first, so a held packet is
         // never overtaken by one held after it.
         ReleaseDue();
@@ -266,6 +273,7 @@ namespace bcp::flux::platform
     common::Result<uint32_t> FaultySocket::ReceiveFrom(PacketSlotHandle* outPackets,
                                                        uint32_t maxCount)
     {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
         // The tick calls this often, which makes it the natural place to let
         // held packets out even when nothing is being sent.
         ReleaseDue();
