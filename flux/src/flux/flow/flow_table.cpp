@@ -59,10 +59,11 @@ namespace bcp::flux
             // No batch is open on a fresh association. A recycled slot carries
             // the previous tenant's bytes, and a non-zero used here would make
             // this flow append into a stranger's half-built packet.
-            assoc->openBatchUsed     = 0;
-            assoc->openBatchHeader   = 0;
-            assoc->openBatchCount    = 0;
-            assoc->openBatchFirstLen = 0;
+            assoc->openBatchUsed      = 0;
+            assoc->openBatchHeader    = 0;
+            assoc->openBatchCount     = 0;
+            assoc->openBatchFirstLen  = 0;
+            assoc->openBatchInFlight  = false;
 
             InFlightEntry* inFlight = assoc->InFlight();
             for (uint32_t i = 0; i < inflightCap; ++i)
@@ -1735,6 +1736,15 @@ namespace bcp::flux
             outAssocPool_.WriteLock(assocSlot));
         if (!flow) return BatchAdmit::Rejected;
 
+        if (flow->openBatchInFlight)
+        {
+            // A flush has this batch and has not yet said whether it went. This
+            // message cannot join it, so it takes the ordinary path and the
+            // next batch starts clean.
+            outAssocPool_.UnlockWrite(assocSlot);
+            return BatchAdmit::Rejected;
+        }
+
         BatchAdmit result;
         uint8_t* buffer = flow->OpenBatch();
         if (flow->openBatchUsed == 0)
@@ -1800,7 +1810,8 @@ namespace bcp::flux
 
         outMode = flow->mode;
         uint16_t written = 0;
-        if (flow->openBatchUsed != 0 && flow->openBatchUsed <= capacity)
+        if (flow->openBatchUsed != 0 && flow->openBatchUsed <= capacity
+            && !flow->openBatchInFlight)
         {
             // Copied, not consumed. The batch stays until the caller reports
             // the send actually happened, because an admission refused at the
@@ -1808,6 +1819,7 @@ namespace bcp::flux
             // been accepted.
             std::memcpy(out, flow->OpenBatch(), flow->openBatchUsed);
             written = flow->openBatchUsed;
+            flow->openBatchInFlight = true;   // no append may join it now
         }
 
         outAssocPool_.UnlockWrite(assocSlot);
@@ -1827,18 +1839,21 @@ namespace bcp::flux
         return ok;
     }
 
-    void FlowTable::ClearBatch(uint32_t assocSlot, uint16_t expectedUsed) noexcept
+    void FlowTable::FinishBatch(uint32_t assocSlot, uint16_t expectedUsed, bool sent) noexcept
     {
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(assocSlot));
         if (!flow) return;
-        if (flow->openBatchUsed == expectedUsed)
+        // No append can have grown it, since they are refused while in flight,
+        // so the size still matching is an invariant rather than a hope.
+        if (sent && flow->openBatchUsed == expectedUsed)
         {
             flow->openBatchUsed     = 0;
             flow->openBatchHeader   = 0;
             flow->openBatchCount    = 0;
             flow->openBatchFirstLen = 0;
         }
+        flow->openBatchInFlight = false;
         outAssocPool_.UnlockWrite(assocSlot);
     }
 

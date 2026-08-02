@@ -428,10 +428,14 @@ namespace bcp::flux
         [[nodiscard]] bool WouldAdmit(const Peer& peer, uint32_t assocSlot,
                                       uint16_t wireSize) noexcept;
 
-        /** Clears the open batch, but only if it is still the one the caller
-            took. An append that landed in between means the batch has grown, so
-            clearing would drop a message that was never sent. */
-        void ClearBatch(uint32_t assocSlot, uint16_t expectedUsed) noexcept;
+        /** Ends the flush the matching TakeBatch began.
+
+            `sent` says whether the bytes actually reached the wire. If they did
+            the batch is spent and cleared; if they did not it stays exactly as
+            it was and goes out on a later flush. Either way the batch stops
+            being in flight, because leaving that set would refuse every append
+            and every future take, wedging the flow on one refusal. */
+        void FinishBatch(uint32_t assocSlot, uint16_t expectedUsed, bool sent) noexcept;
 
         /** Whether this association is holding an unsent batch, and the mode it
             belongs to, so a flush can get the slot the batch will need before

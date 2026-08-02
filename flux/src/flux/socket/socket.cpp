@@ -663,21 +663,33 @@ namespace bcp::flux
         if (!packet || !packet->HasFlow() || packet->IsInternal() || !packet->IsSecure())
             return false;
 
+        const uint8_t  flowData = packet->FlowData();
+        const uint16_t flowId   = packet->FlowId();
+        const Address  to       = packet->address;
+
         // A message the caller framed itself as part of a larger one keeps its
         // own packet. The framing bits live on the packet and describe its first
         // and last message, so several hand-framed pieces sharing one could not
         // each say what they are. Batching is for whole messages.
-        const uint8_t flowData = packet->FlowData();
-        if ((flowData & (FLOW_PART_MORE | FLOW_PART_CONT)) != 0)
-            return false;
-
-        const uint16_t flowId = packet->FlowId();
-        const Address  to     = packet->address;
+        //
+        // It still must not overtake what is already waiting. Sequence numbers
+        // are handed out when a packet is admitted, so a message that went
+        // straight out while a batch sat open would take the lower number and
+        // arrive first, reordering a flow the caller sent in order. Emptying the
+        // batch first is what keeps send order and wire order the same.
+        const bool handFramed = (flowData & (FLOW_PART_MORE | FLOW_PART_CONT)) != 0;
+        if (handFramed)
+        {
+            if (FlushFlowOf(to, flowId)) return false;   // nothing ahead of it, send it now
+            status = common::Error::TooManyPending;      // still queued ahead: ask again
+            return true;
+        }
 
         // Under the peer borrow only long enough to find the association. The
         // append takes the flow lock after this closes, which keeps the order
         // packet then peer then flow.
-        uint32_t assocSlot = common::collections::SlotPool::INVALID;
+        uint32_t assocSlot   = common::collections::SlotPool::INVALID;
+        bool     gateRefused = false;
         {
             PeerHandle peerHandle = peers_.GetPeer(to);
             if (peerHandle.Failed()) return false;
@@ -692,10 +704,21 @@ namespace bcp::flux
             // the caller see the refusal, exactly as it did before batching.
             if (assocSlot != common::collections::SlotPool::INVALID
              && !flows_.WouldAdmit(*peer, assocSlot, packet->dataSize))
-                return false;
+                gateRefused = true;
+        }
+
+        // Emptied before the ordinary path runs, for the same reason as a
+        // hand-framed message: whatever is already batched was sent first and
+        // must take the lower sequence.
+        if (gateRefused)
+        {
+            if (FlushFlowOf(to, flowId)) return false;
+            status = common::Error::TooManyPending;
+            return true;
         }
         if (assocSlot == common::collections::SlotPool::INVALID)
             return false;   // first send on this flow: the ordinary path creates the association
+
 
         FlowTable::BatchAdmit admitted =
             flows_.AppendToBatch(assocSlot, *packet, internal::MAX_WIRE_PACKET_SIZE);
@@ -709,10 +732,37 @@ namespace bcp::flux
         }
 
         if (admitted != FlowTable::BatchAdmit::Appended)
-            return false;   // it will not batch at all, so let it fly on its own
+        {
+            // A flush is carrying this batch, so the message cannot join it and
+            // cannot go around it either: the batch has not been given its
+            // sequence yet, and anything sent now would take a lower one and
+            // arrive first. Refused instead, which is the answer the caller
+            // already handles, and the flush it is waiting on is in progress.
+            status = common::Error::TooManyPending;
+            return true;
+        }
 
         status = common::Error::Ok;
         return true;
+    }
+
+    bool Socket::FlushFlowOf(const Address& to, uint16_t flowId)
+    {
+        uint32_t assocSlot = common::collections::SlotPool::INVALID;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(to);
+            if (peerHandle.Failed() || !peerHandle.Read()) return true;
+            assocSlot = flows_.FindOutAssoc(peerHandle.GetSlotIndex(), flowId);
+        }
+        if (assocSlot == common::collections::SlotPool::INVALID) return true;
+
+        (void)FlushOneBatch(to, assocSlot);
+
+        // Emptied is the only answer that lets the caller go around the batch.
+        // Another thread's flush may hold it, or the gate may have refused it,
+        // and in both cases something is still queued ahead of the caller.
+        FlowMode mode = FlowMode::RELIABLE_ORDERED;
+        return !flows_.PeekBatch(assocSlot, mode);
     }
 
     common::Error Socket::FlushOneBatch(const Address& to, uint32_t assocSlot)
@@ -745,9 +795,18 @@ namespace bcp::flux
             size = flows_.TakeBatch(assocSlot, slot->data,
                                     internal::MAX_WIRE_PACKET_SIZE, taken);
         }
-        if (size == 0) return common::Error::Ok;
+        if (size == 0) return common::Error::Ok;   // nothing taken, so nothing to finish
+
+        // Past here the batch is in flight and MUST be finished on every path
+        // out, or it stays that way and the flow refuses every later append and
+        // every later flush.
         if (taken != mode)
-            return common::Error::InvalidState;   // recycled under us: wrong pool, drop rather than mis-send
+        {
+            // Recycled under us, so the slot came from the wrong pool. Give the
+            // batch back rather than send it to the wrong place.
+            flows_.FinishBatch(assocSlot, size, false);
+            return common::Error::InvalidState;
+        }
 
         slot->dataSize = size;
         slot->address  = to;
@@ -756,11 +815,11 @@ namespace bcp::flux
         // the one it came from would loop.
         const common::Error sent = sender_.SendNow(std::move(handle));
 
-        // Only now is the batch spent. A refusal here means nothing reached the
-        // wire, so leaving it in place sends it on the next flush instead of
-        // discarding messages the caller was told had been accepted.
-        if (sent == common::Error::Ok)
-            flows_.ClearBatch(assocSlot, size);
+        // Only now is the batch spent. A refusal means nothing reached the wire,
+        // so it stays in place for a later flush rather than discarding messages
+        // the caller was told had been accepted. Either way the flush is over,
+        // and saying so is what stops one refusal wedging the flow.
+        flows_.FinishBatch(assocSlot, size, sent == common::Error::Ok);
         return sent;
     }
 

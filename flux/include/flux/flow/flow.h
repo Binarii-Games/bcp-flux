@@ -423,6 +423,13 @@ namespace bcp::flux
         uint16_t openBatchCount;
         uint16_t openBatchFirstLen;
 
+        /** Set while a flush is carrying this batch to the wire, between the
+            copy out and the confirmation that it went. An append landing in
+            that gap would either be thrown away when the batch is cleared, or
+            resent along with messages that already left, so appends are refused
+            while it is set and their messages open the next batch instead. */
+        bool     openBatchInFlight;
+
         InFlightEntry* InFlight()
         {
             return reinterpret_cast<InFlightEntry*>(

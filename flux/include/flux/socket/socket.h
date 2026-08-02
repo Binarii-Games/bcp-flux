@@ -530,6 +530,15 @@ namespace bcp::flux
         [[nodiscard]] bool OfferToBatch(PacketSlotHandle& pHandle, bool requireAuth,
                                         common::Error& status);
 
+        /** Empties one flow's batch before something that cannot join it goes
+            out, so send order and wire order stay the same.
+
+            @return false when the batch still holds messages, because another
+                    flush has it or the gate refused it. The caller must not go
+                    around it then, since anything sent would take the lower
+                    sequence and arrive first. */
+        [[nodiscard]] bool FlushFlowOf(const Address& to, uint16_t flowId);
+
         /** Takes one association's open batch under the peer borrow and sends it
             with nothing held. Gather under the lock, send after release. */
         common::Error FlushOneBatch(const Address& to, uint32_t assocSlot);
