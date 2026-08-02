@@ -17,6 +17,7 @@
 #include <flux/flow/flow_handle.h>
 #include <flux/socket/platform/faulty_socket.h>
 
+#include "flux_net.h"   // boots Winsock on Windows before the FAULTY kernel binds
 #include "harness.h"
 
 #include <chrono>
