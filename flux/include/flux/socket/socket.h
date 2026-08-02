@@ -273,8 +273,11 @@ namespace bcp::flux
 
         [[nodiscard]] common::Error Init(const Config& config);
 
-        /** Idempotent teardown: closes the kernel, releases pools, drops peers.
-            The destructor calls it; calling it twice is a no-op. */
+        /** Idempotent teardown: closes the kernel, releases the pools, drops the
+            peers. The destructor calls it; calling it twice is a no-op. After it
+            the socket may be Init'd again from scratch. No other thread may be in
+            Poll or Update while it runs, since it frees the pools those paths
+            read, the same rule that has always applied to the destructor. */
         void Shutdown() noexcept;
 
         /** Adds a certificate to the trust store; safe at any time, including

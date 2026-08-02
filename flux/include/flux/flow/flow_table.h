@@ -104,6 +104,15 @@ namespace bcp::flux
                          : standard_.UnlockWrite(slot);
         }
 
+        /** Frees both sub-pools. Idempotent, since each pool's Shutdown is. */
+        void Shutdown() noexcept
+        {
+            standard_.Shutdown();
+            bulk_.Shutdown();
+            standardCount_ = 0;
+            bulkCount_     = 0;
+        }
+
         [[nodiscard]] uint32_t GetCapacity() const noexcept
         {
             return standardCount_ + bulkCount_;
@@ -179,6 +188,11 @@ namespace bcp::flux
                                          common::collections::SlotPool* recvPool,
                                          common::collections::SlotPool* sendPool,
                                          common::collections::FifoQueue<uint32_t>* readyQueue) noexcept;
+
+        /** Frees every pool and directory this table owns and forgets the pools
+            it borrows, so a later Init starts clean. Idempotent. The caller must
+            ensure no other thread is in the table. */
+        void Shutdown() noexcept;
 
         [[nodiscard]] bool SendEnabled() const noexcept;
         [[nodiscard]] bool ReceiveEnabled() const noexcept;

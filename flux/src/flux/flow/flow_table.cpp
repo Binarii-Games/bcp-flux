@@ -427,6 +427,27 @@ namespace bcp::flux
         return common::Error::Ok;
     }
 
+    void FlowTable::Shutdown() noexcept
+    {
+        // Free what this table owns.
+        flowPool_.Shutdown();
+        outAssocPool_.Shutdown();
+        inAssocPool_.Shutdown();
+        stagingPool_.Shutdown();
+        outAssocDir_.reset();
+        inAssocDir_.reset();
+        lastEpochById_.reset();
+
+        // Forget what it borrows, so a stale pointer cannot outlive the kernel
+        // that owns the recv and send pools. Nulling the directories also makes
+        // SendEnabled and ReceiveEnabled report the table disabled.
+        recvPool_   = nullptr;
+        sendPool_   = nullptr;
+        readyQueue_ = nullptr;
+        maxOutAssocPerPeer_ = 0;
+        maxInAssocPerPeer_  = 0;
+    }
+
     bool FlowTable::SendEnabled() const noexcept
     {
         return outAssocDir_ != nullptr;

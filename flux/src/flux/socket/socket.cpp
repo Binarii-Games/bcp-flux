@@ -176,12 +176,26 @@ namespace bcp::flux
 
     void Socket::Shutdown() noexcept
     {
-        // Idempotent: the first call marks the socket down and closes the OS
-        // handle; the pools and buffers release through their own destructors.
+        // Idempotent: the first call tears the socket down, later calls and the
+        // destructor's call return here. The caller must ensure no other thread
+        // is in Poll or Update, the same rule the destructor has always had,
+        // since this now frees the pools those paths read.
         if (!initialized_.exchange(false, std::memory_order_acq_rel))
             return;
+
+        // Peers and flows first, while the kernel still owns the recv and send
+        // pools they point at, then the pools this socket owns, then the kernel
+        // itself. Each release nulls its own pointers, so a later Init starts
+        // from clean state rather than leaking the previous allocation.
+        peers_.Shutdown();
+        flows_.Shutdown();
+        pendingPool_.Shutdown();
+        readyQueue_.Shutdown();
         if (kernel_)
+        {
             kernel_->Close();
+            kernel_.reset();
+        }
     }
 
     common::Error Socket::Init(const Config& config)
