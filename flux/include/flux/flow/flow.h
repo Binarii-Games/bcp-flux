@@ -395,10 +395,10 @@ namespace bcp::flux
         uint32_t waitingCount;
 
         /** The batch being filled, and the whole of the batching state. Sends
-            append into this slot until it is sealed, by a message that will not
-            fit or by Flush, and sealing is what hands it to the ordinary admit
-            path. So the batch takes the flow's next sequence and every ack,
-            retransmit and dedupe below stays exactly as it was: the reliability
+            append into the inline buffer below until it is sealed, by a message
+            that will not fit or by Flush, and sealing hands it to the ordinary
+            admit path. So the batch takes the flow's next sequence and every
+            ack, retransmit and dedupe stays exactly as it was: the reliability
             machinery only ever sees one wire packet per sequence and never
             learns how many messages rode inside it.
 
@@ -406,16 +406,20 @@ namespace bcp::flux
             seal into an earlier sequence, which is reordering the packer
             invented rather than the network.
 
-            SlotPool::INVALID means none is open. The slot comes from staging on
-            a reliable flow, so it is already the retransmit source and sealing
-            copies nothing.
+            The buffer is inline rather than a pooled slot so this association's
+            own lock covers it. Finding a pooled slot would mean taking the
+            association lock and then the slot's, which is the reverse of the
+            packet-then-flow order the rest of the send path takes.
 
-            firstLen is kept because the first message is written with no length
-            in front of it, which is what makes a one-message batch identical on
-            the wire to an unbatched packet. When a second message arrives the
-            first has to be shifted to make room for its length, and this is
-            where that length comes from. */
-        uint32_t openBatchSlot;
+            used is zero when no batch is open. header is where the packet's own
+            framing ends and the message list begins, captured from the first
+            message because it already carries exactly the framing this batch
+            needs. firstLen exists because that first message is stored with no
+            length in front of it, which is what keeps a one-message batch
+            identical on the wire to an unbatched packet, and the length has to
+            come from somewhere when a second message forces it to grow one. */
+        uint16_t openBatchUsed;
+        uint16_t openBatchHeader;
         uint16_t openBatchCount;
         uint16_t openBatchFirstLen;
 
@@ -442,11 +446,29 @@ namespace bcp::flux
                 + inflightCap * sizeof(InFlightEntry));
         }
 
+        /** The batch under construction: one whole packet, its own framing then
+            the messages packed behind it. Sized for the largest packet this
+            socket would ever put on the wire, since that is the most a batch
+            can ever hold. */
+        uint8_t* OpenBatch()
+        {
+            return reinterpret_cast<uint8_t*>(this) + sizeof(OutAssociation)
+                 + inflightCap * sizeof(InFlightEntry)
+                 + waitingCap * sizeof(WaitingEntry);
+        }
+        const uint8_t* OpenBatch() const
+        {
+            return reinterpret_cast<const uint8_t*>(this) + sizeof(OutAssociation)
+                 + inflightCap * sizeof(InFlightEntry)
+                 + waitingCap * sizeof(WaitingEntry);
+        }
+
         static constexpr size_t StrideFor(uint16_t inflightCap, uint16_t waitingCap)
         {
             return sizeof(OutAssociation)
                  + inflightCap * sizeof(InFlightEntry)
-                 + waitingCap * sizeof(WaitingEntry);
+                 + waitingCap * sizeof(WaitingEntry)
+                 + internal::MAX_WIRE_PACKET_SIZE;
         }
     };
 

@@ -3,6 +3,8 @@
 #include <common/platform.h>
 #include <flux/internal/constants.h>
 #include <flux/peer/peer.h>
+#include <flux/socket/packet_slot.h>
+#include <flux/wire/batch.h>
 
 #include <cstring>
 #include <new>
@@ -54,10 +56,11 @@ namespace bcp::flux
             assoc->waitingHead  = 0;
             assoc->waitingCount = 0;
 
-            // No batch is open on a fresh association. A recycled slot may carry
-            // the previous tenant's index here, and acting on that would append
-            // into a slot this flow does not own.
-            assoc->openBatchSlot     = common::collections::SlotPool::INVALID;
+            // No batch is open on a fresh association. A recycled slot carries
+            // the previous tenant's bytes, and a non-zero used here would make
+            // this flow append into a stranger's half-built packet.
+            assoc->openBatchUsed     = 0;
+            assoc->openBatchHeader   = 0;
             assoc->openBatchCount    = 0;
             assoc->openBatchFirstLen = 0;
 
@@ -1634,6 +1637,118 @@ namespace bcp::flux
         }
         inAssocPool_.UnlockWrite(assocSlot);
         return produced;
+    }
+
+    FlowTable::BatchAdmit FlowTable::AppendToBatch(uint32_t assocSlot, const PacketSlot& packet,
+                                                   uint16_t limit) noexcept
+    {
+        const size_t header = packet.ContentOffset();
+        if (header > packet.dataSize) return BatchAdmit::Rejected;
+
+        // dataSize less the header, NOT ContentLength: this packet has been
+        // built but not sealed, and the seal is what appends the tag, so the
+        // trailer ContentLength subtracts is not there yet. Using it would trim
+        // the last sixteen bytes off every message.
+        const size_t content = packet.dataSize - header;
+        if (content == 0 || content > UINT16_MAX) return BatchAdmit::Rejected;
+
+        // The seal will append that tag to whatever the batch holds, so the
+        // room it needs comes out of the limit here rather than being
+        // discovered when the sealed packet turns out to be too long.
+        if (limit > internal::MAX_WIRE_PACKET_SIZE) limit = internal::MAX_WIRE_PACKET_SIZE;
+        const uint16_t trailer = packet.IsSecure() ? internal::WIRE_TAG_SIZE : 0;
+        if (limit <= trailer) return BatchAdmit::Rejected;
+        limit = static_cast<uint16_t>(limit - trailer);
+
+        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
+            outAssocPool_.WriteLock(assocSlot));
+        if (!flow) return BatchAdmit::Rejected;
+
+        BatchAdmit result;
+        uint8_t* buffer = flow->OpenBatch();
+        if (flow->openBatchUsed == 0)
+        {
+            // Nothing open. This packet's own framing becomes the batch's, so
+            // the whole thing is copied and the first message sits bare behind
+            // it, exactly as an unbatched packet would look.
+            if (header + content > limit)
+            {
+                result = BatchAdmit::Rejected;   // cannot fit even on its own
+            }
+            else
+            {
+                std::memcpy(buffer, packet.data, header + content);
+                flow->openBatchHeader   = static_cast<uint16_t>(header);
+                flow->openBatchUsed     = static_cast<uint16_t>(header + content);
+                flow->openBatchCount    = 1;
+                flow->openBatchFirstLen = static_cast<uint16_t>(content);
+                result = BatchAdmit::Appended;
+            }
+        }
+        else
+        {
+            wire::BatchCursor cursor{
+                buffer + flow->openBatchHeader,
+                static_cast<uint16_t>(flow->openBatchUsed - flow->openBatchHeader),
+                flow->openBatchCount,
+                flow->openBatchFirstLen,
+                static_cast<uint16_t>(limit - flow->openBatchHeader)
+            };
+
+            if (!wire::BatchAppend(cursor, packet.data + header,
+                                   static_cast<uint16_t>(content)))
+            {
+                // Full. Leave the batch exactly as it is so the caller can send
+                // it, then offer this message again into the empty one.
+                result = BatchAdmit::Sealed;
+            }
+            else
+            {
+                flow->openBatchUsed  = static_cast<uint16_t>(flow->openBatchHeader + cursor.used);
+                flow->openBatchCount = cursor.count;
+                // Second message onward: the content is a list now, and the
+                // controller has to say so or the far side reads it as one
+                // message with rubbish appended.
+                buffer[0] = static_cast<uint8_t>(buffer[0] | internal::WIRE_CTRL_BATCH);
+                result = BatchAdmit::Appended;
+            }
+        }
+
+        outAssocPool_.UnlockWrite(assocSlot);
+        return result;
+    }
+
+    uint16_t FlowTable::TakeBatch(uint32_t assocSlot, uint8_t* out, uint16_t capacity) noexcept
+    {
+        if (!out) return 0;
+
+        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
+            outAssocPool_.WriteLock(assocSlot));
+        if (!flow) return 0;
+
+        uint16_t written = 0;
+        if (flow->openBatchUsed != 0 && flow->openBatchUsed <= capacity)
+        {
+            std::memcpy(out, flow->OpenBatch(), flow->openBatchUsed);
+            written = flow->openBatchUsed;
+            flow->openBatchUsed     = 0;
+            flow->openBatchHeader   = 0;
+            flow->openBatchCount    = 0;
+            flow->openBatchFirstLen = 0;
+        }
+
+        outAssocPool_.UnlockWrite(assocSlot);
+        return written;
+    }
+
+    bool FlowTable::HasOpenBatch(uint32_t assocSlot) noexcept
+    {
+        const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
+            outAssocPool_.ReadLock(assocSlot));
+        if (!flow) return false;
+        const bool open = flow->openBatchUsed != 0;
+        outAssocPool_.UnlockRead(assocSlot);
+        return open;
     }
 
     uint32_t FlowTable::DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept

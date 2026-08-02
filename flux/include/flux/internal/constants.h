@@ -30,6 +30,13 @@ namespace bcp::flux::internal
         be trusted, so the whole packet is dropped rather than partly
         delivered. */
     static constexpr uint8_t  WIRE_BATCH_LEN_SIZE           = 2;
+
+    /** Controller bit 5, saying the content is that list rather than one
+        message. Named here as well as in Controls because the packer sets it
+        while building a batch, and the flow table has no business reaching into
+        the socket's headers for a wire constant. Controls takes its value from
+        this one, so there is a single definition. */
+    static constexpr uint8_t  WIRE_CTRL_BATCH               = 0x20;
     static constexpr uint8_t  WIRE_SECURE_CHANNEL_SIZE      = 1;
     static constexpr uint8_t  MIN_WIRE_SIZE                 = WIRE_CONTROLLER_SIZE;
     /** What a secure packet puts in front of the content: controller and the

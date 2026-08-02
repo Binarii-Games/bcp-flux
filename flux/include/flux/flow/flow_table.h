@@ -380,6 +380,40 @@ namespace bcp::flux
         [[nodiscard]] uint32_t DeliverIn(uint32_t assocSlot, uint16_t flowId, uint32_t seq,
                                          PacketSlotHandle& incoming) noexcept;
 
+        // --- Batching. The association's own lock covers the open batch, since
+        //     the buffer is inline and nothing else can reach it. ---
+
+        /** What an append did to the batch, which is what tells the caller
+            whether there is now a sealed packet to send. */
+        enum class BatchAdmit : uint8_t
+        {
+            Appended,   ///< it fitted, nothing to send yet
+            Sealed,     ///< it did not fit; the batch was closed and must be taken and sent,
+                        ///< then this message offered again into the fresh one
+            Rejected,   ///< the flow is gone, or the message cannot fit an empty batch
+        };
+
+        /** Copies one message into the flow's open batch, opening one from
+            `packet` when none is (the packet's own framing becomes the batch's,
+            since it already describes this flow exactly).
+
+            @return Sealed when the message did not fit. The batch is closed and
+                    unchanged by this message, so the caller sends it and then
+                    offers the same message again. */
+        [[nodiscard]] BatchAdmit AppendToBatch(uint32_t assocSlot, const PacketSlot& packet,
+                                               uint16_t limit) noexcept;
+
+        /** Copies the open batch out into `out` and clears it, so the caller can
+            put it through the ordinary admit and seal path.
+
+            @return the byte count written, or 0 when no batch is open. */
+        [[nodiscard]] uint16_t TakeBatch(uint32_t assocSlot, uint8_t* out,
+                                         uint16_t capacity) noexcept;
+
+        /** Whether this association is holding an unsent batch, so Flush knows
+            there is something to do without taking the write lock. */
+        [[nodiscard]] bool HasOpenBatch(uint32_t assocSlot) noexcept;
+
     private:
         common::collections::SlotPool  flowPool_;
         SplitAssocPool                 outAssocPool_;

@@ -65,7 +65,7 @@ namespace bcp::flux
             and costs nothing. Every message in the list belongs to the same
             flow with the same security, which is why they share this
             controller instead of each carrying one. */
-        CTRL_BATCH    = (1u << 5),
+        CTRL_BATCH    = internal::WIRE_CTRL_BATCH,
     };
 
     constexpr Controls operator|(Controls a, Controls b) noexcept
