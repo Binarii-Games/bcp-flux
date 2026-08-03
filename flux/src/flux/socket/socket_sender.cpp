@@ -28,12 +28,20 @@ namespace bcp::flux
     common::Error SocketSender::SendNow(PacketSlotHandle pHandle, bool requireAuth)
     {
         common::Error status = common::Error::Ok;
-        pHandle = sock_->PreProcessOut(std::move(pHandle), status, requireAuth);
+        PacketSlotHandle sealed = SealForSend(std::move(pHandle), status, requireAuth);
 
-        const PacketSlot* packet = pHandle.Read();
+        const PacketSlot* packet = sealed.Read();
         if (!packet)
             return status;   // Ok = accepted and parked behind a handshake
 
         return sockKernel_->SendTo(packet->address.addr, packet->data, packet->dataSize);
+    }
+
+    PacketSlotHandle SocketSender::SealForSend(PacketSlotHandle pHandle,
+                                               common::Error& status,
+                                               bool requireAuth)
+    {
+        status = common::Error::Ok;
+        return sock_->PreProcessOut(std::move(pHandle), status, requireAuth);
     }
 }

@@ -559,8 +559,44 @@ namespace bcp::flux
                     sequence and arrive first. */
         [[nodiscard]] bool FlushFlowOf(const Address& to, uint16_t flowId);
 
-        /** Takes one association's open batch under the peer borrow and sends it
-            with nothing held. Gather under the lock, send after release. */
+        /** A batch taken off its flow and sealed, waiting for the kernel.
+
+            Its flow refuses every later append and every later flush until
+            FinishBatch is called for it, so whoever holds one owes that call on
+            every path out. `packet` reads null when there was nothing to take,
+            and the debt does not exist in that case. */
+        /** Associations one peer can have a batch flushed for in a single
+            pass. The rest ride the next one, which costs a loop of latency and
+            cannot lose anything, since an unflushed batch stays where it is. */
+        static constexpr uint32_t MAX_FLUSH_PER_PEER = 32;
+
+        struct SealedBatch
+        {
+            PacketSlotHandle packet;
+            uint32_t         assocSlot = 0;
+            uint16_t         size      = 0;
+        };
+
+        /** Takes one association's open batch under the peer borrow and seals
+            it with nothing held. Gather under the lock, seal after release.
+
+            A failure after the batch is taken is settled here, so the returned
+            SealedBatch either carries a packet the caller owes FinishBatch for
+            or carries nothing at all. */
+        [[nodiscard]] SealedBatch SealOneBatch(const Address& to, uint32_t assocSlot,
+                                               common::Error& status);
+
+        /** Hands sealed batches to the kernel together and settles each one.
+
+            The kernel reports how many of them reached the wire, counting from
+            the first, so the rest stay with their flows for a later flush
+            rather than discarding messages the caller was told were accepted.
+
+            @return how many reached the wire, always counting from the
+                    first. */
+        uint32_t SendSealed(SealedBatch* sealed, uint32_t count);
+
+        /** Seals one association's batch and sends it on its own. */
         common::Error FlushOneBatch(const Address& to, uint32_t assocSlot);
 
         /** Retransmit: re-seal a retained body from its staging slot under a

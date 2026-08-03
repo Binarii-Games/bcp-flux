@@ -494,6 +494,14 @@ batch is flushed. A flow that cannot take another packet refuses at the `Send`
 that asked, exactly as it did before batching. A flush whose send is refused
 leaves the batch in place, since nothing reached the wire.
 
+`Flush` seals every batch a peer is holding before it sends any of them, then
+hands that whole round to the backend in one call. Sealing and sending are
+separate steps for this reason: the seal needs the peer's session material and
+the send needs none of it, so the material is gathered once per batch and the
+datagrams then leave together. The backend reports how many reached the wire,
+counting from the first, and every batch behind that point stays with its flow
+for the next flush.
+
 Closing a flow flushes first. The batch lives on the association and would
 otherwise be torn down with it, losing messages the caller was told had been
 accepted.

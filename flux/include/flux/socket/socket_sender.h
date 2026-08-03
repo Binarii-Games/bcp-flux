@@ -31,5 +31,16 @@ namespace bcp::flux
             considered. This is the path a sealed batch takes, and going back
             through Send would offer it to the batch it just came out of. */
         [[nodiscard]] common::Error SendNow (PacketSlotHandle pHandle, bool requireAuth = false);
+
+        /** Everything SendNow does except the send: takes the packet through
+            the outbound gate and hands back the sealed wire slot.
+
+            For a caller with several packets to put out that would rather give
+            them to the kernel together. An invalid handle back means the packet
+            was consumed on the way through, either parked behind a handshake or
+            refused, and `status` says which. */
+        [[nodiscard]] PacketSlotHandle SealForSend(PacketSlotHandle pHandle,
+                                                   common::Error& status,
+                                                   bool requireAuth = false);
     };
 }
