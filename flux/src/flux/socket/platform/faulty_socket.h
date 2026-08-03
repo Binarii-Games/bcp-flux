@@ -1,5 +1,7 @@
 #pragma once
 
+#include <flux/platform.h>
+
 #include <cstdint>
 #include <mutex>
 

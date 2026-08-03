@@ -89,7 +89,7 @@ static void full_pool_refused()
     }
     uint32_t overflow = 0;
     CHECK(table.RegisterPeer(AddressAt(static_cast<uint16_t>(5200 + capacity)), nullptr, overflow)
-          == Error::MaxPeersReached);
+          == Error::LimitReached);
     CHECK(table.GetPeerCount() == capacity);
 }
 

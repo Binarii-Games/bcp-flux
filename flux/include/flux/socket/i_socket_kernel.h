@@ -12,6 +12,7 @@
 #include <common/error.h>
 #include <common/result.h>
 #include <common/platform.h>
+#include <flux/platform.h>
 #include <common/collections/slot_pool.h>
 
 #include <flux/socket/packet_slot.h>
@@ -49,16 +50,6 @@ namespace bcp::flux
             uint32_t maxCount
         ) = 0;
 
-        /** Returns packets to the socket. */
-        virtual void ReleasePacket
-        (
-            uint8_t** addresses, 
-            uint32_t count
-        ) = 0;
-
-        virtual uint8_t* GetBufferBase() = 0;
-        virtual uint32_t GetBufferSize() = 0;
-
         /** Pool every received packet is leased from. The flow receive path
             parks out-of-order packets by bare slot index (hold-back) and needs
             this to rebuild a handle at delivery time. Stable for the kernel's
@@ -72,9 +63,5 @@ namespace bcp::flux
         common::collections::SlotPool* GetSendPool() { return &sendSlotPool_; }
 
         common::Result<PacketSlotWriter> Write();
-        void Unlock(uint32_t idx);
-
-    protected:
-        common::Result<PacketSlotHandle> PopPacketHandle();
     };
 }

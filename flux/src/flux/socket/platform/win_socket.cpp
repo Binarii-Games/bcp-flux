@@ -13,7 +13,7 @@ namespace bcp::flux::platform {
     common::Error WinSocket::Init(int port, uint32_t recvSlotCount, uint32_t sendSlotCount) 
     {
         handle_ = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-        if (handle_ == INVALID_SOCKET) return common::Error::SocketFailed;
+        if (handle_ == INVALID_SOCKET) return common::Error::IoFailed;
 
         int optTrue = 1;
         int optFalse = 0;
@@ -27,7 +27,7 @@ namespace bcp::flux::platform {
         if (ioctlsocket(handle_, FIONBIO, &mode) != 0) 
         {
             Close();
-            return common::Error::SocketFailed;
+            return common::Error::IoFailed;
         }
 
         sockaddr_in6 addr = {};
@@ -71,8 +71,8 @@ namespace bcp::flux::platform {
 
     common::Error WinSocket::SendTo(const sockaddr_storage& dest, const uint8_t* data, uint16_t size) 
     {
-        if (handle_ == INVALID_SOCKET) return common::Error::SocketFailed;
-        if (size > internal::MAX_WIRE_PACKET_SIZE) return common::Error::PacketTooLarge;
+        if (handle_ == INVALID_SOCKET) return common::Error::IoFailed;
+        if (size > internal::MAX_WIRE_PACKET_SIZE) return common::Error::TooLarge;
 
         int destLen = (dest.ss_family == AF_INET)
             ? sizeof(sockaddr_in)
@@ -96,7 +96,7 @@ namespace bcp::flux::platform {
     common::Result<uint32_t> WinSocket::ReceiveFrom(PacketSlotHandle* outPackets, uint32_t maxCount) 
     {
         if (handle_ == INVALID_SOCKET)
-            return common::Result<uint32_t>::Fail(common::Error::SocketFailed);
+            return common::Result<uint32_t>::Fail(common::Error::IoFailed);
 
         uint32_t count = 0;
 
@@ -132,16 +132,6 @@ namespace bcp::flux::platform {
         }
 
         return common::Result<uint32_t>::Success(count);
-    }
-
-    void WinSocket::ReleasePacket(uint8_t** addresses, uint32_t count) 
-    {
-        for (uint32_t i = 0; i < count; i++) 
-        {
-            uint32_t idx = GetSlotIndexFromPtr(addresses[i]);
-            recvSlotPool_.Release(idx);
-            LogF(common::LogLevel::Debug, "Released packet slot index: %u", idx);
-        }
     }
 
     PacketSlot* WinSocket::GetRecvSlot(uint32_t slotIndex) 

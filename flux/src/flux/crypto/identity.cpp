@@ -34,7 +34,7 @@ namespace bcp::flux
             return false;
 
         uint16_t written = 0;
-        common::BytesWriter w{ .p = out, .l = &written, .r = cap };
+        common::BytesWriter w{ .p = out, .written = &written, .r = cap };
 
         return w.PutBytes(secretKey.data(), secretKey.size())
             && w.PutBytes(tag.data(), tag.size());
@@ -47,7 +47,7 @@ namespace bcp::flux
         Identity id;
         if (!r.TakeBytes(id.secretKey.data(), id.secretKey.size()) ||
             !r.TakeBytes(id.tag.data(), id.tag.size()))
-            return common::Result<Identity>::Fail(common::Error::InvalidHeader);
+            return common::Result<Identity>::Fail(common::Error::Malformed);
 
         common::crypto::DerivePublicKey(id.publicKey, id.secretKey);
         return common::Result<Identity>::Success(id);

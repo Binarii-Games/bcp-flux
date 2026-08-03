@@ -26,7 +26,7 @@ namespace bcp::flux
         return true;
     }
 
-    uint32_t ReadyLanes::Claim(uint32_t wanted) noexcept
+    uint32_t ReadyLanes::ClaimLane(uint32_t wanted) noexcept
     {
         if (laneCount_ == 0) return NO_LANE;
 

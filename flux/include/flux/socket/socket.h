@@ -33,6 +33,7 @@
 #include <flux/crypto/cert_store.h>
 #include <flux/crypto/identity.h>
 #include <flux/socket/i_socket_kernel.h>
+#include <flux/crypto/packet_seal.h>
 #include <flux/socket/packet_slot.h>
 #include <flux/socket/ready_lanes.h>
 #include <flux/socket/socket_listener.h>
@@ -94,19 +95,6 @@ namespace bcp::flux
         HS_CHLG   = 0x01,
         HS_RES    = 0x02,
         HS_FINISH = 0x03,
-    };
-
-    /** The session materials one send needs, gathered once under the peer's
-        write lock and carried by value to the seal. Trivially copyable; the
-        caller Wipes `key` after the send. */
-    struct PeerSendMaterials
-    {
-        common::crypto::SessionKey key;
-        common::crypto::SessionKey headerKey;   ///< masks the wire counter field
-        common::crypto::SessionKey macKey;      ///< authenticates a MAC-only packet
-        uint64_t                   counter = 0;   ///< a fresh ++sendCounter per send
-        uint8_t                    lane    = 0;
-        PeerTag                    tag{};
     };
 
     /** The lane a thread last drained, handed back to Poll so it returns to the
@@ -507,25 +495,7 @@ namespace bcp::flux
         void BuildBackendSocket(BackendType type) noexcept;
         [[nodiscard]] bool GenerateKeypair() noexcept;
 
-        // --- Crypto / seal ---
-        // The ONE seal and the ONE open. Every outbound secure packet (data,
-        // retransmit, control) seals here; every inbound one opens here.
-        static void SealSecurePacket(PacketSlot& dst, const uint8_t* plaintext,
-                                     size_t headerSize, size_t bodyLen,
-                                     const PeerSendMaterials& materials, bool tagged) noexcept;
 
-        /** Opens a secure packet in place and reports the sender's counter in
-            `outCounter`. The counter is masked on the wire, so it cannot be
-            read off the header; this is the only place it is recovered, and the
-            header is left exactly as it arrived either way — which is what lets
-            the migration path try one candidate key after another against the
-            same packet. `outCounter` is meaningful only when this returns
-            true. */
-        [[nodiscard]] static bool OpenSecurePacket(PacketSlot& packet,
-                                                   const common::crypto::SessionKey& key,
-                                                   const common::crypto::SessionKey& headerKey,
-                                                   uint8_t senderLane,
-                                                   uint64_t& outCounter) noexcept;
         /** Copies a peer's send materials and bumps its counter, the one place
             ++sendCounter happens for a send. Non-static because it derives the
             lane from this socket's own public key.
@@ -670,22 +640,7 @@ namespace bcp::flux
                                const common::crypto::SecretKey& myEphSk,
                                const common::crypto::PublicKey& theirEphPk,
                                const uint8_t* transcript, size_t transcriptLen) noexcept;
-        /** Authenticates a packet without encrypting it. The whole datagram up
-            to the tag field is one contiguous range, so the controller byte is
-            covered by simply being in it, and there is no associated data to
-            assemble. The counter is masked last, with the MAC, because that is
-            the only per-packet value both ends can agree on before either has
-            verified anything. */
-        void SealMacOnlyPacket(PacketSlot& dst, size_t headerSize, size_t bodyLen,
-                               const PeerSendMaterials& materials, bool tagged) noexcept;
 
-        /** Verifies one. Unmasks the counter with the MAC read off the end,
-            recomputes over the range, and reports whether it matched. The
-            payload is never touched either way. */
-        [[nodiscard]] bool OpenMacOnlyPacket(PacketSlot& packet,
-                                             const common::crypto::SessionKey& macKey,
-                                             const common::crypto::SessionKey& headerKey,
-                                             uint64_t& outCounter) noexcept;
 
         /** The kernel_->Write + CTRL_INTERNAL|CTRL_UNSECURE + opcode preamble,
             one writer factory for the handshake senders. */

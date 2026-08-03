@@ -20,7 +20,7 @@ namespace bcp::flux::platform {
         // the single form the rest of the codebase uses (ResolveAddress
         // produces the same mapping on the send side).
         handle_ = ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-        if (handle_ < 0) return common::Error::SocketFailed;
+        if (handle_ < 0) return common::Error::IoFailed;
 
         int optTrue  = 1;
         int optFalse = 0;
@@ -43,7 +43,7 @@ namespace bcp::flux::platform {
         if (flags < 0 || fcntl(handle_, F_SETFL, flags | O_NONBLOCK) < 0)
         {
             Close();
-            return common::Error::SocketFailed;
+            return common::Error::IoFailed;
         }
 
         sockaddr_in6 addr{};
@@ -87,8 +87,8 @@ namespace bcp::flux::platform {
 
     common::Error PosixSocket::SendTo(const sockaddr_storage& dest, const uint8_t* data, uint16_t size)
     {
-        if (handle_ < 0) return common::Error::SocketFailed;
-        if (size > internal::MAX_WIRE_PACKET_SIZE) return common::Error::PacketTooLarge;
+        if (handle_ < 0) return common::Error::IoFailed;
+        if (size > internal::MAX_WIRE_PACKET_SIZE) return common::Error::TooLarge;
 
         // The kernel wants the exact sockaddr size for the family, not
         // sizeof(sockaddr_storage); some stacks reject the padded length.
@@ -114,7 +114,7 @@ namespace bcp::flux::platform {
     common::Result<uint32_t> PosixSocket::ReceiveFrom(PacketSlotHandle* outPackets, uint32_t maxCount)
     {
         if (handle_ < 0)
-            return common::Result<uint32_t>::Fail(common::Error::SocketFailed);
+            return common::Result<uint32_t>::Fail(common::Error::IoFailed);
 
         uint32_t count = 0;
 
@@ -149,15 +149,6 @@ namespace bcp::flux::platform {
         }
 
         return common::Result<uint32_t>::Success(count);
-    }
-
-    void PosixSocket::ReleasePacket(uint8_t** addresses, uint32_t count)
-    {
-        for (uint32_t i = 0; i < count; i++)
-        {
-            const uint32_t idx = GetSlotIndexFromPtr(addresses[i]);
-            recvSlotPool_.Release(idx);
-        }
     }
 
     uint32_t PosixSocket::GetSlotIndexFromPtr(const uint8_t* address)

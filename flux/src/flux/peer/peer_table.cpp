@@ -265,7 +265,7 @@ namespace bcp::flux
 
                 std::atomic_thread_fence(std::memory_order_acquire);
                 if (version.load(std::memory_order_relaxed) == startVersion)
-                    return PeerHandle{common::Error::PeerNotFound};
+                    return PeerHandle{common::Error::NotFound};
             }
 
             // Slow path: probe under the writer lock. Acquiring it excludes
@@ -275,7 +275,7 @@ namespace bcp::flux
             while (writeLock.test_and_set(std::memory_order_acquire))
                 common::CpuPause();
 
-            PeerHandle result{common::Error::PeerNotFound};
+            PeerHandle result{common::Error::NotFound};
             uint32_t pos = static_cast<uint32_t>(hash) & mask;
             for (uint32_t dist = 0; dist < capacity; ++dist)
             {
@@ -392,7 +392,7 @@ namespace bcp::flux
         if (peerCount_.load(std::memory_order_relaxed) >= peerCapacity_)
         {
             UnlockWriter();
-            return common::Error::MaxPeersReached;
+            return common::Error::LimitReached;
         }
 
         if (FindPos(addrIdx_.get(), idxMask_, ah,
@@ -418,7 +418,7 @@ namespace bcp::flux
         if (slot == INVALID_SLOT)
         {
             UnlockWriter();
-            return common::Error::MaxPeersReached;
+            return common::Error::LimitReached;
         }
 
         // A recycled slot holds the previous peer's bytes; write every field.
@@ -496,7 +496,7 @@ namespace bcp::flux
         {
             peerPool_.UnlockWrite(slot);
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         if (p->hasId)
@@ -542,7 +542,7 @@ namespace bcp::flux
         if (apos == NPOS)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
         const uint32_t slot = addrIdx_[apos].idx.load(std::memory_order_relaxed);
 
@@ -591,7 +591,7 @@ namespace bcp::flux
         if (bpos == NPOS)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
         const uint32_t slot = bcpIdx_[bpos].idx.load(std::memory_order_relaxed);
 
@@ -642,7 +642,7 @@ namespace bcp::flux
         if (apos == NPOS || addrIdx_[apos].idx.load(std::memory_order_relaxed) != slot)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         if (newAddr == oldAddr)
@@ -709,7 +709,7 @@ namespace bcp::flux
         if (apos == NPOS || addrIdx_[apos].idx.load(std::memory_order_relaxed) != slot)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         const uint32_t v = version_.load(std::memory_order_relaxed);
@@ -738,7 +738,7 @@ namespace bcp::flux
         if (tpos == NPOS)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         const uint32_t v = version_.load(std::memory_order_relaxed);
@@ -826,7 +826,7 @@ namespace bcp::flux
 
             // The index moved while we probed; drop every pin and retry.
             for (uint32_t i = 0; i < pinned; ++i)
-                out[i] = PeerHandle{common::Error::PeerNotFound};
+                out[i] = PeerHandle{common::Error::NotFound};
         }
 
         // Slow path: probe under the writer lock, where the index is frozen

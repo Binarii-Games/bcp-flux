@@ -54,7 +54,10 @@ namespace bcp::flux
         ReadyLanes(const ReadyLanes&) = delete;
         ReadyLanes& operator=(const ReadyLanes&) = delete;
 
-        /** @param laneCount rounded up to a power of two, clamped to MAX_LANES.
+        /** @param laneCount a power of two, at most MAX_LANES. A caller that
+                   passes anything else gets it rounded up, which is why Socket
+                   refuses such a count before reaching here: a rounded one
+                   leaves a lane nobody was told to drain.
             @param perLaneCapacity entries in each lane, one per receive slot so
                    a push cannot fail. */
         [[nodiscard]] bool Init(uint32_t laneCount, uint32_t perLaneCapacity) noexcept;
@@ -65,10 +68,10 @@ namespace bcp::flux
         /** Takes a lane for the caller, preferring `wanted`.
 
             @return the lane claimed, or NO_LANE when every one is busy. */
-        [[nodiscard]] uint32_t Claim(uint32_t wanted) noexcept;
+        [[nodiscard]] uint32_t ClaimLane(uint32_t wanted) noexcept;
 
         /** Hands a claimed lane back. */
-        void Release(uint32_t lane) noexcept
+        void ReleaseLane(uint32_t lane) noexcept
         {
             if (lane < laneCount_) busy_[lane].flag.clear(std::memory_order_release);
         }

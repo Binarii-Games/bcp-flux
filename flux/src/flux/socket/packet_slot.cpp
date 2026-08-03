@@ -360,7 +360,7 @@ namespace bcp::flux
             cursor_ = common::BytesWriter  
             {
                 .p = nullptr,
-                .l = nullptr,
+                .written = nullptr,
                 .r = 0
             };
             return;
@@ -376,7 +376,7 @@ namespace bcp::flux
         cursor_ = common::BytesWriter
         {
             .p = pkt_->data,
-            .l = &pkt_->dataSize,
+            .written = &pkt_->dataSize,
             .r = handle_.GetStride() - sizeof(PacketSlot)
         };
     }
@@ -399,7 +399,7 @@ namespace bcp::flux
         std::memset(cursor_.p, 0, reserved);
         cursor_.p += reserved;
         cursor_.r -= reserved;
-        cursor_.IncrLenght(reserved);
+        cursor_.AddWritten(reserved);
         return true;
     }
 
@@ -440,7 +440,7 @@ namespace bcp::flux
         cursor_ = common::BytesWriter
         {
             .p = nullptr,
-            .l = nullptr,
+            .written = nullptr,
             .r = 0
         };
         return std::move(handle_);
@@ -495,7 +495,7 @@ namespace bcp::flux
                 content_ = nullptr;
                 message_ = nullptr;
                 messageLen_ = 0;
-                failReason_ = common::Error::InvalidHeader;
+                failReason_ = common::Error::Malformed;
                 return;
             }
         }
@@ -570,7 +570,7 @@ namespace bcp::flux
 
     PollCursor::~PollCursor()
     {
-        if (lanes_) lanes_->Release(lane_);
+        if (lanes_) lanes_->ReleaseLane(lane_);
     }
 
     PollCursor::PollCursor(PollCursor&& o) noexcept
@@ -590,7 +590,7 @@ namespace bcp::flux
     PollCursor& PollCursor::operator=(PollCursor&& o) noexcept
     {
         if (this == &o) return *this;
-        if (lanes_) lanes_->Release(lane_);
+        if (lanes_) lanes_->ReleaseLane(lane_);
         lanes_  = o.lanes_;
         lane_   = o.lane_;
         slots_  = o.slots_;

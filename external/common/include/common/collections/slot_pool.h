@@ -81,9 +81,7 @@ namespace bcp::common::collections
 
         // Index management
         [[nodiscard]] uint32_t Acquire();
-        [[nodiscard]] uint32_t AcquireBatch(uint32_t* indices, uint32_t requestedCount);
         void Release(uint32_t idx);
-        void ReleaseBatch(const uint32_t* indices, uint32_t count);
 
         // Per-slot locking: readers can overlap, writer is exclusive
         const uint8_t* ReadLock(uint32_t idx);

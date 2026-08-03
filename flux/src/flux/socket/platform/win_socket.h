@@ -1,6 +1,8 @@
 // --- win_socket.h ---
 
 #pragma once
+
+#include <flux/platform.h>
 #ifdef _WIN32
 
 #include <winsock2.h>
@@ -34,10 +36,7 @@ namespace bcp::flux::platform {
 
         [[nodiscard]] common::Error SendTo(const sockaddr_storage& target, const uint8_t* data, uint16_t size) override;
         [[nodiscard]] common::Result<uint32_t> ReceiveFrom(PacketSlotHandle* outPackets, uint32_t maxCount) override;
-        void ReleasePacket(uint8_t** addresses, uint32_t count) override;
 
-        uint8_t* GetBufferBase() override { return nullptr; }
-        uint32_t GetBufferSize() override { return 0; }
 
     private:
         PacketSlot* GetRecvSlot(uint32_t slotIndex);

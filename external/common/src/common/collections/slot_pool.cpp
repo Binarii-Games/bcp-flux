@@ -163,22 +163,6 @@ namespace bcp::common::collections {
         return INVALID;
     }
 
-    uint32_t SlotPool::AcquireBatch(uint32_t* indices, uint32_t requestedCount) {
-        // Gathers ring by ring from the hint onward; the batch may span rings.
-        // Like Acquire, a full sweep finding nothing returns what was got.
-        uint32_t got = 0;
-        const uint32_t start = ShardHint() & shardMask_;
-        for (uint32_t hop = 0; hop < shardCount_ && got < requestedCount; hop++) {
-            const uint32_t ring = (start + hop) & shardMask_;
-            while (got < requestedCount) {
-                uint32_t idx = TryAcquireFrom(ring);
-                if (idx == INVALID) break;
-                indices[got++] = idx;
-            }
-        }
-        return got;
-    }
-
     void SlotPool::Release(uint32_t idx) {
         // The index picks the ring, not the caller: its home holds only its
         // own residue class, so the ring can be exactly full but never
@@ -209,13 +193,6 @@ namespace bcp::common::collections {
                 head = ctl.head.load(std::memory_order_acquire);
             }
         }
-    }
-
-    void SlotPool::ReleaseBatch(const uint32_t* indices, uint32_t count) {
-        // A batch's indices can be homed to different rings, so each one is
-        // routed individually. Release never drops, so neither does this.
-        for (uint32_t i = 0; i < count; i++)
-            Release(indices[i]);
     }
 
     // Per-slot locking: multiple readers, single writer

@@ -503,151 +503,6 @@ namespace bcp::flux
         return retryIntervalMicros_;
     }
 
-    // --- Directory helpers ---
-
-    FlowDirEntry* FlowTable::OutDirFor(uint32_t peerSlot) noexcept
-    {
-        return outAssocDir_.get() + static_cast<size_t>(peerSlot) * maxOutAssocPerPeer_;
-    }
-
-    FlowDirEntry* FlowTable::InDirFor(uint32_t peerSlot) noexcept
-    {
-        return inAssocDir_.get() + static_cast<size_t>(peerSlot) * maxInAssocPerPeer_;
-    }
-
-    /** The directory scan every flow lookup shares.
-
-        @return The entry's flow slot, or INVALID when the id is not published in
-        this segment. */
-    uint32_t FlowTable::FindFlowSlot(const FlowDirEntry* dir, uint32_t width,
-                                     uint16_t flowId) noexcept
-    {
-        for (uint32_t i = 0; i < width; ++i)
-        {
-            if (dir[i].flowSlot == common::collections::SlotPool::INVALID) continue;
-            if (dir[i].flowId == flowId) return dir[i].flowSlot;
-        }
-        return common::collections::SlotPool::INVALID;
-    }
-
-    /** One scan that both rejects a duplicate id and finds the first free entry,
-        publishing the already-leased slot on success.
-
-        @return INVALID when the id is already published (duplicate); `width` when
-        there is no free entry (directory full); otherwise the index written.
-        @pre Caller holds the peer write lock, the directory's guard. */
-    uint32_t FlowTable::InsertFlowSlot(FlowDirEntry* dir, uint32_t width,
-                                       uint16_t flowId, uint32_t flowSlot) noexcept
-    {
-        uint32_t freeAt = width;
-        for (uint32_t i = 0; i < width; ++i)
-        {
-            if (dir[i].flowSlot == common::collections::SlotPool::INVALID)
-            {
-                if (freeAt == width) freeAt = i;
-                continue;
-            }
-            if (dir[i].flowId == flowId)
-                return common::collections::SlotPool::INVALID;   // duplicate
-        }
-        if (freeAt == width)
-            return width;   // directory full
-        dir[freeAt] = FlowDirEntry{ flowId, 0, flowSlot };
-        return freeAt;
-    }
-
-    /** Find-and-clear: unpublish the entry that points at `flowSlot`. The slot is
-        unique in the segment, so matching on it alone hits a single entry. */
-    void FlowTable::EraseFlowSlot(FlowDirEntry* dir, uint32_t width,
-                                  uint32_t flowSlot) noexcept
-    {
-        for (uint32_t i = 0; i < width; ++i)
-        {
-            if (dir[i].flowSlot == flowSlot)
-            {
-                dir[i] = FlowDirEntry{ internal::INVALID_FLOW_ID, 0,
-                                       common::collections::SlotPool::INVALID };
-                return;
-            }
-        }
-    }
-
-    uint32_t FlowTable::FindFlowById(uint16_t flowId) noexcept
-    {
-        // A free slot carries INVALID_FLOW_ID, written at Init and restored on
-        // close. Zero is a legal flow id, so the sentinel cannot be the pool's
-        // zeroing.
-        if (flowId == internal::INVALID_FLOW_ID)
-            return common::collections::SlotPool::INVALID;
-
-        for (uint32_t slot = 0; slot < flowPool_.GetCapacity(); ++slot)
-        {
-            const Flow* flow = reinterpret_cast<const Flow*>(flowPool_.ReadLock(slot));
-            const bool match = flow->flowId == flowId;
-            flowPool_.UnlockRead(slot);
-            if (match) return slot;
-        }
-        return common::collections::SlotPool::INVALID;
-    }
-
-    void FlowTable::LinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept
-    {
-        Flow* flow = reinterpret_cast<Flow*>(flowPool_.WriteLock(flowSlot));
-        OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
-            outAssocPool_.WriteLock(assocSlot));
-
-        assoc->flowSlot   = flowSlot;
-        assoc->nextInFlow = flow->firstAssoc;
-        flow->firstAssoc  = assocSlot;
-
-        outAssocPool_.UnlockWrite(assocSlot);
-        flowPool_.UnlockWrite(flowSlot);
-    }
-
-    void FlowTable::UnlinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept
-    {
-        if (flowSlot >= flowPool_.GetCapacity())
-            return;
-
-        Flow* flow = reinterpret_cast<Flow*>(flowPool_.WriteLock(flowSlot));
-
-        uint32_t prev = common::collections::SlotPool::INVALID;
-        uint32_t scan = flow->firstAssoc;
-        while (scan != common::collections::SlotPool::INVALID && scan != assocSlot)
-        {
-            const OutAssociation* node = reinterpret_cast<const OutAssociation*>(
-                outAssocPool_.ReadLock(scan));
-            const uint32_t next = node->nextInFlow;
-            outAssocPool_.UnlockRead(scan);
-            prev = scan;
-            scan = next;
-        }
-
-        if (scan == assocSlot)
-        {
-            OutAssociation* node = reinterpret_cast<OutAssociation*>(
-                outAssocPool_.WriteLock(assocSlot));
-            const uint32_t next = node->nextInFlow;
-            node->nextInFlow = common::collections::SlotPool::INVALID;
-            node->flowSlot   = common::collections::SlotPool::INVALID;
-            outAssocPool_.UnlockWrite(assocSlot);
-
-            if (prev == common::collections::SlotPool::INVALID)
-            {
-                flow->firstAssoc = next;
-            }
-            else
-            {
-                OutAssociation* before = reinterpret_cast<OutAssociation*>(
-                    outAssocPool_.WriteLock(prev));
-                before->nextInFlow = next;
-                outAssocPool_.UnlockWrite(prev);
-            }
-        }
-
-        flowPool_.UnlockWrite(flowSlot);
-    }
-
     // --- Flow lifecycle ---
 
     FlowHandle FlowTable::Open(uint16_t flowId, FlowMode mode) noexcept
@@ -1708,6 +1563,20 @@ namespace bcp::flux
         return valid;
     }
 
+
+    bool FlowTable::WouldAdmit(const Peer& peer, uint32_t assocSlot,
+                               uint16_t wireSize) noexcept
+    {
+        const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
+            outAssocPool_.ReadLock(assocSlot));
+        if (!flow) return false;
+        const bool ok = flow->life == FlowLifecycle::OPEN
+                     && flow->waitingCount == 0
+                     && CanSend(*flow, peer, wireSize, flow->mode != FlowMode::UNRELIABLE);
+        outAssocPool_.UnlockRead(assocSlot);
+        return ok;
+    }
+
     // --- The waiting-ring drain ---
 
     bool FlowTable::PeekWaiting(uint32_t peerSlot, const Peer& peer,
@@ -1827,163 +1696,6 @@ namespace bcp::flux
         }
         inAssocPool_.UnlockWrite(assocSlot);
         return produced;
-    }
-
-    FlowTable::BatchAdmit FlowTable::AppendToBatch(uint32_t assocSlot, const PacketSlot& packet,
-                                                   uint16_t limit) noexcept
-    {
-        const size_t header = packet.ContentOffset();
-        if (header > packet.dataSize) return BatchAdmit::Rejected;
-
-        // dataSize less the header, NOT ContentLength: this packet has been
-        // built but not sealed, and the seal is what appends the tag, so the
-        // trailer ContentLength subtracts is not there yet. Using it would trim
-        // the last sixteen bytes off every message.
-        const size_t content = packet.dataSize - header;
-        if (content == 0 || content > UINT16_MAX) return BatchAdmit::Rejected;
-
-        // The seal will append that tag to whatever the batch holds, so the
-        // room it needs comes out of the limit here rather than being
-        // discovered when the sealed packet turns out to be too long.
-        if (limit > internal::MAX_WIRE_PACKET_SIZE) limit = internal::MAX_WIRE_PACKET_SIZE;
-        const uint16_t trailer = packet.IsSecure() ? internal::WIRE_TAG_SIZE : 0;
-        if (limit <= trailer) return BatchAdmit::Rejected;
-        limit = static_cast<uint16_t>(limit - trailer);
-
-        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
-            outAssocPool_.WriteLock(assocSlot));
-        if (!flow) return BatchAdmit::Rejected;
-
-        if (flow->openBatchInFlight)
-        {
-            // A flush has this batch and has not yet said whether it went. This
-            // message cannot join it, so it takes the ordinary path and the
-            // next batch starts clean.
-            outAssocPool_.UnlockWrite(assocSlot);
-            return BatchAdmit::Rejected;
-        }
-
-        BatchAdmit result;
-        uint8_t* buffer = flow->OpenBatch();
-        if (flow->openBatchUsed == 0)
-        {
-            // Nothing open. This packet's own framing becomes the batch's, so
-            // the whole thing is copied and the first message sits bare behind
-            // it, exactly as an unbatched packet would look.
-            if (header + content > limit)
-            {
-                result = BatchAdmit::Rejected;   // cannot fit even on its own
-            }
-            else
-            {
-                std::memcpy(buffer, packet.data, header + content);
-                flow->openBatchHeader   = static_cast<uint16_t>(header);
-                flow->openBatchUsed     = static_cast<uint16_t>(header + content);
-                flow->openBatchCount    = 1;
-                flow->openBatchFirstLen = static_cast<uint16_t>(content);
-                result = BatchAdmit::Appended;
-            }
-        }
-        else
-        {
-            wire::BatchCursor cursor{
-                buffer + flow->openBatchHeader,
-                static_cast<uint16_t>(flow->openBatchUsed - flow->openBatchHeader),
-                flow->openBatchCount,
-                flow->openBatchFirstLen,
-                static_cast<uint16_t>(limit - flow->openBatchHeader)
-            };
-
-            if (!wire::BatchAppend(cursor, packet.data + header,
-                                   static_cast<uint16_t>(content)))
-            {
-                // Full. Leave the batch exactly as it is so the caller can send
-                // it, then offer this message again into the empty one.
-                result = BatchAdmit::Sealed;
-            }
-            else
-            {
-                flow->openBatchUsed  = static_cast<uint16_t>(flow->openBatchHeader + cursor.used);
-                flow->openBatchCount = cursor.count;
-                // Second message onward: the content is a list now, and the
-                // controller has to say so or the far side reads it as one
-                // message with rubbish appended.
-                buffer[0] = static_cast<uint8_t>(buffer[0] | internal::WIRE_CTRL_BATCH);
-                result = BatchAdmit::Appended;
-            }
-        }
-
-        outAssocPool_.UnlockWrite(assocSlot);
-        return result;
-    }
-
-    uint16_t FlowTable::TakeBatch(uint32_t assocSlot, uint8_t* out, uint16_t capacity,
-                                  FlowMode& outMode) noexcept
-    {
-        if (!out) return 0;
-
-        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
-            outAssocPool_.WriteLock(assocSlot));
-        if (!flow) return 0;
-
-        outMode = flow->mode;
-        uint16_t written = 0;
-        if (flow->openBatchUsed != 0 && flow->openBatchUsed <= capacity
-            && !flow->openBatchInFlight)
-        {
-            // Copied, not consumed. The batch stays until the caller reports
-            // the send actually happened, because an admission refused at the
-            // flush would otherwise throw away messages the caller was told had
-            // been accepted.
-            std::memcpy(out, flow->OpenBatch(), flow->openBatchUsed);
-            written = flow->openBatchUsed;
-            flow->openBatchInFlight = true;   // no append may join it now
-        }
-
-        outAssocPool_.UnlockWrite(assocSlot);
-        return written;
-    }
-
-    bool FlowTable::WouldAdmit(const Peer& peer, uint32_t assocSlot,
-                               uint16_t wireSize) noexcept
-    {
-        const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
-            outAssocPool_.ReadLock(assocSlot));
-        if (!flow) return false;
-        const bool ok = flow->life == FlowLifecycle::OPEN
-                     && flow->waitingCount == 0
-                     && CanSend(*flow, peer, wireSize, flow->mode != FlowMode::UNRELIABLE);
-        outAssocPool_.UnlockRead(assocSlot);
-        return ok;
-    }
-
-    void FlowTable::FinishBatch(uint32_t assocSlot, uint16_t expectedUsed, bool sent) noexcept
-    {
-        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
-            outAssocPool_.WriteLock(assocSlot));
-        if (!flow) return;
-        // No append can have grown it, since they are refused while in flight,
-        // so the size still matching is an invariant rather than a hope.
-        if (sent && flow->openBatchUsed == expectedUsed)
-        {
-            flow->openBatchUsed     = 0;
-            flow->openBatchHeader   = 0;
-            flow->openBatchCount    = 0;
-            flow->openBatchFirstLen = 0;
-        }
-        flow->openBatchInFlight = false;
-        outAssocPool_.UnlockWrite(assocSlot);
-    }
-
-    bool FlowTable::PeekBatch(uint32_t assocSlot, FlowMode& outMode) noexcept
-    {
-        const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
-            outAssocPool_.ReadLock(assocSlot));
-        if (!flow) return false;
-        const bool open = flow->openBatchUsed != 0;
-        outMode = flow->mode;
-        outAssocPool_.UnlockRead(assocSlot);
-        return open;
     }
 
     uint32_t FlowTable::DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept

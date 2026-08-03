@@ -11,7 +11,7 @@ namespace bcp::flux
             return false;
 
         uint16_t written = 0;
-        common::BytesWriter w{ .p = out, .l = &written, .r = cap };
+        common::BytesWriter w{ .p = out, .written = &written, .r = cap };
 
         return w.PutU8(version)
             && w.PutBytes(subjectKey.data(), subjectKey.size())
@@ -24,13 +24,13 @@ namespace bcp::flux
 
         uint8_t ver = 0;
         if (!r.TakeU8(ver) || ver != VERSION_PINNED)
-            return common::Result<Certificate>::Fail(common::Error::InvalidHeader);
+            return common::Result<Certificate>::Fail(common::Error::Malformed);
 
         Certificate cert;
         cert.version = ver;
         if (!r.TakeBytes(cert.subjectKey.data(), cert.subjectKey.size()) ||
             !r.TakeBytes(cert.identityTag.data(), cert.identityTag.size()))
-            return common::Result<Certificate>::Fail(common::Error::InvalidHeader);
+            return common::Result<Certificate>::Fail(common::Error::Malformed);
 
         return common::Result<Certificate>::Success(cert);
     }

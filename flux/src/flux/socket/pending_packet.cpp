@@ -13,7 +13,7 @@ namespace bcp::flux::pending
                        bool requireAuth, bool keepsBodyForResend)
     {
         if (packet.dataSize > internal::MAX_WIRE_PACKET_SIZE)
-            return common::Error::PacketTooLarge;
+            return common::Error::TooLarge;
 
         Peer* p = peer.Write();
         if (!p)

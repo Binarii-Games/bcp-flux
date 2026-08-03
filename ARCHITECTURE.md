@@ -2,7 +2,11 @@
 
 Flux is a connectionless encrypted UDP transport. It builds on `common`, a
 standalone systems library vendored in `external/common` and developed on its
-own. `common` carries nothing that only makes sense to a transport.
+own. `common` is meant to carry nothing that only makes sense to a transport,
+and three places currently break that: the error enum names transport
+conditions, `platform.h` pulls in the OS socket headers, and `BytesWriter`
+carries a pointer to a packet length field. They are listed here rather than
+quietly excepted, because a rule with unlisted exceptions is not a rule.
 
 This document describes each library's structure: its entities, its ownership
 graph, and the number of sanctioned ways to perform each core operation. Where
@@ -28,8 +32,8 @@ flux  ──depends on──▶  common  ──depends on──▶  monocypher
 
 A library may depend on another library in the set. It may never depend on a
 consumer of itself, and it may never carry a concept that only makes sense to
-one of its consumers. `common` knows nothing about packets, peers, sockets, or
-wire formats. A type that only makes sense to a transport belongs in `flux`.
+one of its consumers. A type that only makes sense to a transport belongs in
+`flux`. The exceptions named above are the whole list, and nothing new joins it.
 
 ### Conventions every library obeys
 
@@ -58,9 +62,10 @@ wire formats. A type that only makes sense to a transport belongs in `flux`.
 - **Platform.** `CACHE_LINE` (128 on arm64, 64 elsewhere), `CpuPause()`, and
   `MonotonicMicros()`, which is meaningful only as a difference between two
   calls.
-- **Collections.** Two lock-free primitives, and they are the whole set.
-  `SlotPool` is an index free-list over one contiguous block plus a per-slot
-  reader/writer lock. The free-list is sharded across up to sixteen rings so
+- **Collections.** Two structures, and they are the whole set. `SlotPool` is an
+  index free-list over one contiguous block plus a per-slot reader/writer lock.
+  The free-list is lock-free; the per-slot lock is a blocking spin with no try
+  variant and no timeout, so a caller that takes one cannot decline to wait. The free-list is sharded across up to sixteen rings so
   concurrent acquires and releases spread over independent cache lines. Slots
   are fixed-stride and never move, so an index is a stable name for a piece of
   memory. The pool runs no constructors and zeroes only at `Init`, so anything
@@ -73,10 +78,12 @@ wire formats. A type that only makes sense to a transport belongs in `flux`.
   these buffers, and never overlay a struct on them.
 - **Crypto.** X25519 keypairs and Diffie-Hellman, a blake2b KDF and keyed MAC,
   XChaCha20-Poly1305 AEAD, ids as `blake2b(pubkey)`, constant-time comparison,
-  secure wipe, and `RandomBytes` over the platform RNG. Header-only, so
-  monocypher and `bcrypt` propagate as `PUBLIC` link dependencies.
-- **Log.** All diagnostics go through `Log` and `LogF`, which route to a
-  replaceable callback. Never `printf`, never iostreams.
+  secure wipe, and `RandomBytes` over the platform RNG. Every function a caller
+  uses is inline in the header, so monocypher and `bcrypt` propagate as `PUBLIC`
+  link dependencies.
+- **Log.** All diagnostics go through `Log` and `LogF`. The callback type is
+  declared but nothing installs one, so today both write to stdout under a mutex.
+  Never `printf` directly, never iostreams.
 
 ---
 
@@ -92,6 +99,12 @@ exception is `Address::From`, which will resolve a hostname through the
 platform's `getaddrinfo` as a convenience for callers that have a name rather
 than a literal. That call blocks and allocates, so it belongs to setup and never
 to a packet path.
+
+`Socket` also owns five smaller pieces the sections below refer to without
+introducing: `SocketListener` and `SocketSender`, thin wrappers over the kernel's
+receive and send; `ChallengeGenerator`, the stateless handshake cookie source;
+`Identity`, this socket's long-term keypair; and `ReplayWindow`, one per peer
+slot.
 
 | Sub-namespace | Holds |
 |---|---|
@@ -197,18 +210,27 @@ owner:
 | pending | `Socket` | packets parked behind an unfinished handshake |
 | staging | `FlowTable` | retained reliable bodies, held until the receiver's cursor passes |
 | flow | `FlowTable` | `Flow` slots, one per open flow |
-| out-association | `FlowTable` | `OutAssociation` slots |
-| in-association | `FlowTable` | `InAssociation` slots |
+| out-association | `FlowTable` | `OutAssociation` slots, standard window |
+| out-association, bulk | `FlowTable` | `OutAssociation` slots, deep window |
+| in-association | `FlowTable` | `InAssociation` slots, standard window |
+| in-association, bulk | `FlowTable` | `InAssociation` slots, deep window |
 | peer | `PeerTable` | `Peer` slots |
 | certificate | `CertStore` | trusted `Certificate` slots |
 
-`Socket` borrows the two kernel pools as raw pointers, so it must not outlive
-the kernel, and lends both to `FlowTable` along with the ready queue. Every
-other pool is owned by `Socket` or by the component it reaches through.
+Each association pool is really two, a standard one and a deep one for bulk,
+behind a single index space. `SplitAssocPool` maps an index below the standard
+capacity to the first and the rest into the second, so a slot index stays a
+plain integer everywhere it is stored and the rest of the table never learns
+there are two. A bulk association's rings are four times as deep, and this is
+what stops an ordinary flow paying for that.
 
-Two flat arrays are indexed by peer slot and guarded by that peer's slot lock:
-the replay window state, and the flow directories (`FlowDirEntry[]`, one
-segment per direction). Staging is sized apart from the kernel send pool so a
+`Socket` owns the kernel and borrows its two pools as raw pointers, lending both
+to `FlowTable` along with the delivery lanes. Every other pool is owned by
+`Socket` or by the component it reaches through.
+
+Three flat arrays are indexed by peer slot and guarded by that peer's slot lock:
+the replay window state, and the two flow directories (`FlowDirEntry[]`, one per
+direction). Staging is sized apart from the kernel send pool so a
 busy reliable flow can never starve handshakes, acks, or unreliable traffic of
 send slots. Staging running dry is backpressure.
 
@@ -218,22 +240,25 @@ send slots. Staging running dry is backpressure.
 |---|---|---|
 | `PacketSlotHandle` | a slot lease and its lock | destructor, returning the slot to the pool |
 | `PeerHandle` | the slot's lock only | destructor, dropping the lock |
-| `FlowHandle` | nothing, a `{slot, epoch, flowId}` key | nothing to release |
+| `FlowHandle` | nothing, a `{slot, epoch, flowId, flowData}` key | nothing to release |
+| `PollCursor` | the claim on the lane it drained | destructor, freeing the lane |
 
-All three are move-only, and a moved-from handle is left unusable.
+All four are move-only, and a moved-from handle is left unusable.
 
 `PacketSlotHandle` is the unit of packet ownership. An invalid index yields a
 failed handle whose `Read()` and `Write()` return `nullptr`. `Detach()` gives
 up ownership and returns the bare index, which is how a reliable body outlives
 the send that wrote it. `PacketSlotWriter` wraps a handle with a byte cursor.
-`PacketSlotReader` borrows one instead of owning it, because a packet carrying
-several messages is read by one reader per message while a single handle keeps
-the slot, so the reader has to be something the packet's owner outlives.
+`PacketSlotReader` borrows one instead of owning it, and walks the messages a
+packet holds one at a time, so it has to be something the packet's owner
+outlives.
 
 `PollCursor` is what `Poll` returns. It borrows the array `Poll` filled and
-steps through every message in every packet it holds, which is what lets a
-caller read one loop whether the messages arrived one per datagram or packed
-together. It owns nothing and releases nothing.
+drives one reader across every packet in it, which is what lets a caller read
+one flat loop whether the messages arrived one per datagram or packed together.
+It owns the claim on the lane it drained and frees that on destruction, which is
+what keeps one thread the only reader of a peer's traffic for as long as the
+caller is still reading.
 
 `PeerHandle` arrives read-locked with the key verified under that lock.
 `RemovePeer` frees a slot only after taking its write lock, so a peer is never
@@ -257,14 +282,22 @@ holds takes the handle, never an address or slot index:
 
 ### 3.4 Concurrency
 
-Flux owns no thread. Work happens on a caller's thread through four entry
-points, all safe to call concurrently:
+Flux owns no thread. Work happens on a caller's thread. Four entry points carry
+the packet path and all of them are safe to call concurrently:
 
-- `Poll` processes inbound packets and drains ready ones to the application.
-- `Update` runs the tick: flush owed acks, retransmit, drain waiting sends,
-  evict idle peers. All time-based work lives here.
-- `Flush` puts every flow's part-filled batch on the wire.
+- `Poll` processes inbound packets and drains a lane of ready ones to the
+  application.
+- `Update` runs the tick: retry handshakes, flush owed acks, retransmit, drain
+  waiting sends, evict idle peers, reclaim jammed receiving flows. All
+  time-based work lives here.
+- `Flush` puts part-filled batches on the wire, at most `MAX_FLUSH_PER_PEER`
+  associations per peer per call, the rest riding the next one.
 - Sending, through `PacketBuilder`.
+
+The rest of the public surface is setup and inspection: `Init`, `Shutdown`,
+`Connect`, `OpenFlow`, `CloseFlow`, `GetFlowState`, `GetPeer`, `RemovePeer`,
+`RotateTags`, `RetryHandshakes`, `NextTimeout`, `LoadCertificate`,
+`ReceivingFlowCount`, `BuildPacket`.
 
 A send on a flow is packed into a batch and waits for `Flush`, so a caller
 drives all three round its loop and nothing leaves without the last of them.
@@ -288,12 +321,12 @@ peer lock is never held across a `SendTo` syscall or anything that takes a
 staging lock.
 
 `PeerTable` and `CertStore` share one design: entries in a `SlotPool`, Robin
-Hood open-addressed indexes mapping keys to slots, removal by backward-shift so
+Hood open-addressed indexes mapping keys to slots, removal by backward-shift on the peer side only so
 probe distance stays bounded. One table-wide seqlock (`version_`) covers the
 indexes. A writer holds it odd across any mutation, a reader validates its
 whole probe against it and retries if the version moved, and writers serialize
 on a single write lock. Readers never store to the index, so lookups scale
-across cores, and a matched slot's key is verified under its read lock, so a
+across cores, and a matched slot's key is verified under its read lock, except on the tag index, which verifies none, so a
 hash collision never resolves to the wrong peer.
 
 Do not call a table operation while holding a handle from that table. Writers
@@ -360,11 +393,32 @@ Handshake packets are the only cleartext opcodes (`HS_INIT`, `HS_CHLG`,
 `HS_RES`, `HS_FINISH`), carried on unsecured internal packets because no key
 exists yet.
 
-Every wire constant is named in `flux/internal/constants.h`.
+Most wire constants are named in `flux/internal/constants.h`. The exceptions
+live where the thing they describe is decoded: the flow framing bits and the
+epoch width in `flow.h`, and the controller bits in `socket.h`. `CTRL_BATCH` is
+the one controller bit taking its value from `constants.h`, because the batch
+packer sets it and has no business reaching into the socket's headers.
+
+### 3.5b Where the code lives
+
+Four pieces sit in their own files rather than inside `Socket` or `FlowTable`,
+because each is one job and neither of those is:
+
+| File | Holds |
+|---|---|
+| `crypto/packet_seal.cpp` | the two seals and the two opens, and nothing that reaches a peer, a flow or a pool |
+| `flow/flow_batching.cpp` | the open batch on a sending association: what may join it and what its bytes cost |
+| `flow/assoc_directory.cpp` | flow id to slot index, per peer, per direction |
+| `peer/congestion.cpp` | the AIMD budget, which belongs to the peer and not to any one flow |
+
+The split is by job, not by size. The handshake and the migration receive path
+are both larger than any of these and both stay where they are: each reaches
+most of `Socket`, so moving either would trade one large file for a large file
+plus a wide interface.
 
 ### 3.6 The paths
 
-#### Reaching a peer: three keys, one table
+#### Reaching a peer: three keys, one sweep, one raw index
 
 | Route | Call | When |
 |---|---|---|
@@ -372,32 +426,58 @@ Every wire constant is named in `flux/internal/constants.h`.
 | by id | `PeerTable::GetPeer(const BcpId&)` | after a peer proves an id, survives migration |
 | by tag | `PeerTable::GetPeersByTag(...)` | migration only, multi-valued |
 
-All three return a read-locked `PeerHandle`, and nothing outside `PeerTable`
-reaches a peer slot directly. The tag route is multi-valued because one peer
-holds several tags at once (its rotation window, capped at `MAX_TAGS_PER_PEER`)
-and two peers may derive the same tag by chance. A clash resolves by trial
-decryption.
+All three return a read-locked `PeerHandle`. The tag route is multi-valued
+because one peer holds several tags at once (its rotation window, capped at
+`MAX_TAGS_PER_PEER`) and two peers may derive the same tag by chance. A clash
+resolves by trial decryption.
 
-#### Sending: one seal, five origins
+Two more routes exist and neither yields a handle. `CollectAddresses` copies out
+every live address so the tick and `Flush` can walk peers without holding the
+table, and it takes the writer lock, which is the opposite profile from the three
+lookups above. And a bare slot index, handed out by `RegisterPeer`, is what the
+handshake carries between its steps: every binding call (`BindId`, `BindTag`,
+`UnbindTags`, `UpdateAddress`) is keyed on that index rather than on a handle.
+Reads go through a verified key; those mutations do not.
 
-`Socket::SealSecurePacket` is the only place an outbound packet is encrypted.
-Five things originate a send:
+#### Three security levels
+
+A packet is encrypted, authenticated but readable, or neither. `PacketBuilder`
+picks with `MacOnly()` and `Unsecured()`, and encrypted is the default. Mac-only
+carries the same framing and the same tag as encrypted and costs roughly half the
+crypto, for traffic that is public anyway and sent often. Unsecured carries no
+tag at all and cannot carry a flow, because a forged packet could otherwise name
+any sequence it liked.
+
+#### Sending: two seals, six origins
+
+An outbound packet is sealed one of two ways. `SealSecurePacket` encrypts the
+payload and covers it with a tag. `SealMacOnlyPacket` leaves the payload readable
+and covers it with the same tag, for traffic that is public anyway and sent
+often. Framing is identical either way, so every offset matches and only the
+seal and the open differ. The receive side mirrors them with `OpenSecurePacket`
+and `OpenMacOnlyPacket`.
+
+Six things originate a send:
 
 1. Application, non-flow: `BuildPacket().NoFlow()...Send()` or `.SendSecured()`
 2. Application, on a flow: `BuildPacket().WithFlow(flow)...Send()` or `.SendSecured()`
 3. Handshake: `BuildInternal(op)`, unsecured because no key exists yet
 4. Secure control: `SendSecureControl(...)`, wire-identical to data
-5. Retransmit and waiting-ring drain: `SealStagingToWire(...)`, shared by
-   `ResendStaging` and `DrainWaitingSends`
+5. Retransmit: `ResendStaging(...)` into `SealStagingToWire`
+6. The waiting-ring drain: reliable entries go through `SealStagingToWire` like
+   a retransmit, unreliable ones are sealed and sent where they sit, because
+   nothing retains them and there is no staging copy to seal from
 
 The builder requires the packet's kind declared before any payload, because the
 kind decides the pool: a reliable flow body is its own retransmit source and
 goes to a retained staging slot, everything else goes to a kernel send slot and
 is released once on the wire.
 
-A send on a flow does not reach the wire by itself. It is packed into that
-flow's open batch and waits there for `Flush`, so several small messages leave
-as one datagram, under one seal, holding one staging slot. Nothing else is
+A send on a flow does not usually reach the wire by itself. It is packed into
+that flow's open batch and waits for `Flush`, so several small messages leave as
+one datagram, under one seal, holding one staging slot. A batch that fills goes
+out immediately rather than waiting, since there is no room for the next message
+either way. Nothing else is
 batched: handshake traffic, secure control, retransmits and the waiting-ring
 drain all go straight out, and so does a message the caller framed itself as
 part of a larger one, since the framing bits describe a packet's first and last
@@ -487,14 +567,17 @@ each of them whatever they win, and two threads then walk their own packets at
 their own speed, so the application sees sequence four before sequence one even
 though the queue held them the right way round.
 
-Lanes fix that by giving each draining thread its own queue. A peer's packets
+`ReadyLanes` fixes that by giving each draining thread its own queue. A peer's packets
 always take the same lane, chosen by hashing its slot index, so one thread sees
 all of them and sees them in order. The slot index is used because it does not
 change while the peer lives: a peer that moves to a new address keeps its lane,
 and no state is ever handed between threads.
 
 `Config::pollLanes` sets how many, defaulting to one, which is the single queue
-this has always been.
+this has always been. It must be a power of two and at most sixteen, and `Init`
+refuses anything else rather than rounding, because a rounded count would leave a
+lane no thread was told to drain. The caller names its lane with a
+`ThreadIdentity`, which is nothing but the lane it last held.
 
 A lane is claimed for the life of the `PollCursor`, not merely for the drain.
 That span is what the guarantee rests on: the order survives only while one
@@ -506,7 +589,9 @@ taken by another rather than filling untouched.
 
 Each lane is sized for the whole receive pool rather than a share of it, because
 all the traffic can come from peers landing in one lane, and a push that fails is
-a packet dropped after its sender was told it arrived.
+a packet dropped after its sender was told it arrived. That makes the lanes the
+largest memory the socket commits after the pools themselves, and it is why the
+lane count is capped.
 
 A packet with no flow carries no sequence and so has no order to keep. It takes
 the lane its source address hashes to, which only keeps one sender's traffic
@@ -583,7 +668,7 @@ after verification, so an unverified initiator costs it nothing. Both sides
 bind a role-ordered transcript into the session key and a confirmation MAC:
 
 ```
-initiatorPk ‖ responderPk ‖ saltI ‖ saltR
+initiatorPk ‖ responderPk ‖ initiatorEph ‖ responderEph ‖ saltI ‖ saltR
   ‖ initiatorCaps ‖ responderCaps ‖ initiatorVersion ‖ responderVersion ‖ tag
 ```
 
@@ -673,13 +758,14 @@ this socket allocate, and it is reachable only after a completed handshake.
 
 Closing is local too. `CloseFlow` walks the flow's association list, releases
 what each was holding, and frees the flow, sending nothing. A remote dropping
-its receive state can never end the flow, only lose one association, and an
-unused association idles out on its own.
+its receive state can never end the flow, only lose one association. An
+association is freed by `CloseFlow` or by its peer going away, and by nothing
+else: there is no idle timer on an association.
 
 `FAILED` is terminal, reached when the remote rejects the flow or a packet
 exhausts its retransmits. The rings drain and the congestion bytes refund
-immediately, but the slot waits for the application to observe the failure
-through its handle before recycling.
+immediately, and the slot stays leased until `CloseFlow` or the peer's teardown
+frees it. `GetFlowState` reports the failure and does not clear it.
 
 Mode is copied onto each association at creation, because the send gate, the
 drain, and the retransmit scan read it per packet, and reaching back to the flow
@@ -725,7 +811,10 @@ only be evicted late.
 ### 3.8 Platform backends
 
 All platform-specific code lives behind an `ISocketKernel` implementation, and
-nothing OS-specific leaks into `Socket` or above. Adding a backend means
+nothing OS-specific leaks into `Socket` or above. Alongside the real backends
+sits `FAULTY`, an in-process kernel that drops, duplicates, reorders and corrupts
+on a seeded schedule. It is a `BackendType` like any other so a test drives it
+through the ordinary public surface. Adding a backend means
 implementing the interface and wiring its `BackendType` case, without editing
 callers. Windows, Linux, and macOS are all targets, on x86-64 and arm64, and a
 path that compiles everywhere carries no architecture-specific intrinsic
