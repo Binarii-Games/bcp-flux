@@ -194,6 +194,21 @@ namespace bcp::flux::platform
         return FaultyBase::SendTo(target, data, size);
     }
 
+    uint32_t FaultySocket::SendBatch(const Outgoing* items, uint32_t count)
+    {
+        // Through SendTo so every datagram still meets the drop, reorder
+        // and corruption rules. A batch that bypassed them would make the
+        // fault tests quietly stop testing anything.
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (SendTo(*items[i].target, items[i].data, items[i].size)
+                != common::Error::Ok) break;
+            ++done;
+        }
+        return done;
+    }
+
     common::Error FaultySocket::SendTo(const sockaddr_storage& target,
                                        const uint8_t* data, uint16_t size)
     {

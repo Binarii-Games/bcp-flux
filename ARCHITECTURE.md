@@ -819,3 +819,10 @@ implementing the interface and wiring its `BackendType` case, without editing
 callers. Windows, Linux, and macOS are all targets, on x86-64 and arm64, and a
 path that compiles everywhere carries no architecture-specific intrinsic
 unconditionally.
+
+A backend puts packets on the wire one at a time through `SendTo`, or several
+at once through `SendBatch`. The batch form exists because a flush usually has
+more than one datagram ready for the same peer, and Linux can hand all of them
+over in a single `sendmmsg` call. Where the OS has no equivalent the backend
+loops over its own `SendTo`, so the calling code is identical everywhere and
+only the syscall count changes.

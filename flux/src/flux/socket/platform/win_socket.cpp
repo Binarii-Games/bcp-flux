@@ -69,6 +69,20 @@ namespace bcp::flux::platform {
         sendSlotPool_.Shutdown();
     }
 
+    uint32_t WinSocket::SendBatch(const Outgoing* items, uint32_t count)
+    {
+        // Windows has no sendmmsg. This is the loop it already ran, behind
+        // the call the send path now makes.
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (SendTo(*items[i].target, items[i].data, items[i].size)
+                != common::Error::Ok) break;
+            ++done;
+        }
+        return done;
+    }
+
     common::Error WinSocket::SendTo(const sockaddr_storage& dest, const uint8_t* data, uint16_t size) 
     {
         if (handle_ == INVALID_SOCKET) return common::Error::IoFailed;

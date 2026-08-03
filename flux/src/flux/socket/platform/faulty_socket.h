@@ -138,6 +138,8 @@ namespace bcp::flux::platform
                                          uint32_t sendSlotCount = 4096) override;
         void Close() override;
 
+        [[nodiscard]] uint32_t SendBatch(const Outgoing* items, uint32_t count) override;
+
         [[nodiscard]] common::Error SendTo(const sockaddr_storage& target,
                                            const uint8_t* data, uint16_t size) override;
 
