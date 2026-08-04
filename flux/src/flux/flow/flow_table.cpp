@@ -345,7 +345,8 @@ namespace bcp::flux
     common::Error FlowTable::Init(const Params& params,
                                   common::collections::SlotPool* recvPool,
                                   common::collections::SlotPool* sendPool,
-                                  ReadyLanes* readyLanes) noexcept
+                                  ReadyLanes* readyLanes,
+                                  PeerRecvState* peerRecvStates) noexcept
     {
         if (params.outCount == 0 && params.inCount == 0)
             return common::Error::Ok;   // flows disabled entirely
@@ -353,6 +354,7 @@ namespace bcp::flux
         recvPool_   = recvPool;
         sendPool_   = sendPool;
         readyLanes_ = readyLanes;
+        peerRecvStates_ = peerRecvStates;
 
         // Fixed, not configured: nothing carries the window on the wire, so two
         // sockets that disagreed could never find out. See internal::FLOW_WINDOW.
@@ -1327,6 +1329,7 @@ namespace bcp::flux
                 continue;
 
             recvPool_->Release(ring[i].packetSlot);
+            peerRecvStates_[flow->peerSlot].ReleaseOne();
             // The bit has to go with the bytes. A sequence left marked seen is
             // a sequence the resend is discarded as a duplicate, and the sender
             // has no other way to learn this side no longer holds it.
@@ -1666,9 +1669,10 @@ namespace bcp::flux
         // Everything from this peer takes the same lane, and a lane has one
         // reader, which is what carries the sequence order built above all the
         // way out to the application.
-        if (!readyLanes_->Push(readyLanes_->LaneOf(peerSlot), idx))
+        if (!readyLanes_->Push(readyLanes_->LaneOf(peerSlot), idx, peerSlot))
             return false;   // full: backpressure, caller drops
         (void)handle.Detach();                       // queued; must not release the slot
+        peerRecvStates_[peerSlot].PinOne();
         return true;
     }
 
@@ -1762,6 +1766,7 @@ namespace bcp::flux
             {
                 slot.seq = seq;
                 slot.packetSlot = incoming.Detach();   // stays in recv pool, leased
+                peerRecvStates_[flow.peerSlot].PinOne();
                 CommitSeen(&flow, seq);                 // held -> ackable (SACK)
                 ArmAck(&flow);
             }
@@ -1790,7 +1795,10 @@ namespace bcp::flux
                 || held.seq != flow.recvNext)
                 break;   // gap: stop draining
 
-            if (!readyLanes_->Push(readyLanes_->LaneOf(flow.peerSlot), held.packetSlot))
+            // Hold-back to lane is a move, not a new pin, so the peer's
+            // occupancy is unchanged and nothing is counted here.
+            if (!readyLanes_->Push(readyLanes_->LaneOf(flow.peerSlot),
+                                   held.packetSlot, flow.peerSlot))
                 break;   // queue full: leave the tail held
 
             held.packetSlot = common::collections::SlotPool::INVALID;

@@ -42,6 +42,16 @@ namespace bcp::flux
         A claim starts at the lane the caller last held: that keeps a thread on
         one lane and its peers' state in one cache while things are healthy, and
         lets another thread take it over when they are not. */
+    /** A packet waiting to be polled. The peer slot rides with it because the
+        thread that pops it has to know whose receive budget it frees, and by
+        then the packet's association is long out of reach. Eight bytes in a
+        cell that is cache-line padded either way, so it costs nothing. */
+    struct ReadyEntry
+    {
+        uint32_t slotIndex;
+        uint32_t peerSlot;
+    };
+
     class ReadyLanes
     {
     public:
@@ -85,14 +95,14 @@ namespace bcp::flux
             return laneCount_ > 1 ? (key * GOLDEN) >> laneShift_ : 0;
         }
 
-        [[nodiscard]] bool Push(uint32_t lane, uint32_t slotIndex) noexcept
+        [[nodiscard]] bool Push(uint32_t lane, uint32_t slotIndex, uint32_t peerSlot) noexcept
         {
-            return lane < laneCount_ && lanes_[lane].Push(slotIndex);
+            return lane < laneCount_ && lanes_[lane].Push(ReadyEntry{slotIndex, peerSlot});
         }
 
-        [[nodiscard]] bool Pop(uint32_t lane, uint32_t& slotIndex) noexcept
+        [[nodiscard]] bool Pop(uint32_t lane, ReadyEntry& out) noexcept
         {
-            return lane < laneCount_ && lanes_[lane].Pop(slotIndex);
+            return lane < laneCount_ && lanes_[lane].Pop(out);
         }
 
     private:
@@ -105,7 +115,7 @@ namespace bcp::flux
             std::atomic_flag flag = ATOMIC_FLAG_INIT;
         };
 
-        common::collections::FifoQueue<uint32_t> lanes_[MAX_LANES];
+        common::collections::FifoQueue<ReadyEntry> lanes_[MAX_LANES];
         LaneBusy busy_[MAX_LANES];
         uint32_t laneCount_ = 0;
         uint32_t laneShift_ = 32;

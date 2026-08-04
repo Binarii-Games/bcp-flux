@@ -228,9 +228,20 @@ what stops an ordinary flow paying for that.
 to `FlowTable` along with the delivery lanes. Every other pool is owned by
 `Socket` or by the component it reaches through.
 
-Three flat arrays are indexed by peer slot and guarded by that peer's slot lock:
-the replay window state, and the two flow directories (`FlowDirEntry[]`, one per
-direction). Staging is sized apart from the kernel send pool so a
+Four flat arrays are indexed by peer slot. Three of them are guarded by that
+peer's slot lock: the replay window state, and the two flow directories
+(`FlowDirEntry[]`, one per direction). The fourth is not, and that is the point
+of it. `PeerRecvState[]` records how many receive slots a peer currently pins,
+counting both packets held behind a gap and packets queued for delivery that
+have not been polled, alongside the limit that peer was given. Both are written
+where no peer lock is held, on the receive path and again when the application
+polls, so both are atomics and every access is relaxed. Neither publishes
+anything, they are only ever compared, so a reader may see a count stale by
+however many pins and releases are in flight. That costs a packet either side of
+a limit and can never over-allocate the pool, because the count decides policy
+and never ownership.
+
+Staging is sized apart from the kernel send pool so a
 busy reliable flow can never starve handshakes, acks, or unreliable traffic of
 send slots. Staging running dry is backpressure.
 

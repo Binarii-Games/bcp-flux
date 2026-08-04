@@ -35,6 +35,7 @@
 #include <flux/socket/i_socket_kernel.h>
 #include <flux/crypto/packet_seal.h>
 #include <flux/socket/packet_slot.h>
+#include <flux/peer/peer_recv_state.h>
 #include <flux/socket/ready_lanes.h>
 #include <flux/socket/socket_listener.h>
 #include <flux/socket/socket_sender.h>
@@ -458,6 +459,12 @@ namespace bcp::flux
 
         // Peers, replay, and the pending-behind-handshake pool.
         PeerTable                      peers_;
+        /** One per peer slot, sized with the peer pool. Holds what that peer
+            pins of the receive pool and what it was granted. Written on the
+            receive path, which holds no peer lock, so both fields are atomic
+            and every access is relaxed. See peer_recv_state.h for why that is
+            sufficient. */
+        std::unique_ptr<PeerRecvState[]> peerRecvStates_;
         std::unique_ptr<uint64_t[]>    replayState_;   ///< (1 + replayWords_) u64 per peer slot
         uint32_t                       replayWords_ = 0;
         common::collections::SlotPool  pendingPool_;

@@ -228,6 +228,13 @@ namespace bcp::flux
         // One replay block per peer slot: [highWater][bitmap words...]. Rounds up
         // to a multiple of 64 counters, at least one word. All zero: an unproven
         // peer receives nothing, and each establish resets its block.
+        // One entry per peer slot, and the peer pool rounds its capacity up to
+        // a power of two, so the array has to match or a high slot index reads
+        // past the end.
+        peerRecvStates_.reset(new (std::nothrow)
+                             PeerRecvState[common::NextPowerOfTwo(config.maxPeers)]);
+        if (!peerRecvStates_) return common::Error::NotInitialized;
+
         replayWords_ = (config.replayWindowBits + 63) / 64;
         if (replayWords_ == 0)
             replayWords_ = 1;
@@ -264,7 +271,8 @@ namespace bcp::flux
         params.maxAttempts         = config.timers.maxAttempts;
         params.flowStallTimeoutMicros = config.liveness.flowStallTimeoutMicros;
 
-        if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyLanes_);
+        if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyLanes_,
+                                             peerRecvStates_.get());
             error != common::Error::Ok)
             return error;
 
@@ -1102,10 +1110,15 @@ namespace bcp::flux
             return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
 
         size_t delivered = 0;
-        uint32_t idx = 0;
-        while (delivered < max && readyLanes_.Pop(lane, idx))
+        ReadyEntry ready{};
+        while (delivered < max && readyLanes_.Pop(lane, ready))
         {
-            outPackets[delivered] = PacketSlotHandle{ idx, recvPool_ };
+            // Out of the lane and into the caller's hands, so it stops counting
+            // against the peer that sent it. Non-flow packets are unattributed
+            // and never counted, so there is nothing to give back for them.
+            if (ready.peerSlot != common::collections::SlotPool::INVALID)
+                peerRecvStates_[ready.peerSlot].ReleaseOne();
+            outPackets[delivered] = PacketSlotHandle{ ready.slotIndex, recvPool_ };
             outPackets[delivered].BindSocket(this);
             ++delivered;
         }
@@ -1282,7 +1295,11 @@ namespace bcp::flux
         // A non-flow packet carries no sequence, so there is no order to keep.
         // Hashing the address only keeps one sender's traffic landing together.
         const uint32_t lane = readyLanes_.LaneOf(packet->address.hash());
-        if (!readyLanes_.Push(lane, idx)) return false;   // full: backpressure, caller drops
+        // No flow means no association and so no peer slot in hand. Attributing
+        // it would cost a peer lookup on every non-flow packet, so this rides
+        // unattributed and does not count against anyone's occupancy.
+        if (!readyLanes_.Push(lane, idx, common::collections::SlotPool::INVALID))
+            return false;   // full: backpressure, caller drops
         (void)handle.Detach();                      // queued; must not release the slot
         return true;
     }
@@ -1798,6 +1815,7 @@ namespace bcp::flux
             {
                 if (peers_.RegisterPeer(from, &id, slot) != common::Error::Ok)
                     return;   // table full; the initiator's retry will land later
+                peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
             }
             else
             {
@@ -2435,6 +2453,7 @@ namespace bcp::flux
                                             // its HS_INIT is already on the way
         if (registration != common::Error::Ok)
             return registration;
+        peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
 
         {
             PeerHandle peerHandle = peers_.GetPeer(addr);
