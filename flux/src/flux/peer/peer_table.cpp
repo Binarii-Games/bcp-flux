@@ -450,6 +450,14 @@ namespace bcp::flux
         p->lastSeenAt  = p->firstSeenAt;
         p->congestionBudget     = internal::CC_INITIAL_WINDOW_BYTES;
         p->bytesInFlight        = 0;
+        // Both generations restart with the slot. Inheriting a high one from a
+        // previous occupant would make every grant the new peer sends look
+        // older than what is already applied, and nothing would ever take.
+        p->theirGrant           = 0;   // no limit named yet
+        p->theirGrantGeneration = 0;
+        p->ourGrantGeneration   = 0;
+        p->grantSendPending     = false;   // raised when a session commits
+        p->grantSentAtMicros    = 0;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
         p->pathSrttMicros       = 0;
         p->lastLossReactionMicros = 0;

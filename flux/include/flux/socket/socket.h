@@ -219,6 +219,18 @@ namespace bcp::flux
                     the whole pool, so a socket exposed to untrusted remotes
                     wants this low, recvSlotCount high, or both. */
                 uint32_t maxInPerPeer      = 8;
+
+                /** Receive slots one peer may occupy at once, told to that peer
+                    over the secure channel once a session exists. Counts
+                    packets held behind a gap plus packets delivered and not yet
+                    polled, since both pin a slot.
+
+                    A throughput ceiling as much as a memory one: a peer can
+                    never receive more than this many packets per round trip, so
+                    a small value caps every remote permanently. Zero means no
+                    limit, which is the behaviour before grants existed. */
+                uint32_t recvGrant         = 0;
+
                 /** Retained reliable bodies, kept as retransmit sources. Held
                     from send until the receiver reports a delivery cursor past
                     them, which is later than the acknowledgement: a packet can
@@ -465,6 +477,7 @@ namespace bcp::flux
             and every access is relaxed. See peer_recv_state.h for why that is
             sufficient. */
         std::unique_ptr<PeerRecvState[]> peerRecvStates_;
+        uint32_t recvGrant_ = 0;   ///< Config::flows::recvGrant, what every peer is told
         std::unique_ptr<uint64_t[]>    replayState_;   ///< (1 + replayWords_) u64 per peer slot
         uint32_t                       replayWords_ = 0;
         common::collections::SlotPool  pendingPool_;
@@ -628,6 +641,37 @@ namespace bcp::flux
             application data (only the encrypted channel byte differs). Materials
             from the caller's peer-lock scope; the counter must be a sendCounter
             bump so data and control never share a nonce. */
+        /** Tells one peer how much of this socket's receive pool it may hold.
+
+            Sent when a session commits and again whenever the value changes, so
+            session start and every later change are the same path. Carries a
+            generation, because an op that overtakes an older one must not be
+            undone by it.
+
+            Materials and both values are gathered by the caller under the peer
+            lock and passed by value, so nothing is held across the send. */
+        void SendGrant(const Address& to, const PeerSendMaterials& materials,
+                       uint32_t grant, uint32_t generation);
+
+        /** Applies a peer's advertised grant, ignoring one older than the last
+            applied, and acknowledges it either way.
+
+            The acknowledgement is unconditional on purpose. Acking only a value
+            that was new would wedge the sender's retry: its resend carries a
+            generation this side has already applied, so it would be ignored in
+            silence and resent forever. */
+        void Grant_Update(const Address& from, const uint8_t* payload, size_t len);
+
+        /** Clears a peer's pending flag once it names the generation currently
+            outstanding. An ack for anything else is stale and ignored. */
+        void Grant_Acked(const Address& from, const uint8_t* payload, size_t len);
+
+        /** Sends this socket's grant to one peer, if that peer still owes an
+            acknowledgement. Called from the tick, so a lost announcement is
+            retried until it lands. Takes the handle by value: the gather
+            happens under it and the send after it is released. */
+        void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
+
         void SendSecureControl(const Address& to, const PeerSendMaterials& materials,
                                uint8_t channel, const uint8_t* payload, size_t payloadLen);
 

@@ -262,6 +262,7 @@ namespace bcp::flux
         params.bulkInCount         = f.bulkInCount;
         params.maxOutPerPeer       = f.maxOutPerPeer;
         params.maxInPerPeer        = f.maxInPerPeer;
+        recvGrant_                 = f.recvGrant;
         params.maxPeers            = config.maxPeers;
         params.stagingCount        = f.stagingCount;
         params.reliableWait        = f.reliableWaitCount;
@@ -1281,6 +1282,8 @@ namespace bcp::flux
             case internal::SECURE_CHANNEL_PATH_CHLG:      PathChallenge_Respond(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_PATH_RESP:      PathChallenge_Complete(from, buf, plen); break;
             case internal::SECURE_CHANNEL_FLOW_REJECT:    Flow_Reject(from, buf, plen);    break;
+            case internal::SECURE_CHANNEL_GRANT:          Grant_Update(from, buf, plen);   break;
+            case internal::SECURE_CHANNEL_GRANT_ACK:      Grant_Acked(from, buf, plen);    break;
             case internal::SECURE_CHANNEL_FLOW_ACK:       Flow_Ack(from, buf, plen);       break;
             default: break;   // unknown channel: authenticated but unhandled, drop
         }
@@ -1816,6 +1819,7 @@ namespace bcp::flux
                 if (peers_.RegisterPeer(from, &id, slot) != common::Error::Ok)
                     return;   // table full; the initiator's retry will land later
                 peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
+                peerRecvStates_[slot].grant.store(recvGrant_, std::memory_order_relaxed);
             }
             else
             {
@@ -2119,6 +2123,21 @@ namespace bcp::flux
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
+        // A secure channel exists from here, so this is the first moment a
+        // grant can be told to anyone, and the tick does the sending.
+        // Generation advances rather than resetting, because the remote
+        // compares against what it already applied and a restart at zero would
+        // read as stale.
+        //
+        // A socket that grants no limit announces nothing. There is no value to
+        // carry, and staying silent is what keeps an unconfigured socket byte
+        // for byte what it was before grants existed.
+        if (recvGrant_ != 0)
+        {
+            ++peer.ourGrantGeneration;
+            peer.grantSendPending  = true;
+            peer.grantSentAtMicros = 0;   // send at the next tick, not one RTO later
+        }
         peer.myTag        = DerivePeerTag(peer.session, LaneTo(theirPk), 0);
         peer.state        = HandshakeState::ESTABLISHED;
     }
@@ -2283,6 +2302,111 @@ namespace bcp::flux
             return 0;
 
         return flows_.InAssocCountForPeer(peerHandle.GetSlotIndex());
+    }
+
+    void Socket::SendGrant(const Address& to, const PeerSendMaterials& materials,
+                           uint32_t grant, uint32_t generation)
+    {
+        uint8_t payload[internal::WIRE_GRANT_PAYLOAD_SIZE];
+        payload[0] = static_cast<uint8_t>(grant >> 0);
+        payload[1] = static_cast<uint8_t>(grant >> 8);
+        payload[2] = static_cast<uint8_t>(grant >> 16);
+        payload[3] = static_cast<uint8_t>(grant >> 24);
+        payload[4] = static_cast<uint8_t>(generation >> 0);
+        payload[5] = static_cast<uint8_t>(generation >> 8);
+        payload[6] = static_cast<uint8_t>(generation >> 16);
+        payload[7] = static_cast<uint8_t>(generation >> 24);
+
+        SendSecureControl(to, materials, internal::SECURE_CHANNEL_GRANT,
+                          payload, sizeof(payload));
+    }
+
+    void Socket::Grant_Update(const Address& from, const uint8_t* payload, size_t len)
+    {
+        if (len < internal::WIRE_GRANT_PAYLOAD_SIZE) return;
+        const uint32_t grant = static_cast<uint32_t>(payload[0])
+                             | static_cast<uint32_t>(payload[1]) << 8
+                             | static_cast<uint32_t>(payload[2]) << 16
+                             | static_cast<uint32_t>(payload[3]) << 24;
+        const uint32_t generation = static_cast<uint32_t>(payload[4])
+                                  | static_cast<uint32_t>(payload[5]) << 8
+                                  | static_cast<uint32_t>(payload[6]) << 16
+                                  | static_cast<uint32_t>(payload[7]) << 24;
+
+        PeerSendMaterials materials;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(from);
+            if (peerHandle.Failed()) return;
+            Peer* peer = peerHandle.Write();
+            if (!peer || !peer->IsValid()) return;
+
+            // Wrap-safe ordering. A signed difference treats generation 0
+            // arriving after 0xFFFFFFFF as newer, which it is, where a plain
+            // comparison would freeze the value at the wrap.
+            const int32_t age = static_cast<int32_t>(generation - peer->theirGrantGeneration);
+            if (age > 0)
+            {
+                peer->theirGrantGeneration = generation;
+                peer->theirGrant           = grant;
+            }
+            materials = GatherSendMaterials(*peer);
+        }
+
+        uint8_t ack[internal::WIRE_GRANT_ACK_PAYLOAD_SIZE];
+        ack[0] = static_cast<uint8_t>(generation >> 0);
+        ack[1] = static_cast<uint8_t>(generation >> 8);
+        ack[2] = static_cast<uint8_t>(generation >> 16);
+        ack[3] = static_cast<uint8_t>(generation >> 24);
+        SendSecureControl(from, materials, internal::SECURE_CHANNEL_GRANT_ACK,
+                          ack, sizeof(ack));
+        common::crypto::Wipe(materials.key.data(), materials.key.size());
+    }
+
+    void Socket::Grant_Acked(const Address& from, const uint8_t* payload, size_t len)
+    {
+        if (len < internal::WIRE_GRANT_ACK_PAYLOAD_SIZE) return;
+        const uint32_t generation = static_cast<uint32_t>(payload[0])
+                                  | static_cast<uint32_t>(payload[1]) << 8
+                                  | static_cast<uint32_t>(payload[2]) << 16
+                                  | static_cast<uint32_t>(payload[3]) << 24;
+
+        PeerHandle peerHandle = peers_.GetPeer(from);
+        if (peerHandle.Failed()) return;
+        Peer* peer = peerHandle.Write();
+        if (!peer) return;
+
+        // Only the outstanding generation clears the flag. An ack for an older
+        // one is a straggler from a value already superseded.
+        if (peer->grantSendPending && generation == peer->ourGrantGeneration)
+            peer->grantSendPending = false;
+    }
+
+    void Socket::SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now)
+    {
+        PeerSendMaterials materials;
+        uint32_t generation = 0;
+        {
+            // The transferred handle is this function's to release: the gather
+            // happens in this scope and the send after it, so the peer lock is
+            // never held across the syscall.
+            PeerHandle owned = std::move(peerHandle);
+            if (owned.Failed()) return;
+            Peer* peer = owned.Write();
+            if (!peer || !peer->IsValid() || !peer->grantSendPending) return;
+
+            // Paced like a retransmit. Without this the flag would put one op
+            // on the wire every tick until the ack lands.
+            if (peer->grantSentAtMicros != 0
+                && now - peer->grantSentAtMicros < internal::HANDSHAKE_RETRY_DEFAULT)
+                return;
+            peer->grantSentAtMicros = now;
+
+            generation = peer->ourGrantGeneration;
+            materials  = GatherSendMaterials(*peer);
+        }
+
+        SendGrant(to, materials, recvGrant_, generation);
+        common::crypto::Wipe(materials.key.data(), materials.key.size());
     }
 
     void Socket::Flow_Reject(const Address& from, const uint8_t* payload, size_t len)
@@ -2454,6 +2578,7 @@ namespace bcp::flux
         if (registration != common::Error::Ok)
             return registration;
         peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
+        peerRecvStates_[slot].grant.store(recvGrant_, std::memory_order_relaxed);
 
         {
             PeerHandle peerHandle = peers_.GetPeer(addr);
@@ -2639,6 +2764,10 @@ namespace bcp::flux
                 // every owing association in one packet).
                 if (ackDue)
                     FlushPeerAcks(addr, peers_.GetPeer(addr));
+
+                // Retried every tick until the peer acknowledges it, so a lost
+                // announcement is not a peer that never learns its limit.
+                SendPendingGrant(addr, peers_.GetPeer(addr), Now(nowOverride));
 
                 // Out-flows: open/close retries with give-up, and reliable
                 // retransmits / unreliable loss declarations past the RTO. Each

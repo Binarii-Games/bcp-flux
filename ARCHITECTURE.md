@@ -775,6 +775,19 @@ Registration is caps-only: a dry pool or a full per-peer directory yields
 retransmitting into silence. This is the one path where a remote makes
 this socket allocate, and it is reachable only after a completed handshake.
 
+How much a remote may make this socket hold is a separate limit, told to that
+remote over the secure channel as a `GRANT` op carrying a slot count and a
+generation. Each side announces its own receive capacity once its session
+commits, so the exchange is symmetric and neither side ever states the other's
+allowance. The value is local configuration, so the receiver enforces it from
+the peer's first packet rather than from the announcement, and what travels only
+saves the sender from overshooting. A grant may be raised or lowered at any
+time, which is why the announcement is a control op rather than a handshake
+field: the handshake transcript derives the session key, and a limit that
+changes has no business in a key. The generation orders announcements so one
+that overtakes an older one cannot be undone by it, compared as a wrapped
+difference so the counter can run forever.
+
 Closing is local too. `CloseFlow` walks the flow's association list, releases
 what each was holding, and frees the flow, sending nothing. A remote dropping
 its receive state can never end the flow, only lose one association. An

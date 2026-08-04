@@ -141,6 +141,34 @@ namespace bcp::flux
             @pre Read and written under the slot write lock, like sendCounter. */
         uint32_t congestionBudget;        ///< ceiling on in-flight flow bytes
         uint32_t bytesInFlight;           ///< flow bytes sent, not yet resolved
+
+        /** Recv slots this remote said it will hold for us at once. Bounds what
+            we may leave outstanding to it, alongside the congestion window.
+            Zero means it has named no limit. */
+        uint32_t theirGrant;
+
+        /** Generation of the newest grant applied from this remote, so an op
+            that arrives out of order is ignored rather than undoing a newer
+            one. */
+        uint32_t theirGrantGeneration;
+
+        /** Generation of the last grant this side sent, incremented when the
+            value changes so the remote can order them. */
+        uint32_t ourGrantGeneration;
+
+        /** Set while this peer still owes us an acknowledgement for our current
+            grant. Raised when a session commits and again whenever the value
+            changes, cleared by an ack naming ourGrantGeneration. The tick
+            resends while it is set, which is what makes an announcement
+            survive a lost packet. */
+        bool grantSendPending;
+
+        /** When the pending grant last went out. The tick paces the resend
+            against this, because a flag alone would put one op on the wire per
+            tick for as long as the ack takes. Zero sends at the first
+            opportunity. */
+        uint64_t grantSentAtMicros;
+
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
                                           ///< at or above, it grows one packet per round-trip
         uint32_t pathSrttMicros;          ///< smoothed round-trip time; 0 until the first sample

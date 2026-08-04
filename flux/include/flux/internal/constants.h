@@ -57,6 +57,16 @@ namespace bcp::flux::internal
     static constexpr uint8_t  SECURE_CHANNEL_PATH_RESP      = 0x02;
     static constexpr uint8_t  SECURE_CHANNEL_FLOW_REJECT    = 0x03;
     static constexpr uint8_t  SECURE_CHANNEL_FLOW_ACK       = 0x04;
+    static constexpr uint8_t  SECURE_CHANNEL_GRANT           = 0x05;
+    static constexpr uint8_t  SECURE_CHANNEL_GRANT_ACK       = 0x06;
+
+    /** Grant payload: the receive slots the sender of this op will hold for the
+        peer it is addressed to, and a generation so an op that overtakes an
+        older one cannot be undone by it. */
+    static constexpr uint8_t  WIRE_GRANT_PAYLOAD_SIZE        = 8;
+
+    /** Grant ack payload: the generation being acknowledged, nothing else. */
+    static constexpr uint8_t  WIRE_GRANT_ACK_PAYLOAD_SIZE    = 4;
 
     static_assert(WIRE_TAG_SIZE == common::crypto::TAG_SIZE,
                   "The wire tag field carries the AEAD tag verbatim");
