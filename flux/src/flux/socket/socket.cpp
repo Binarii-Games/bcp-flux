@@ -2339,6 +2339,39 @@ namespace bcp::flux
         return flows_.InAssocCountForPeer(peerHandle.GetSlotIndex());
     }
 
+    common::Error Socket::SetRecvGrant(const Address& peer, uint32_t slots)
+    {
+        if (!initialized_.load(std::memory_order_acquire))
+            return common::Error::NotInitialized;
+
+        PeerHandle peerHandle = peers_.GetPeer(peer);
+        if (peerHandle.Failed()) return common::Error::NotFound;
+        Peer* state = peerHandle.Write();
+        if (!state) return common::Error::InvalidState;
+
+        // In force from here. A peer already past the new figure is not made to
+        // give anything back, it simply stops being buffered for until it
+        // drains under it.
+        peerRecvStates_[peerHandle.GetSlotIndex()].grant.store(
+            slots, std::memory_order_relaxed);
+
+        // A new generation, so the peer takes this over whatever it last
+        // applied, and the tick carries it until acknowledged.
+        ++state->ourGrantGeneration;
+        state->grantSendPending  = true;
+        state->grantSentAtMicros = 0;   // go on the next tick, not one interval later
+        return common::Error::Ok;
+    }
+
+    uint32_t Socket::RecvGrantFor(const Address& peer)
+    {
+        if (!initialized_.load(std::memory_order_acquire)) return 0;
+        PeerHandle peerHandle = peers_.GetPeer(peer);
+        if (peerHandle.Failed() || !peerHandle.Read()) return 0;
+        return peerRecvStates_[peerHandle.GetSlotIndex()].grant.load(
+            std::memory_order_relaxed);
+    }
+
     void Socket::SendGrant(const Address& to, const PeerSendMaterials& materials,
                            uint32_t grant, uint32_t generation)
     {
@@ -2420,6 +2453,7 @@ namespace bcp::flux
     {
         PeerSendMaterials materials;
         uint32_t generation = 0;
+        uint32_t grant      = 0;
         {
             // The transferred handle is this function's to release: the gather
             // happens in this scope and the send after it, so the peer lock is
@@ -2437,10 +2471,12 @@ namespace bcp::flux
             peer->grantSentAtMicros = now;
 
             generation = peer->ourGrantGeneration;
+            grant      = peerRecvStates_[owned.GetSlotIndex()].grant.load(
+                             std::memory_order_relaxed);
             materials  = GatherSendMaterials(*peer);
         }
 
-        SendGrant(to, materials, recvGrant_, generation);
+        SendGrant(to, materials, grant, generation);
         common::crypto::Wipe(materials.key.data(), materials.key.size());
     }
 

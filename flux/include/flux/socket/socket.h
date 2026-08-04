@@ -456,6 +456,30 @@ namespace bcp::flux
             reclaimed no longer counts. */
         [[nodiscard]] uint32_t ReceivingFlowCount(const Address& peer);
 
+        /** Changes how much of this socket's receive pool one peer may occupy,
+            and tells that peer.
+
+            Raising it lets the peer keep more in flight, lowering it throttles
+            it. A reduction takes effect here immediately, so a peer already
+            past the new figure simply stops being buffered for until it drains
+            back under it. Nothing already accepted is discarded.
+
+            The peer is told over the secure channel and retold until it
+            acknowledges, so the announcement survives a lost packet. Until it
+            arrives the peer keeps sending to its old figure and is trimmed by
+            this side, which costs it retransmits and nothing else.
+
+            Zero means no limit, which is the same as never having set one.
+
+            @return NotFound if this socket has no such peer. The value is
+                    remembered for a peer that exists but has not finished its
+                    handshake, and goes out when it does. */
+        common::Error SetRecvGrant(const Address& peer, uint32_t slots);
+
+        /** The grant currently in force for one peer, or zero when it has no
+            limit. Zero is also what an unknown peer reports. */
+        [[nodiscard]] uint32_t RecvGrantFor(const Address& peer);
+
         /** Advances this side's migration tag for every established peer, so
             packets after a deliberate local address change wear unlinkable
             tags. All peers rotate together; 3+ rotations unheard outruns a

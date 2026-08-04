@@ -825,7 +825,12 @@ buffers, which costs reordering and not reception.
 The reserve is configured, defaulting to a sixteenth of the receive pool with a
 floor. A fraction rather than a fixed count, because what it has to absorb is
 arrivals per tick, and a socket sized for ten thousand peers needs headroom a
-socket sized for ten does not. A grant may be raised or lowered at any
+socket sized for ten does not. A grant is per peer rather than per socket. Configuration sets what a peer
+starts with and `SetRecvGrant` changes one afterwards, in either direction, so a
+peer that has proved itself can be given more than one that has not. A reduction
+binds immediately on the receiving side, and a peer already past the new figure
+is not made to give anything back, it simply stops being buffered for until it
+drains under it. A grant may be raised or lowered at any
 time, which is why the announcement is a control op rather than a handshake
 field: the handshake transcript derives the session key, and a limit that
 changes has no business in a key. The generation orders announcements so one
