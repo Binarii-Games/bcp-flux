@@ -496,6 +496,15 @@ namespace bcp::flux
         common::collections::SlotPool* recvPool_  = nullptr;   ///< borrowed from the kernel
         common::collections::SlotPool* sendPool_  = nullptr;   ///< borrowed from the kernel
         ReadyLanes* readyLanes_ = nullptr;   ///< borrowed from the socket
+        /** Whether one more recv slot may be pinned for this peer: inside its
+            own grant, and inside the pool-wide floor under all the grants.
+
+            The packet a flow's cursor is waiting for is exempt and never asks,
+            because admitting it releases the run held behind it. Refusing that
+            one would turn a limit into a deadlock. */
+        [[nodiscard]] bool HasRoomFor(uint32_t peerSlot) const noexcept;
+
+
         PeerRecvState* peerRecvStates_ = nullptr;   ///< borrowed, one per peer slot
         std::atomic<uint32_t>* heldTotal_ = nullptr;   ///< borrowed, pool-wide hold-back tally
         uint32_t holdCeiling_ = 0;   ///< hold-back may not take the pool past this

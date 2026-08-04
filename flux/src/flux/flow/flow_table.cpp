@@ -91,6 +91,7 @@ namespace bcp::flux
             assoc->epoch      = assoc->epoch + 1;
 
             assoc->recvNext           = 1;
+            assoc->heldCount          = 0;
             assoc->recvHighest        = 0;
             assoc->newSinceFlush      = 0;
             assoc->ackArmedMicros     = 0;
@@ -287,6 +288,12 @@ namespace bcp::flux
                 return false;
             if (static_cast<uint64_t>(peer.bytesInFlight) + wireSize > peer.congestionBudget)
                 return false;
+            // What the far side said it will hold. A separate question from
+            // what the path will carry, so a separate test: merging them would
+            // let a small grant read as a congested path and shrink a budget
+            // the network never objected to.
+            if (peer.theirGrant != 0 && peer.outstandingToPeer >= peer.theirGrant)
+                return false;
             const InFlightEntry& entry = flow.InFlight()[flow.nextSeq & (flow.inflightCap - 1)];
             return entry.seq == 0;
         }
@@ -313,6 +320,7 @@ namespace bcp::flux
 
             flow.unresolved += 1;
             peer.bytesInFlight += wireSize;      // congestion spend
+            peer.outstandingToPeer += 1;         // grant spend
             flow.nextSeq = seq + 1;
             if (flow.nextSeq == 0) flow.nextSeq = 1;   // 0 is the never-sent sentinel
 
@@ -1335,6 +1343,7 @@ namespace bcp::flux
             recvPool_->Release(ring[i].packetSlot);
             peerRecvStates_[flow->peerSlot].ReleaseOne();
             heldTotal_->fetch_sub(1, std::memory_order_relaxed);
+            if (flow->heldCount > 0) --flow->heldCount;
             // The bit has to go with the bytes. A sequence left marked seen is
             // a sequence the resend is discarded as a duplicate, and the sender
             // has no other way to learn this side no longer holds it.
@@ -1370,6 +1379,7 @@ namespace bcp::flux
         if (entry.seq == 0 || entry.acked) return;
 
         delta.resolvedBytes += entry.wireSize;
+        delta.resolvedPackets += 1;
         if (acked)
         {
             delta.ackedBytes += entry.wireSize;
@@ -1678,6 +1688,7 @@ namespace bcp::flux
             return false;   // full: backpressure, caller drops
         (void)handle.Detach();                       // queued; must not release the slot
         peerRecvStates_[peerSlot].PinOne();
+        heldTotal_->fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -1707,6 +1718,16 @@ namespace bcp::flux
         return produced;
     }
 
+    bool FlowTable::HasRoomFor(uint32_t peerSlot) const noexcept
+    {
+        const uint32_t grant = peerRecvStates_[peerSlot].grant.load(
+            std::memory_order_relaxed);
+        if (grant != 0
+            && peerRecvStates_[peerSlot].occupancy.load(std::memory_order_relaxed) >= grant)
+            return false;
+        return heldTotal_->load(std::memory_order_relaxed) < holdCeiling_;
+    }
+
     uint32_t FlowTable::DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept
     {
         // Both unordered modes: no hold-back, so no recv slot is ever pinned
@@ -1729,6 +1750,24 @@ namespace bcp::flux
             ArmAck(&flow);
             return 0;
         }
+        // An unordered flow has no cursor to strand, so a peer at its limit is
+        // simply refused here. This is the path that would otherwise let one
+        // remote fill the pool with packets nobody is waiting behind.
+        if (!HasRoomFor(flow.peerSlot))
+        {
+            ArmAck(&flow);
+            return 0;   // uncommitted and unacked, so the sender resends
+        }
+
+        // No cursor here, so nothing waits behind this packet and refusing it
+        // strands nothing. This is the entry that would otherwise let one peer
+        // fill the pool with traffic nobody is blocked on.
+        if (!HasRoomFor(flow.peerSlot))
+        {
+            ArmAck(&flow);
+            return 0;   // uncommitted and unacked, so the sender resends
+        }
+
         // Commit only if it actually queues (two-step: queued == acked).
         if (!QueueReady(incoming, flow.peerSlot))
             return 0;   // ready queue full: uncommitted, unacked -> dropped/resent
@@ -1750,6 +1789,15 @@ namespace bcp::flux
 
         if (seq == flow.recvNext)
         {
+            // A cursor packet with a run behind it always enters, because
+            // admitting it frees more than it takes and refusing it would wedge
+            // the flow for good. With nothing held it frees nothing, so it is
+            // an ordinary entry and asks like any other.
+            if (flow.heldCount == 0 && !HasRoomFor(flow.peerSlot))
+            {
+                ArmAck(&flow);
+                return 0;
+            }
             // Queue the cursor packet first; only advance and commit if it took
             // (full queue -> leave everything untouched, unacked).
             if (!QueueReady(incoming, flow.peerSlot))
@@ -1768,22 +1816,8 @@ namespace bcp::flux
         // and it can never stall the flow: the packet at the cursor is
         // delivered rather than held, so the one packet that would drain this
         // buffer is never the one refused. Zero grants no limit.
-        const uint32_t grant = peerRecvStates_[flow.peerSlot].grant.load(
-            std::memory_order_relaxed);
-        const bool withinGrant =
-            grant == 0
-            || peerRecvStates_[flow.peerSlot].occupancy.load(
-                   std::memory_order_relaxed) < grant;
-
-        // The reserve is what the grants cannot collectively spend. Grants may
-        // overcommit the pool, since most peers are idle most of the time, so
-        // this is the floor that keeps reception possible when they do not.
-        const bool poolHasRoom =
-            heldTotal_->load(std::memory_order_relaxed) < holdCeiling_;
-
         const bool holdable = flow.reorderCap > 0
-                           && withinGrant
-                           && poolHasRoom
+                           && HasRoomFor(flow.peerSlot)
                            && seq < flow.recvNext + flow.reorderCap;
         if (holdable)
         {
@@ -1792,6 +1826,7 @@ namespace bcp::flux
             {
                 slot.seq = seq;
                 slot.packetSlot = incoming.Detach();   // stays in recv pool, leased
+                ++flow.heldCount;
                 peerRecvStates_[flow.peerSlot].PinOne();
                 heldTotal_->fetch_add(1, std::memory_order_relaxed);
                 CommitSeen(&flow, seq);                 // held -> ackable (SACK)
@@ -1828,9 +1863,9 @@ namespace bcp::flux
                                    held.packetSlot, flow.peerSlot))
                 break;   // queue full: leave the tail held
 
-            heldTotal_->fetch_sub(1, std::memory_order_relaxed);
             held.packetSlot = common::collections::SlotPool::INVALID;
             held.seq = 0;
+            if (flow.heldCount > 0) --flow.heldCount;
             ++produced;
             flow.recvNext += 1;
             if (flow.recvNext == 0) flow.recvNext = 1;

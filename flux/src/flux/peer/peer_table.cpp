@@ -454,6 +454,7 @@ namespace bcp::flux
         // previous occupant would make every grant the new peer sends look
         // older than what is already applied, and nothing would ever take.
         p->theirGrant           = 0;   // no limit named yet
+        p->outstandingToPeer    = 0;
         p->theirGrantGeneration = 0;
         p->ourGrantGeneration   = 0;
         p->grantSendPending     = false;   // raised when a session commits

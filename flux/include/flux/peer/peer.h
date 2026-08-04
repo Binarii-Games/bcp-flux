@@ -147,6 +147,16 @@ namespace bcp::flux
             Zero means it has named no limit. */
         uint32_t theirGrant;
 
+        /** Packets sent to this remote that it has not yet resolved. Compared
+            against theirGrant, so this side stops sending what the far side
+            would only throw away.
+
+            An estimate rather than the truth. It cannot see what the remote has
+            delivered but its application has not polled, so it reads low. The
+            remote's own enforcement is authoritative and this only spares the
+            bandwidth of sending into a refusal. */
+        uint32_t outstandingToPeer;
+
         /** Generation of the newest grant applied from this remote, so an op
             that arrives out of order is ignored rather than undoing a newer
             one. */

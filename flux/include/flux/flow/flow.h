@@ -258,6 +258,7 @@ namespace bcp::flux
     struct CongestionDelta
     {
         uint32_t resolvedBytes   = 0;   ///< in-flight bytes freed (acked or lost)
+        uint32_t resolvedPackets = 0;   ///< of those, the count, against the peer's grant
         uint32_t ackedBytes      = 0;   ///< of those, the acked ones; grow the budget
         uint32_t rttSampleMicros = 0;   ///< newest acked round-trip, 0 if none
         bool     sawLoss         = false;
@@ -561,6 +562,11 @@ namespace bcp::flux
                 reinterpret_cast<const uint8_t*>(this) + sizeof(InAssociation)
                 + (windowBits / 8));
         }
+
+        /** How many hold-back entries are occupied. Tells a cursor packet
+            whether anything is waiting behind it, which is what decides if it
+            may enter past this peer's budget. */
+        uint16_t heldCount;
 
         static constexpr size_t StrideFor(uint16_t windowBits, uint16_t reorderCap)
         {

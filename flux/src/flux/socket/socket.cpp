@@ -1135,7 +1135,10 @@ namespace bcp::flux
             // against the peer that sent it. Non-flow packets are unattributed
             // and never counted, so there is nothing to give back for them.
             if (ready.peerSlot != common::collections::SlotPool::INVALID)
+            {
                 peerRecvStates_[ready.peerSlot].ReleaseOne();
+                heldTotal_.fetch_sub(1, std::memory_order_relaxed);
+            }
             outPackets[delivered] = PacketSlotHandle{ ready.slotIndex, recvPool_ };
             outPackets[delivered].BindSocket(this);
             ++delivered;

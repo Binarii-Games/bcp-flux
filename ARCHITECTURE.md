@@ -783,6 +783,16 @@ allowance. The value is local configuration, so the receiver enforces it from
 the peer's first packet rather than from the announcement, and what travels only
 saves the sender from overshooting.
 
+Both ends act on it, and the send gate treats it as its own question. What the
+path will carry and what the peer will hold are separate limits, tested
+separately, and the smaller one decides. Folding a grant into the congestion
+budget would let a small grant read as a congested path and shrink a budget the
+network never objected to, and would lose the distinction between being
+network-limited and being receiver-limited. The sender's count of what a peer is
+holding is an estimate, since it cannot see what has been delivered and not yet
+polled, so it reads low. The receiver's enforcement is the authoritative one and
+the sender's restraint only spares the bandwidth of sending into a refusal.
+
 Enforcement is a refusal to buffer. A peer already holding its grant has further
 out-of-order packets ejected rather than held, which is the same path an
 out-of-window packet takes: no copy, no pinned slot, and the sequence is left

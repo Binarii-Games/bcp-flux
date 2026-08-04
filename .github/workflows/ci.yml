@@ -77,4 +77,4 @@ jobs:
 
       - name: test
         if: ${{ !matrix.buildonly }}
-        run: ctest --test-dir build -C Debug -LE bench --output-on-failure
+        run: ctest --test-dir build -C Debug -LE "bench|acceptance" --output-on-failure

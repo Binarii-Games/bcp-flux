@@ -24,6 +24,8 @@ namespace bcp::flux
         // counter past zero into a huge value.
         peer.bytesInFlight -= delta.resolvedBytes <= peer.bytesInFlight
             ? delta.resolvedBytes : peer.bytesInFlight;
+        peer.outstandingToPeer -= delta.resolvedPackets <= peer.outstandingToPeer
+            ? delta.resolvedPackets : peer.outstandingToPeer;
 
         // Smooth the per-peer round-trip from the newest acked sample.
         if (delta.rttSampleMicros != 0)
