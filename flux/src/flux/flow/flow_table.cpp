@@ -346,7 +346,9 @@ namespace bcp::flux
                                   common::collections::SlotPool* recvPool,
                                   common::collections::SlotPool* sendPool,
                                   ReadyLanes* readyLanes,
-                                  PeerRecvState* peerRecvStates) noexcept
+                                  PeerRecvState* peerRecvStates,
+                                  std::atomic<uint32_t>* heldTotal,
+                                  uint32_t holdCeiling) noexcept
     {
         if (params.outCount == 0 && params.inCount == 0)
             return common::Error::Ok;   // flows disabled entirely
@@ -355,6 +357,8 @@ namespace bcp::flux
         sendPool_   = sendPool;
         readyLanes_ = readyLanes;
         peerRecvStates_ = peerRecvStates;
+        heldTotal_      = heldTotal;
+        holdCeiling_    = holdCeiling;
 
         // Fixed, not configured: nothing carries the window on the wire, so two
         // sockets that disagreed could never find out. See internal::FLOW_WINDOW.
@@ -1330,6 +1334,7 @@ namespace bcp::flux
 
             recvPool_->Release(ring[i].packetSlot);
             peerRecvStates_[flow->peerSlot].ReleaseOne();
+            heldTotal_->fetch_sub(1, std::memory_order_relaxed);
             // The bit has to go with the bytes. A sequence left marked seen is
             // a sequence the resend is discarded as a duplicate, and the sender
             // has no other way to learn this side no longer holds it.
@@ -1770,8 +1775,15 @@ namespace bcp::flux
             || peerRecvStates_[flow.peerSlot].occupancy.load(
                    std::memory_order_relaxed) < grant;
 
+        // The reserve is what the grants cannot collectively spend. Grants may
+        // overcommit the pool, since most peers are idle most of the time, so
+        // this is the floor that keeps reception possible when they do not.
+        const bool poolHasRoom =
+            heldTotal_->load(std::memory_order_relaxed) < holdCeiling_;
+
         const bool holdable = flow.reorderCap > 0
                            && withinGrant
+                           && poolHasRoom
                            && seq < flow.recvNext + flow.reorderCap;
         if (holdable)
         {
@@ -1781,6 +1793,7 @@ namespace bcp::flux
                 slot.seq = seq;
                 slot.packetSlot = incoming.Detach();   // stays in recv pool, leased
                 peerRecvStates_[flow.peerSlot].PinOne();
+                heldTotal_->fetch_add(1, std::memory_order_relaxed);
                 CommitSeen(&flow, seq);                 // held -> ackable (SACK)
                 ArmAck(&flow);
             }
@@ -1815,6 +1828,7 @@ namespace bcp::flux
                                    held.packetSlot, flow.peerSlot))
                 break;   // queue full: leave the tail held
 
+            heldTotal_->fetch_sub(1, std::memory_order_relaxed);
             held.packetSlot = common::collections::SlotPool::INVALID;
             held.seq = 0;
             ++produced;

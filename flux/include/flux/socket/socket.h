@@ -149,6 +149,20 @@ namespace bcp::flux
             uint32_t    recvSlotCount      = internal::SOCK_KERNEL_ZLOCKPCKT_COUNT;
             uint32_t    sendSlotCount      = internal::SOCK_KERNEL_SENDSLOT_COUNT;
 
+            /** Receive slots that buffering may never take, so an arriving
+                packet always has somewhere to land. Without it a pool filled
+                with packets waiting behind a gap leaves nothing to receive
+                into, and the socket goes deaf to every peer rather than
+                throttling one.
+
+                Zero derives it from recvSlotCount, a sixteenth with a floor of
+                64. Set it directly when the default does not suit: a socket
+                fielding thousands of peers wants far more headroom per tick
+                than one fielding ten, and only the embedder knows which it is.
+                A reserve at or above recvSlotCount simply never buffers, which
+                costs reordering and never reception. */
+            uint32_t    recvReserveSlots   = 0;
+
             /** How many threads will drain delivered packets. One means Poll
                 behaves exactly as it always has and the identity argument can be
                 left off.
@@ -478,6 +492,12 @@ namespace bcp::flux
             sufficient. */
         std::unique_ptr<PeerRecvState[]> peerRecvStates_;
         uint32_t recvGrant_ = 0;   ///< Config::flows::recvGrant, what every peer is told
+
+        /** Recv slots pinned by hold-back across every peer. Read to keep the
+            reserve free, moved at the same four points as the per-peer count,
+            and relaxed for the same reason: nothing is published through it. */
+        std::atomic<uint32_t> heldTotal_{0};
+        uint32_t recvHoldCeiling_ = 0;   ///< recvSlotCount less the reserve
         std::unique_ptr<uint64_t[]>    replayState_;   ///< (1 + replayWords_) u64 per peer slot
         uint32_t                       replayWords_ = 0;
         common::collections::SlotPool  pendingPool_;

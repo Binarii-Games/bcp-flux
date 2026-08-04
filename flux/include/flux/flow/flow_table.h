@@ -14,6 +14,8 @@
 #include <flux/flow/flow_handle.h>
 #include <flux/peer/peer_id.h>
 #include <flux/socket/packet_slot.h>
+#include <atomic>
+
 #include <flux/peer/peer_recv_state.h>
 #include <flux/socket/ready_lanes.h>
 
@@ -190,7 +192,9 @@ namespace bcp::flux
                                          common::collections::SlotPool* recvPool,
                                          common::collections::SlotPool* sendPool,
                                          ReadyLanes* readyLanes,
-                                         PeerRecvState* peerRecvStates) noexcept;
+                                         PeerRecvState* peerRecvStates,
+                                         std::atomic<uint32_t>* heldTotal,
+                                         uint32_t holdCeiling) noexcept;
 
         /** Frees every pool and directory this table owns and forgets the pools
             it borrows, so a later Init starts clean. Idempotent. The caller must
@@ -493,6 +497,8 @@ namespace bcp::flux
         common::collections::SlotPool* sendPool_  = nullptr;   ///< borrowed from the kernel
         ReadyLanes* readyLanes_ = nullptr;   ///< borrowed from the socket
         PeerRecvState* peerRecvStates_ = nullptr;   ///< borrowed, one per peer slot
+        std::atomic<uint32_t>* heldTotal_ = nullptr;   ///< borrowed, pool-wide hold-back tally
+        uint32_t holdCeiling_ = 0;   ///< hold-back may not take the pool past this
 
         uint32_t maxOutAssocPerPeer_ = 0;
         uint32_t maxInAssocPerPeer_  = 0;

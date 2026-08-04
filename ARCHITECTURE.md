@@ -790,7 +790,22 @@ unseen so the sender resends it. That is what bounds one remote's share of a
 pool every remote draws from. It cannot stall a flow, because the packet at the
 cursor is delivered rather than buffered, so the one packet that would drain the
 buffer is never the one refused. A grant of zero bounds nothing, which is how a
-socket that configures none behaves exactly as it did before grants existed. A grant may be raised or lowered at any
+socket that configures none behaves exactly as it did before grants existed.
+
+Under all of the grants sits one floor they cannot collectively spend. Hold-back
+across every peer may fill the receive pool only down to a reserve, and no
+further. Grants are allowed to overcommit the pool, because most peers are idle
+most of the time and sizing for the worst case would mean granting almost
+nothing to anyone, so the reserve is what keeps reception possible when they are
+not idle. It is the difference between throttling one peer and going deaf to all
+of them: a pool consumed entirely by buffered packets leaves the kernel nowhere
+to read into. A socket whose pool is smaller than the reserve simply never
+buffers, which costs reordering and not reception.
+
+The reserve is configured, defaulting to a sixteenth of the receive pool with a
+floor. A fraction rather than a fixed count, because what it has to absorb is
+arrivals per tick, and a socket sized for ten thousand peers needs headroom a
+socket sized for ten does not. A grant may be raised or lowered at any
 time, which is why the announcement is a control op rather than a handshake
 field: the handshake transcript derives the session key, and a limit that
 changes has no business in a key. The generation orders announcements so one

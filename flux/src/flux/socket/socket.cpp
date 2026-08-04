@@ -235,6 +235,22 @@ namespace bcp::flux
                              PeerRecvState[common::NextPowerOfTwo(config.maxPeers)]);
         if (!peerRecvStates_) return common::Error::NotInitialized;
 
+        // Hold-back may fill the receive pool down to the reserve and no
+        // further. A pool at or under the reserve leaves nothing to buffer
+        // with, which is correct rather than a misconfiguration: reception
+        // keeps working and only reordering stops. The derived default is a
+        // fraction, because a socket with a large pool is one expecting many
+        // peers, and headroom has to track arrivals per tick.
+        uint32_t reserve = config.recvReserveSlots;
+        if (reserve == 0)
+        {
+            reserve = config.recvSlotCount / internal::RECV_RESERVE_DIVISOR;
+            if (reserve < internal::RECV_RESERVE_FLOOR)
+                reserve = internal::RECV_RESERVE_FLOOR;
+        }
+        recvHoldCeiling_ = config.recvSlotCount > reserve
+            ? config.recvSlotCount - reserve : 0;
+
         replayWords_ = (config.replayWindowBits + 63) / 64;
         if (replayWords_ == 0)
             replayWords_ = 1;
@@ -273,7 +289,8 @@ namespace bcp::flux
         params.flowStallTimeoutMicros = config.liveness.flowStallTimeoutMicros;
 
         if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyLanes_,
-                                             peerRecvStates_.get());
+                                             peerRecvStates_.get(),
+                                             &heldTotal_, recvHoldCeiling_);
             error != common::Error::Ok)
             return error;
 
