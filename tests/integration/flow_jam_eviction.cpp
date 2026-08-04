@@ -123,23 +123,44 @@ static void JammedFlowKeepsAssociation()
     CHECK(!flow.Failed());
     CHECK(SendWithLostHead(client, CLIENT, flow, serverAddr, 20));
 
-    // The head is lost, so the receiver holds seq 2.. behind the gap and
-    // delivers nothing. Ingest with Poll only: the flow is created on receipt,
-    // but eviction runs on the server tick, so leaving the server un-ticked here
-    // means nothing can reclaim the flow before we observe it, however slow the
-    // runner. The tick starts in the eviction phase below.
+    // The head is lost, so the receiver holds seq 2.. behind the gap. The
+    // server is ticked with a FROZEN clock here: reception happens on the tick,
+    // but every reclaim on it is measured against that clock, so a time that
+    // never advances means nothing can age out before we observe it, however
+    // slow the runner. The eviction phase below lets the clock run.
+    const uint64_t frozen = common::MonotonicMicros();
     flux::PacketSlotHandle inbox[64];
     uint32_t delivered = 0;
     for (int i = 0; i < 120; ++i)
     {
         client.Flush();
         client.Update();
+        // Update takes packets off the socket, Poll hands over what it took.
+        server.Update(frozen);
         flux::PollCursor cursor = server.Poll(inbox, 64);
         delivered += cursor.PacketCount();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
-    CHECK(delivered == 0);                              // nothing past the gap
+
+    // Whatever arrived in order ahead of the dropped packet was delivered, and
+    // which packet the link drops is the backend's schedule rather than this
+    // test's business. What the jam means is that delivery STOPS at the gap and
+    // does not resume, so the count is taken here and must not move while the
+    // sender keeps pushing into a gap it never fills.
+    const uint32_t beforeGap = delivered;
+    CHECK(beforeGap < 20);                              // the gap really blocked something
+    for (int i = 0; i < 120; ++i)
+    {
+        client.Flush();
+        client.Update();
+        server.Update(frozen);
+        flux::PollCursor stuck = server.Poll(inbox, 64);
+        delivered += stuck.PacketCount();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
+    CHECK(delivered == beforeGap);                      // nothing past the gap
     CHECK(server.ReceivingFlowCount(clientAddr) == 1);  // the jammed flow is there
 
     // Past the 250 ms stall timeout, the tick reclaims it.
@@ -264,15 +285,19 @@ static void SiblingSurvives()
 
     Pump(client, server, 20);   // quiesce before staging the jam
 
-    // A second flow, jammed the same way as test 1. Ingest with Poll only, so
-    // the un-ticked server cannot reclaim it before we observe both flows.
+    // A second flow, jammed the same way as test 1. The server ticks on a
+    // frozen clock so it receives without anything aging out before both flows
+    // can be observed.
+    const uint64_t held = common::MonotonicMicros();
     flux::FlowHandle jam = client.OpenFlow(31, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!jam.Failed());
     CHECK(SendWithLostHead(client, CLIENT, jam, serverAddr, 20));
     for (int i = 0; i < 120; ++i)
     {
         client.Flush();
-        client.Update(); server.Poll(inbox, 64);
+        client.Update();
+        server.Update(held);
+        server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();

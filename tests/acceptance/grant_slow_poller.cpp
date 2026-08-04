@@ -140,8 +140,8 @@ namespace
             }
             quiet.Flush();
 
-            receiver.Update();
-            if (++round % POLL_EVERY == 0)
+            receiver.Update();   // takes packets off the socket every round
+            if (++round % POLL_EVERY == 0)   // but the application collects rarely
             {
                 flux::PacketSlotHandle inbox[64];
                 flux::PollCursor cursor = receiver.Poll(inbox, 64);

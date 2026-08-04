@@ -793,6 +793,16 @@ holding is an estimate, since it cannot see what has been delivered and not yet
 polled, so it reads low. The receiver's enforcement is the authoritative one and
 the sender's restraint only spares the bandwidth of sending into a refusal.
 
+Reception happens on the tick, not on the poll. `Update` empties the OS receive
+buffer into the pool, consuming handshake and control traffic and queueing
+application packets, and `Poll` hands over what it brought. That is what puts
+the receive rules, the grant among them, at the moment this socket takes
+responsibility for a packet, and it keeps the kernel from becoming the queue for
+an application that collects at its own pace. How much one tick takes is
+configured, defaulting to the pool's own capacity, since nothing more can be
+taken while every slot is occupied. Everything on the tick reads its clock from
+one place, so passing a fixed time receives without anything aging out.
+
 Enforcement is a refusal to buffer. A peer already holding its grant has further
 out-of-order packets ejected rather than held, which is the same path an
 out-of-window packet takes: no copy, no pinned slot, and the sequence is left

@@ -251,6 +251,8 @@ namespace bcp::flux
         recvHoldCeiling_ = config.recvSlotCount > reserve
             ? config.recvSlotCount - reserve : 0;
 
+        recvBatch_ = config.recvBatch != 0 ? config.recvBatch : config.recvSlotCount;
+
         replayWords_ = (config.replayWindowBits + 63) / 64;
         if (replayWords_ == 0)
             replayWords_ = 1;
@@ -1059,27 +1061,31 @@ namespace bcp::flux
 
 // --- Receive path ---
 
-    PollCursor Socket::Poll(PacketSlotHandle* outPackets, size_t max,
-                            ThreadIdentity identity)
+    void Socket::ReceiveIntoPool()
     {
-        // Per-Poll-pass migration budget on this thread's stack. Under the
-        // fully-concurrent contract several threads may Poll at once, so the
-        // budget must not be a shared member; the immutable per-socket ceiling
-        // seeds a fresh local each pass.
-        if (!initialized_.load(std::memory_order_relaxed))
-            return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
-
+        // Per-pass migration budget on this thread's stack. Several threads may
+        // drive the socket at once, so the budget must not be a shared member.
+        // The immutable per-socket ceiling seeds a fresh local each pass.
         uint32_t migrateBudget = migrateBudgetPerPoll_;
 
-        // Pass 1: pull from the kernel and decrypt in place, consume handshake
-        // and secure-control traffic, and push every committed app packet onto
-        // the ready queue. Nothing is written to the caller's array here; each
-        // input slot is consumed (queued, held, or dropped), so pass 2 can reuse
-        // the whole array with no aliasing.
-        uint32_t count = listener_.Poll(outPackets, max);
+        // Pull from the kernel and decrypt in place, consume handshake and
+        // secure-control traffic, and push every committed app packet onto the
+        // ready queue for Poll to hand over. Every slot taken here is consumed:
+        // queued, held, or dropped.
+        //
+        // Bounded by the batch rather than by anything a caller asked for,
+        // because emptying the OS buffer is the point. What can actually be
+        // taken is bounded by the free recv slots regardless, and a peer's share
+        // of those is bounded by its grant.
+        PacketSlotHandle inbox[internal::RECV_CHUNK];
+        for (uint32_t taken = 0; taken < recvBatch_; )
+        {
+        const uint32_t count = listener_.Poll(inbox, internal::RECV_CHUNK);
+        if (count == 0) break;   // socket empty, nothing left to take this tick
+        taken += count;
         for (size_t scan = 0; scan < count; ++scan)
         {
-            const PacketSlot* packet = outPackets[scan].Read();
+            const PacketSlot* packet = inbox[scan].Read();
             if (!packet) continue;   // failed handle, drop
 
             if (packet->IsInternal())
@@ -1088,19 +1094,19 @@ namespace bcp::flux
                 // claiming to be secure is forged or corrupt. Secure control
                 // hides in the encrypted channel byte, not this bit.
                 if (packet->IsSecure()) continue;
-                ProcessInternal(std::move(outPackets[scan]));
+                ProcessInternal(std::move(inbox[scan]));
                 continue;
             }
 
             // Authenticate and decrypt in place; drop on any failure.
-            if (!PreProcessIn(outPackets[scan], migrateBudget))
+            if (!PreProcessIn(inbox[scan], migrateBudget))
                 continue;
 
             // The plaintext now reveals data vs. control; control is consumed
             // here, never delivered.
             if (packet->SecureChannel() != internal::SECURE_CHANNEL_APP)
             {
-                ProcessSecureControl(std::move(outPackets[scan]));
+                ProcessSecureControl(std::move(inbox[scan]));
                 continue;
             }
 
@@ -1108,14 +1114,23 @@ namespace bcp::flux
             // packets are the unreliable baseline: queue on arrival. A full
             // queue leaves the packet uncommitted (unacked) and it drops.
             if (packet->HasFlow())
-                (void)ProcessFlowIn(std::move(outPackets[scan]));
+                (void)ProcessFlowIn(std::move(inbox[scan]));
             else
-                (void)QueueReady(outPackets[scan]);
+                (void)QueueReady(inbox[scan]);
         }
+        }
+    }
 
-        // Pass 2: drain the ready queue into the caller's array, up to max. A
-        // packet's slot stayed leased in the recv pool while queued; rebuild a
-        // handle over it. Leftovers stay queued for the next Poll. Delivered
+    PollCursor Socket::Poll(PacketSlotHandle* outPackets, size_t max,
+                            ThreadIdentity identity)
+    {
+        if (!initialized_.load(std::memory_order_relaxed))
+            return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
+
+        // Delivery only. Reception happens in Update, which is what empties the
+        // OS buffer into the recv pool and applies the receive rules there. A
+        // packet's slot stayed leased in the recv pool while queued, so rebuild
+        // a handle over it. Leftovers stay queued for the next Poll. Delivered
         // handles are stamped with this socket, which is what lets
         // PrepareResponse build a reply from the packet alone.
         // Claim before draining, and the cursor holds it until the caller is
@@ -2721,6 +2736,10 @@ namespace bcp::flux
         // parked behind it, and the packet carrying it is the one thing here
         // that no retransmit covers, because a peer with no session has no
         // flow state to scan. Paced and bounded internally.
+        // Before anything else on the tick: take what has arrived. Everything
+        // below reasons about peer and flow state that this updates.
+        ReceiveIntoPool();
+
         (void)RetryHandshakes();
 
         // No flow gate on the sweep: idle eviction is mandatory, so the per-peer

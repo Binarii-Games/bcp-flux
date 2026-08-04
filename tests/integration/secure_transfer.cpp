@@ -42,6 +42,10 @@ struct Message
 // into a Message, and appends them to `out`.
 static void Collect(flux::Socket& socket, std::vector<Message>& out)
 {
+    // Update is what takes packets off the socket. Poll hands over what it
+    // brought, so collecting means doing both.
+    socket.Update();
+
     flux::PacketSlotHandle handles[64];
     flux::PollCursor cursor = socket.Poll(handles, 64);
     while (cursor.Next())
@@ -87,12 +91,14 @@ static void secure_messages_cross_intact()
 
     for (int i = 0; i < 200; ++i)
     {
+        // Update first: it is what takes packets off the socket, and Poll
+        // hands over what it brought.
+        client.Update();
+        server.Update();
         Collect(client, gotByClient);
         Collect(server, gotByServer);
         client.Flush();
-        client.Update();
         server.Flush();
-        server.Update();
         if (flux_net::Established(client, serverAddr) && Received(gotByServer, parked)) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

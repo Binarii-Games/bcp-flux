@@ -164,6 +164,10 @@ namespace bcp::flux::internal
         one. A fraction rather than a count, because what the reserve has to
         absorb is arrivals per tick, which tracks pool size and peer count
         rather than any fixed number. */
+    /** Handles one drain chunk holds on the stack. The batch a tick takes is
+        configured and may be far larger, so it is drained in chunks of this. */
+    static constexpr uint32_t RECV_CHUNK                    = 64;
+
     static constexpr uint32_t RECV_RESERVE_DIVISOR          = 16;
     static constexpr uint32_t RECV_RESERVE_FLOOR            = 64;
     static constexpr uint32_t SOCK_KERNEL_SENDSLOT_COUNT    = 2048;

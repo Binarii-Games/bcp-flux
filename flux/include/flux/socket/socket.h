@@ -163,6 +163,18 @@ namespace bcp::flux
                 costs reordering and never reception. */
             uint32_t    recvReserveSlots   = 0;
 
+            /** Packets one Update takes off the socket before returning.
+                Emptying the OS buffer is the point of receiving on the tick, so
+                this is a budget rather than anything a caller asks for, and a
+                socket under load wants it high enough that the kernel never
+                becomes the queue.
+
+                Zero drains as much as the receive pool could hold, which is the
+                natural ceiling: nothing more can be taken while every slot is
+                occupied. Set it lower to bound the work one tick does, higher
+                to keep draining as slots free during the same pass. */
+            uint32_t    recvBatch          = 0;
+
             /** How many threads will drain delivered packets. One means Poll
                 behaves exactly as it always has and the identity argument can be
                 left off.
@@ -498,6 +510,7 @@ namespace bcp::flux
             and relaxed for the same reason: nothing is published through it. */
         std::atomic<uint32_t> heldTotal_{0};
         uint32_t recvHoldCeiling_ = 0;   ///< recvSlotCount less the reserve
+        uint32_t recvBatch_ = 0;         ///< packets one tick takes off the socket
         std::unique_ptr<uint64_t[]>    replayState_;   ///< (1 + replayWords_) u64 per peer slot
         uint32_t                       replayWords_ = 0;
         common::collections::SlotPool  pendingPool_;
@@ -691,6 +704,15 @@ namespace bcp::flux
             retried until it lands. Takes the handle by value: the gather
             happens under it and the send after it is released. */
         void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
+
+        /** Empties the OS receive buffer into the recv pool, consuming handshake
+            and control traffic and queueing application packets for Poll.
+
+            Driven by Update rather than by Poll, so the socket is drained on the
+            tick and the receive rules, the per-peer grant among them, are
+            applied where this socket takes responsibility for a packet. Nothing
+            waits in the kernel for a caller that may be slow to ask. */
+        void ReceiveIntoPool();
 
         void SendSecureControl(const Address& to, const PeerSendMaterials& materials,
                                uint8_t channel, const uint8_t* payload, size_t payloadLen);
