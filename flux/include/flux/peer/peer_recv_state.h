@@ -40,6 +40,13 @@ namespace bcp::flux
             grant is negotiated, and nothing reads it yet. */
         std::atomic<uint32_t> grant{0};
 
+        /** Times this peer has had buffered packets thrown away for making no
+            progress. A gap a sender fills costs nothing here. A gap it never
+            fills, repeatedly, is a peer holding buffer it is not using, which
+            is the one abuse a well-behaved remote never commits. Counted here
+            because the reclaim runs without the peer lock. */
+        std::atomic<uint32_t> stallReclaims{0};
+
         void PinOne() noexcept { occupancy.fetch_add(1, std::memory_order_relaxed); }
 
         /** Saturates at zero instead of wrapping.
@@ -66,6 +73,7 @@ namespace bcp::flux
         {
             occupancy.store(0, std::memory_order_relaxed);
             grant.store(0, std::memory_order_relaxed);
+            stallReclaims.store(0, std::memory_order_relaxed);
         }
     };
 }

@@ -168,6 +168,18 @@ namespace bcp::flux::internal
         configured and may be far larger, so it is drained in chunks of this. */
     static constexpr uint32_t RECV_CHUNK                    = 64;
 
+    /** Buffer reclaims a peer is allowed before its grant is cut. A lossy path
+        costs a peer the occasional one, so this is high enough that ordinary
+        loss never reaches it and low enough that a peer holding buffer it never
+        uses is answered quickly. */
+    static constexpr uint32_t GRANT_STRIKES_BEFORE_CUT      = 4;
+
+    /** What a cut leaves, as a divisor. Halving rather than closing, because a
+        peer that recovers should still be able to work, and repeated cuts reach
+        the floor soon enough. */
+    static constexpr uint32_t GRANT_CUT_DIVISOR             = 2;
+    static constexpr uint32_t GRANT_CUT_FLOOR               = 2;
+
     static constexpr uint32_t RECV_RESERVE_DIVISOR          = 16;
     static constexpr uint32_t RECV_RESERVE_FLOOR            = 64;
     static constexpr uint32_t SOCK_KERNEL_SENDSLOT_COUNT    = 2048;

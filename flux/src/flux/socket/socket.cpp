@@ -2339,6 +2339,38 @@ namespace bcp::flux
         return flows_.InAssocCountForPeer(peerHandle.GetSlotIndex());
     }
 
+    void Socket::CutGrantIfAbusive(PeerHandle peerHandle)
+    {
+        if (peerHandle.Failed()) return;
+        const uint32_t slot = peerHandle.GetSlotIndex();
+        PeerRecvState& state = peerRecvStates_[slot];
+
+        if (state.stallReclaims.load(std::memory_order_relaxed)
+            < internal::GRANT_STRIKES_BEFORE_CUT)
+            return;
+
+        // A peer with no limit has nothing to cut. Giving it one here would let
+        // a lossy path invent a restriction the socket never configured.
+        const uint32_t current = state.grant.load(std::memory_order_relaxed);
+        if (current == 0)
+        {
+            state.stallReclaims.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        uint32_t cut = current / internal::GRANT_CUT_DIVISOR;
+        if (cut < internal::GRANT_CUT_FLOOR) cut = internal::GRANT_CUT_FLOOR;
+        state.stallReclaims.store(0, std::memory_order_relaxed);
+        if (cut >= current) return;   // already at the floor, nothing to say
+
+        Peer* peer = peerHandle.Write();
+        if (!peer) return;
+        state.grant.store(cut, std::memory_order_relaxed);
+        ++peer->ourGrantGeneration;
+        peer->grantSendPending  = true;
+        peer->grantSentAtMicros = 0;
+    }
+
     common::Error Socket::SetRecvGrant(const Address& peer, uint32_t slots)
     {
         if (!initialized_.load(std::memory_order_acquire))
@@ -2839,6 +2871,10 @@ namespace bcp::flux
                 // every owing association in one packet).
                 if (ackDue)
                     FlushPeerAcks(addr, peers_.GetPeer(addr));
+
+                // Judged before the announcement, so a cut decided on this tick
+                // goes out on this tick rather than waiting for the next.
+                CutGrantIfAbusive(peers_.GetPeer(addr));
 
                 // Retried every tick until the peer acknowledges it, so a lost
                 // announcement is not a peer that never learns its limit.

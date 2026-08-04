@@ -729,6 +729,19 @@ namespace bcp::flux
             happens under it and the send after it is released. */
         void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
 
+        /** Cuts a peer's grant once it has had buffer reclaimed too often.
+
+            A peer whose gaps get filled never reaches this. One that repeatedly
+            fills buffer and leaves it to time out is holding what it is not
+            using, and the answer is to let it hold less. Halving rather than
+            closing, so a peer that recovers can still work.
+
+            The strikes reset with the cut, so a peer is judged on what it does
+            next rather than on a total it can never work off. Takes the handle
+            by value: the decision is made under it and the announcement goes out
+            on the tick afterwards. */
+        void CutGrantIfAbusive(PeerHandle peerHandle);
+
         /** Empties the OS receive buffer into the recv pool, consuming handshake
             and control traffic and queueing application packets for Poll.
 

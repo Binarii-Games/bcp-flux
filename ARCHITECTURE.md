@@ -825,7 +825,17 @@ buffers, which costs reordering and not reception.
 The reserve is configured, defaulting to a sixteenth of the receive pool with a
 floor. A fraction rather than a fixed count, because what it has to absorb is
 arrivals per tick, and a socket sized for ten thousand peers needs headroom a
-socket sized for ten does not. A grant is per peer rather than per socket. Configuration sets what a peer
+socket sized for ten does not. A grant can also be cut without anyone asking. A peer whose buffered packets are
+repeatedly thrown away for making no progress is holding what it is not using,
+and after enough of those its grant is halved and the new figure announced like
+any other. Loss alone never reaches this, because a gap the sender fills costs
+nothing: what counts is buffer taken and left to time out, which is the one
+thing a well-behaved remote never does however poor its path. Halving rather
+than closing, so a peer that recovers can still work, and the strikes reset with
+the cut so it is judged on what it does next rather than on a total it can never
+work off.
+
+A grant is per peer rather than per socket. Configuration sets what a peer
 starts with and `SetRecvGrant` changes one afterwards, in either direction, so a
 peer that has proved itself can be given more than one that has not. A reduction
 binds immediately on the receiving side, and a peer already past the new figure

@@ -235,6 +235,7 @@ target_include_directories(mac_only_packet PRIVATE flux/src)
 target_include_directories(flow_jam_eviction PRIVATE flux/src)
 target_include_directories(concurrent_flows PRIVATE flux/src)
 target_include_directories(grant_isolation PRIVATE flux/src)
+target_include_directories(grant_reduction PRIVATE flux/src)
 # Six phases of twenty threads, and a sanitized build runs it several times
 # slower, so it gets more room than the ordinary integration budget.
 set_tests_properties(concurrent_flows PROPERTIES TIMEOUT 600)
