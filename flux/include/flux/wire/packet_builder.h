@@ -28,6 +28,18 @@ namespace bcp::flux::wire
         common::Error failReason_{common::Error::Ok}; ///< Set only if construction or an action failed.
         bool failed_{false};
 
+        /** Records the first failure and keeps it.
+
+            A chain reports one reason at the end, and the useful one is what
+            went wrong first: everything after it is a consequence. A later
+            overflow must not overwrite the reason a builder was already dead. */
+        void Fail(common::Error reason) noexcept
+        {
+            if (failed_) return;
+            failed_     = true;
+            failReason_ = reason;
+        }
+
     public:
         explicit PacketContentStage(SocketSender& sender, PacketSlotWriter writer,
                                     Address respondTo = {}) :

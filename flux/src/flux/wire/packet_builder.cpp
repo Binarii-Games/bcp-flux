@@ -178,31 +178,31 @@ namespace bcp::flux::wire
     // --- Content stage ---
     PacketContentStage& PacketContentStage::PutU8(uint8_t in)
     {
-        if (!writer_.PutU8(in)) failed_ = true;
+        if (!writer_.PutU8(in)) Fail(common::Error::TooLarge);
         return *this;
     }
 
     PacketContentStage& PacketContentStage::PutU16(uint16_t in)
     {
-        if (!writer_.PutU16(in)) failed_ = true;
+        if (!writer_.PutU16(in)) Fail(common::Error::TooLarge);
         return *this;
     }
 
     PacketContentStage& PacketContentStage::PutU32(uint32_t in)
     {
-        if (!writer_.PutU32(in)) failed_ = true;
+        if (!writer_.PutU32(in)) Fail(common::Error::TooLarge);
         return *this;
     }
 
     PacketContentStage& PacketContentStage::PutU64(uint64_t in)
     {
-        if (!writer_.PutU64(in)) failed_ = true;
+        if (!writer_.PutU64(in)) Fail(common::Error::TooLarge);
         return *this;
     }
 
     PacketContentStage& PacketContentStage::PutBytes(const uint8_t* data, size_t len)
     {
-        if (!writer_.PutBytes(data, len)) failed_ = true;
+        if (!writer_.PutBytes(data, len)) Fail(common::Error::TooLarge);
         return *this;
     }
 
