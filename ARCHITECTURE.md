@@ -781,7 +781,16 @@ generation. Each side announces its own receive capacity once its session
 commits, so the exchange is symmetric and neither side ever states the other's
 allowance. The value is local configuration, so the receiver enforces it from
 the peer's first packet rather than from the announcement, and what travels only
-saves the sender from overshooting. A grant may be raised or lowered at any
+saves the sender from overshooting.
+
+Enforcement is a refusal to buffer. A peer already holding its grant has further
+out-of-order packets ejected rather than held, which is the same path an
+out-of-window packet takes: no copy, no pinned slot, and the sequence is left
+unseen so the sender resends it. That is what bounds one remote's share of a
+pool every remote draws from. It cannot stall a flow, because the packet at the
+cursor is delivered rather than buffered, so the one packet that would drain the
+buffer is never the one refused. A grant of zero bounds nothing, which is how a
+socket that configures none behaves exactly as it did before grants existed. A grant may be raised or lowered at any
 time, which is why the announcement is a control op rather than a handshake
 field: the handshake transcript derives the session key, and a limit that
 changes has no business in a key. The generation orders announcements so one

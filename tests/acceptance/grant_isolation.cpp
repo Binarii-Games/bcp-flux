@@ -76,6 +76,9 @@ namespace
         config.flows.outCount    = 8;
         config.flows.inCount     = 8;
         config.flows.bulkInCount = 4;
+        // What any one peer may pin. Well under RECV_SLOTS, so several peers
+        // fit and no single one can take the pool.
+        config.flows.recvGrant   = 48;
         config.flows.stagingCount = 512;
         // Far past the run, so the jam is never reclaimed underneath the test
         // and the pressure on the pool is sustained throughout.

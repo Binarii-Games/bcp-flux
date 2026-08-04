@@ -1757,7 +1757,21 @@ namespace bcp::flux
         }
 
         // seq > recvNext: ahead of the cursor.
+        //
+        // A peer at its grant stops being held for. Ejecting rather than
+        // holding is what bounds one remote's share of the shared recv pool,
+        // and it can never stall the flow: the packet at the cursor is
+        // delivered rather than held, so the one packet that would drain this
+        // buffer is never the one refused. Zero grants no limit.
+        const uint32_t grant = peerRecvStates_[flow.peerSlot].grant.load(
+            std::memory_order_relaxed);
+        const bool withinGrant =
+            grant == 0
+            || peerRecvStates_[flow.peerSlot].occupancy.load(
+                   std::memory_order_relaxed) < grant;
+
         const bool holdable = flow.reorderCap > 0
+                           && withinGrant
                            && seq < flow.recvNext + flow.reorderCap;
         if (holdable)
         {
