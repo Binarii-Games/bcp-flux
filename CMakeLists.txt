@@ -187,10 +187,19 @@ endif()
 #
 #   unit/         data-structure integrity          label: unit
 #   integration/  full processes and edge cases      label: integration
+#   acceptance/   properties a finished feature owes  label: acceptance
 #   bench/        performance against a baseline      label: bench
 #
-# Fast CI runs unit + integration on every commit:  ctest -LE bench
+# Fast CI runs unit + integration on every commit:
+#   ctest -LE "bench|acceptance"
 # The benches are heavier and run on demand or nightly:  ctest -L bench
+#
+# Acceptance tests state what a feature must do once it is finished, so they are
+# written before the feature and fail until it lands. That is the point of them,
+# and it is why they stay out of the per-commit gate: a red acceptance suite
+# means the feature is not built yet, not that the tree is broken. Run them
+# directly with  ctest -L acceptance  and fold them into the gate once the
+# feature they describe is done.
 #
 # Each library owns its tests: flux's are in tests/, the vendored common's
 # travel with it in external/common/tests/ and link common alone, which is what
@@ -215,6 +224,7 @@ endfunction()
 
 register_tests("tests/unit/*.cpp"        unit        240 flux tests)
 register_tests("tests/integration/*.cpp" integration 240 flux tests)
+register_tests("tests/acceptance/*.cpp"  acceptance  240 flux tests)
 register_tests("tests/bench/*.cpp"       bench       600 flux tests)
 
 # The fault-injecting kernel sits beside the platform kernels in flux's private
@@ -223,6 +233,7 @@ target_include_directories(flow_fault_recovery PRIVATE flux/src)
 target_include_directories(mac_only_packet PRIVATE flux/src)
 target_include_directories(flow_jam_eviction PRIVATE flux/src)
 target_include_directories(concurrent_flows PRIVATE flux/src)
+target_include_directories(grant_isolation PRIVATE flux/src)
 # Six phases of twenty threads, and a sanitized build runs it several times
 # slower, so it gets more room than the ordinary integration budget.
 set_tests_properties(concurrent_flows PROPERTIES TIMEOUT 600)
