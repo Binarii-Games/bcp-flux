@@ -123,22 +123,21 @@ static void JammedFlowKeepsAssociation()
     CHECK(!flow.Failed());
     CHECK(SendWithLostHead(client, CLIENT, flow, serverAddr, 20));
 
-    // The head is lost, so the receiver holds seq 2.. behind the gap. The
-    // server is ticked with a FROZEN clock here: reception happens on the tick,
-    // but every reclaim on it is measured against that clock, so a time that
-    // never advances means nothing can age out before we observe it, however
-    // slow the runner. The eviction phase below lets the clock run.
-    const uint64_t frozen = common::MonotonicMicros();
+    // The head is lost, so the receiver holds seq 2.. behind the gap. The whole
+    // observation has to fit inside the 250 ms stall timeout, because the tick
+    // that receives is also the tick that reclaims, so this window is one pass
+    // rather than two and the count is compared against its own midpoint.
     flux::PacketSlotHandle inbox[64];
-    uint32_t delivered = 0;
+    uint32_t delivered = 0, atMidpoint = 0;
     for (int i = 0; i < 120; ++i)
     {
         client.Flush();
         client.Update();
         // Update takes packets off the socket, Poll hands over what it took.
-        server.Update(frozen);
+        server.Update();
         flux::PollCursor cursor = server.Poll(inbox, 64);
         delivered += cursor.PacketCount();
+        if (i == 59) atMidpoint = delivered;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
@@ -148,19 +147,13 @@ static void JammedFlowKeepsAssociation()
     // test's business. What the jam means is that delivery STOPS at the gap and
     // does not resume, so the count is taken here and must not move while the
     // sender keeps pushing into a gap it never fills.
-    const uint32_t beforeGap = delivered;
-    CHECK(beforeGap < 20);                              // the gap really blocked something
-    for (int i = 0; i < 120; ++i)
-    {
-        client.Flush();
-        client.Update();
-        server.Update(frozen);
-        flux::PollCursor stuck = server.Poll(inbox, 64);
-        delivered += stuck.PacketCount();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
-    CHECK(delivered == beforeGap);                      // nothing past the gap
+    // Whatever arrived in order ahead of the dropped packet was delivered, and
+    // which packet the link drops belongs to the backend's schedule rather than
+    // to this test. What a jam means is that delivery STOPS at the gap and does
+    // not resume, so the count must not move over the second half of a window in
+    // which the sender kept pushing into a gap it never fills.
+    CHECK(delivered < 20);              // the gap really blocked something
+    CHECK(delivered == atMidpoint);     // and nothing got past it after that
     CHECK(server.ReceivingFlowCount(clientAddr) == 1);  // the jammed flow is there
 
     // Past the 250 ms stall timeout, the tick reclaims it.
@@ -285,10 +278,9 @@ static void SiblingSurvives()
 
     Pump(client, server, 20);   // quiesce before staging the jam
 
-    // A second flow, jammed the same way as test 1. The server ticks on a
-    // frozen clock so it receives without anything aging out before both flows
-    // can be observed.
-    const uint64_t held = common::MonotonicMicros();
+    // A second flow, jammed the same way as test 1. The stall timeout here is
+    // two seconds, so this window is comfortably inside it and both flows can be
+    // observed before either is reclaimed.
     flux::FlowHandle jam = client.OpenFlow(31, flux::FlowMode::RELIABLE_ORDERED);
     CHECK(!jam.Failed());
     CHECK(SendWithLostHead(client, CLIENT, jam, serverAddr, 20));
@@ -296,7 +288,7 @@ static void SiblingSurvives()
     {
         client.Flush();
         client.Update();
-        server.Update(held);
+        server.Update();
         server.Poll(inbox, 64);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
