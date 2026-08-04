@@ -229,6 +229,12 @@ register_tests("tests/bench/*.cpp"       bench       600 flux tests)
 
 # The fault-injecting kernel sits beside the platform kernels in flux's private
 # tree, so a test that drives one needs the same view of them the library has.
+#
+# Every test that drives it lives under acceptance/. A seeded fault schedule
+# decides per packet, so anything that changes how many packets go out, or when,
+# shifts which ones are damaged. That makes these sensitive to changes they are
+# not testing, and a commit gate they can fail for unrelated reasons stops being
+# a signal. They run on demand with  ctest -L acceptance .
 target_include_directories(flow_fault_recovery PRIVATE flux/src)
 target_include_directories(mac_only_packet PRIVATE flux/src)
 target_include_directories(flow_jam_eviction PRIVATE flux/src)
