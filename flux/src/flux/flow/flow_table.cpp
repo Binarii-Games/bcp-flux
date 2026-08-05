@@ -1755,15 +1755,6 @@ namespace bcp::flux
             ArmAck(&flow);
             return 0;
         }
-        // An unordered flow has no cursor to strand, so a peer at its limit is
-        // simply refused here. This is the path that would otherwise let one
-        // remote fill the pool with packets nobody is waiting behind.
-        if (!HasRoomFor(flow.peerSlot))
-        {
-            ArmAck(&flow);
-            return 0;   // uncommitted and unacked, so the sender resends
-        }
-
         // No cursor here, so nothing waits behind this packet and refusing it
         // strands nothing. This is the entry that would otherwise let one peer
         // fill the pool with traffic nobody is blocked on.

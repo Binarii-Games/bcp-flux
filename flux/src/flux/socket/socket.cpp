@@ -1853,8 +1853,7 @@ namespace bcp::flux
             {
                 if (peers_.RegisterPeer(from, &id, slot) != common::Error::Ok)
                     return;   // table full; the initiator's retry will land later
-                peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
-                peerRecvStates_[slot].grant.store(recvGrant_, std::memory_order_relaxed);
+                SeedPeerRecvState(slot);
             }
             else
             {
@@ -2339,6 +2338,20 @@ namespace bcp::flux
         return flows_.InAssocCountForPeer(peerHandle.GetSlotIndex());
     }
 
+    void Socket::SeedPeerRecvState(uint32_t slot) noexcept
+    {
+        peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
+        peerRecvStates_[slot].grant.store(recvGrant_, std::memory_order_relaxed);
+    }
+
+    void Socket::ApplyGrant(uint32_t slot, Peer& peer, uint32_t value) noexcept
+    {
+        peerRecvStates_[slot].grant.store(value, std::memory_order_relaxed);
+        ++peer.ourGrantGeneration;
+        peer.grantSendPending  = true;
+        peer.grantSentAtMicros = 0;   // go on the next tick, not one interval later
+    }
+
     void Socket::CutGrantIfAbusive(PeerHandle peerHandle)
     {
         if (peerHandle.Failed()) return;
@@ -2365,10 +2378,7 @@ namespace bcp::flux
 
         Peer* peer = peerHandle.Write();
         if (!peer) return;
-        state.grant.store(cut, std::memory_order_relaxed);
-        ++peer->ourGrantGeneration;
-        peer->grantSendPending  = true;
-        peer->grantSentAtMicros = 0;
+        ApplyGrant(slot, *peer, cut);
     }
 
     common::Error Socket::SetRecvGrant(const Address& peer, uint32_t slots)
@@ -2384,14 +2394,7 @@ namespace bcp::flux
         // In force from here. A peer already past the new figure is not made to
         // give anything back, it simply stops being buffered for until it
         // drains under it.
-        peerRecvStates_[peerHandle.GetSlotIndex()].grant.store(
-            slots, std::memory_order_relaxed);
-
-        // A new generation, so the peer takes this over whatever it last
-        // applied, and the tick carries it until acknowledged.
-        ++state->ourGrantGeneration;
-        state->grantSendPending  = true;
-        state->grantSentAtMicros = 0;   // go on the next tick, not one interval later
+        ApplyGrant(peerHandle.GetSlotIndex(), *state, slots);
         return common::Error::Ok;
     }
 
@@ -2680,8 +2683,7 @@ namespace bcp::flux
                                             // its HS_INIT is already on the way
         if (registration != common::Error::Ok)
             return registration;
-        peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
-        peerRecvStates_[slot].grant.store(recvGrant_, std::memory_order_relaxed);
+        SeedPeerRecvState(slot);
 
         {
             PeerHandle peerHandle = peers_.GetPeer(addr);

@@ -729,6 +729,26 @@ namespace bcp::flux
             happens under it and the send after it is released. */
         void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
 
+        /** Starts a freshly registered slot on this socket's configured grant.
+
+            A recycled slot carries its previous occupant's counts, so this
+            wipes them before the new peer is charged for anything. Nothing is
+            announced: a peer with no session cannot be told, and CommitSession
+            raises the flag once there is a channel to say it on. */
+        void SeedPeerRecvState(uint32_t slot) noexcept;
+
+        /** Changes what one peer may occupy and arranges for it to be told.
+
+            Changing a grant is four steps that have to happen together: the
+            value, a fresh generation so the peer takes this over whatever it
+            last applied, the pending flag, and a cleared send stamp so the tick
+            carries it at once rather than an interval later. Every caller goes
+            through here, because three of the four done right is a peer that
+            never learns its limit moved.
+
+            The caller holds `peer` write-locked and `slot` is its slot. */
+        void ApplyGrant(uint32_t slot, Peer& peer, uint32_t value) noexcept;
+
         /** Cuts a peer's grant once it has had buffer reclaimed too often.
 
             A peer whose gaps get filled never reaches this. One that repeatedly
