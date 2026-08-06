@@ -46,6 +46,7 @@ namespace bcp::flux
             assoc->flowEpoch  = flowEpoch;
             assoc->epoch      = assoc->epoch + 1;
             assoc->life       = FlowLifecycle::OPEN;
+            assoc->emitting   = false;
 
             assoc->nextSeq      = 1;
             assoc->unresolved   = 0;
@@ -88,6 +89,7 @@ namespace bcp::flux
             assoc->mode       = mode;
             assoc->flowEpoch  = flowEpoch;
             assoc->life       = FlowLifecycle::OPEN;
+            assoc->emitting   = false;
             assoc->epoch      = assoc->epoch + 1;
 
             assoc->recvNext           = 1;
@@ -961,6 +963,51 @@ namespace bcp::flux
         outAssocPool_.UnlockWrite(flowSlot);
     }
 
+    void FlowTable::MarkEmitting(EventScope scope, uint32_t assocSlot) noexcept
+    {
+        if (scope == EventScope::OUT_FLOW)
+        {
+            if (assocSlot >= outAssocPool_.GetCapacity()) return;
+            OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
+                outAssocPool_.WriteLock(assocSlot));
+            assoc->emitting = true;
+            outAssocPool_.UnlockWrite(assocSlot);
+            return;
+        }
+        if (assocSlot >= inAssocPool_.GetCapacity()) return;
+        InAssociation* assoc = reinterpret_cast<InAssociation*>(
+            inAssocPool_.WriteLock(assocSlot));
+        assoc->emitting = true;
+        inAssocPool_.UnlockWrite(assocSlot);
+    }
+
+    void FlowTable::ClearEmitting(EventScope scope, uint32_t assocSlot) noexcept
+    {
+        // Teardown may have run while the event was waiting, in which case it
+        // left the lease alone for exactly this moment. CLOSED under the write
+        // lock is what says so, and the release happens after the lock drops
+        // because the pool must not be handed a slot someone still holds.
+        bool release = false;
+        if (scope == EventScope::OUT_FLOW)
+        {
+            if (assocSlot >= outAssocPool_.GetCapacity()) return;
+            OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
+                outAssocPool_.WriteLock(assocSlot));
+            assoc->emitting = false;
+            release = assoc->life == FlowLifecycle::CLOSED;
+            outAssocPool_.UnlockWrite(assocSlot);
+            if (release) outAssocPool_.Release(assocSlot);
+            return;
+        }
+        if (assocSlot >= inAssocPool_.GetCapacity()) return;
+        InAssociation* assoc = reinterpret_cast<InAssociation*>(
+            inAssocPool_.WriteLock(assocSlot));
+        assoc->emitting = false;
+        release = assoc->life == FlowLifecycle::CLOSED;
+        inAssocPool_.UnlockWrite(assocSlot);
+        if (release) inAssocPool_.Release(assocSlot);
+    }
+
     bool FlowTable::OutAssocEpochIs(uint32_t assocSlot, uint8_t flowEpoch) noexcept
     {
         if (assocSlot >= outAssocPool_.GetCapacity()) return false;
@@ -1223,12 +1270,17 @@ namespace bcp::flux
         const uint32_t drained = DrainOutInflight(flow);
         DrainOutWaiting(flow);
         flow->life = FlowLifecycle::CLOSED;
+        // An unread event about this association is sitting in the slot's event
+        // entry. Releasing now would let a later occupant land on that entry and
+        // write over it, so the lease is held and ClearEmitting releases it once
+        // the event has been delivered.
+        const bool emitting = flow->emitting;
         outAssocPool_.UnlockWrite(flowSlot);
 
         if (refundTo)
             refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
                 ? drained : refundTo->bytesInFlight;
-        outAssocPool_.Release(flowSlot);
+        if (!emitting) outAssocPool_.Release(flowSlot);
     }
 
     void FlowTable::FailAssoc(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept
@@ -1290,8 +1342,9 @@ namespace bcp::flux
                     inAssocPool_.WriteLock(flowSlot));
                 DrainInHoldback(assoc);
                 assoc->life = FlowLifecycle::CLOSED;
+                const bool emitting = assoc->emitting;
                 inAssocPool_.UnlockWrite(flowSlot);
-                inAssocPool_.Release(flowSlot);
+                if (!emitting) inAssocPool_.Release(flowSlot);
             }
         }
     }

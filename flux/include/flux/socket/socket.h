@@ -37,6 +37,7 @@
 #include <flux/socket/packet_slot.h>
 #include <flux/peer/peer_recv_state.h>
 #include <flux/socket/ready_lanes.h>
+#include <flux/socket/socket_events.h>
 #include <flux/socket/socket_listener.h>
 #include <flux/socket/socket_sender.h>
 #include <flux/peer/peer.h>
@@ -340,6 +341,20 @@ namespace bcp::flux
                     a misbehaving peer keep recv slots hostage. */
                 uint32_t flowStallTimeoutMicros = 0;
             } liveness;
+
+            /** Being told what happened instead of asking every tick.
+                Leaving `hook` null costs nothing: no storage is allocated and
+                nothing is ever recorded. */
+            struct Events
+            {
+                EventHook hook       = nullptr;
+                void*     context    = nullptr;   ///< handed back untouched
+
+                /** Which events `hook` is called for, as the OR of SocketEvent
+                    values. Anything outside it is never recorded, so an empty
+                    set disables the hook as surely as a null pointer does. */
+                uint32_t  subscribed = 0;
+            } events;
         };
 
         Socket() = default;
@@ -480,6 +495,7 @@ namespace bcp::flux
             limit. Zero is also what an unknown peer reports. */
         [[nodiscard]] uint32_t RecvGrantFor(const Address& peer);
 
+
         /** Advances this side's migration tag for every established peer, so
             packets after a deliberate local address change wear unlinkable
             tags. All peers rotate together; 3+ rotations unheard outruns a
@@ -552,6 +568,14 @@ namespace bcp::flux
         common::collections::SlotPool* recvPool_ = nullptr;   ///< borrowed from the kernel
         common::collections::SlotPool* sendPool_ = nullptr;   ///< borrowed from the kernel
         ReadyLanes readyLanes_;   ///< recv-slot indices awaiting Poll, split per draining thread
+
+        /** What happened, held until someone polls for it. Inert unless a hook
+            was registered at Init, and drained by Poll. */
+        EventTable events_;
+
+        /** Handed to EventTable::Dispatch so a slot kept alive only to carry an
+            event can be let go once it has been delivered. */
+        static void OnEventDelivered(void* context, EventScope scope, uint32_t slot) noexcept;
 
         // Fixed-at-Init scalars.
         uint32_t                       minCongestionBudget_ = internal::CC_MIN_BUDGET_DEFAULT;

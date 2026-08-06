@@ -364,7 +364,11 @@ namespace bcp::flux
     struct OutAssociation
     {
         // Which peer. peerSlot is the direct route and cannot go stale, because
-        // RemovePeer frees a peer's associations before releasing its slot.
+        // RemovePeer frees a peer's associations before releasing its slot. One
+        // exception: an association still holding an unread event keeps its
+        // lease until that event is read, so it can outlive the peer slot it
+        // names by a poll. Nothing reaches it in that window, since it has
+        // already been taken out of the directory that lists it.
         // peerAddr and peerId are for hand-over-hand crossings, where the
         // association lock is dropped before the peer is approached: by id once
         // the peer is established, since that survives migration, by address
@@ -390,6 +394,13 @@ namespace bcp::flux
 
         uint32_t epoch;         ///< revalidates the drain's peek against its claim
         FlowLifecycle life;     ///< per target: FAILED here leaves the flow open
+
+        /** An event about this association has been recorded and nobody has
+            read it yet. Teardown leaves the slot leased while it is set, so a
+            later occupant cannot land on the entry the note is sitting in, and
+            whoever delivers the note releases the slot instead. Written under
+            this association's write lock, like every other field here. */
+        bool emitting;
 
         uint32_t nextSeq;
         uint32_t unresolved;    ///< stamped and unacked; the send gate refuses at inflightCap
@@ -519,6 +530,9 @@ namespace bcp::flux
         FlowMode mode;          ///< decoded from the flow data byte
         uint8_t  flowEpoch;     ///< same byte: which generation of that id this is
         FlowLifecycle life;
+
+        /** See OutAssociation::emitting. Same rule, same reason. */
+        bool emitting;
 
         uint32_t epoch;
 

@@ -132,6 +132,7 @@ namespace bcp::flux
         flows_.Shutdown();
         pendingPool_.Shutdown();
         readyLanes_.Shutdown();
+        events_.Shutdown();
         if (kernel_)
         {
             kernel_->Close();
@@ -186,6 +187,15 @@ namespace bcp::flux
         if (common::Error error = InitFlows(config); error != common::Error::Ok)
             return error;
         if (common::Error error = InitLiveness(config); error != common::Error::Ok)
+            return error;
+        // Sized from the association pools, so every entity that can exist has
+        // an entry of its own and nothing can be crowded out.
+        if (common::Error error = events_.Init(
+                config.events.hook, config.events.context, config.events.subscribed,
+                config.flows.outCount + config.flows.bulkOutCount,
+                config.flows.inCount + config.flows.bulkInCount,
+                readyLanes_.LaneCount());
+            error != common::Error::Ok)
             return error;
 
         migration_            = config.enableMigration;
@@ -1121,6 +1131,13 @@ namespace bcp::flux
         }
     }
 
+    void Socket::OnEventDelivered(void* context, EventScope scope, uint32_t slot) noexcept
+    {
+        // The slot may have been torn down while its event waited, in which
+        // case the teardown left the lease alone for this moment.
+        static_cast<Socket*>(context)->flows_.ClearEmitting(scope, slot);
+    }
+
     PollCursor Socket::Poll(PacketSlotHandle* outPackets, size_t max,
                             ThreadIdentity identity)
     {
@@ -1141,6 +1158,14 @@ namespace bcp::flux
         const uint32_t lane = readyLanes_.ClaimLane(identity.lane);
         if (lane == ReadyLanes::NO_LANE)
             return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
+
+        // Before the packets, and only for this lane. An event about a peer
+        // reaches the thread that handles that peer's traffic, so an
+        // application holding per-peer state without a lock keeps it. Holding
+        // the lane across a handler is what makes that exact rather than
+        // usually right, and it is also what keeps a second thread out of these
+        // entries.
+        events_.Dispatch(lane, &Socket::OnEventDelivered, this);
 
         size_t delivered = 0;
         ReadyEntry ready{};
@@ -1377,14 +1402,26 @@ namespace bcp::flux
             if (!peer || !peer->IsValid()) return 0;
 
             const uint32_t peerSlot = peerHandle.GetSlotIndex();
-            if (flows_.AdmitIn(peerSlot, from, peer->id, flowId, flowData,
-                               flowSlot, flowEpoch) == FlowAdmit::Rejected)
+            const FlowAdmit admit = flows_.AdmitIn(peerSlot, from, peer->id, flowId,
+                                                   flowData, flowSlot, flowEpoch);
+            if (admit == FlowAdmit::Rejected)
             {
                 // An undecodable flow data byte, or caps. Tell the sender so it
                 // stops rather than retransmitting into silence.
                 rejectMaterials = GatherSendMaterials(*peer);
                 reject = true;
             }
+            // Registered means this packet is the first of a flow the remote
+            // opened. Existing says nothing new, and every later packet of the
+            // same flow reports Existing. Recorded here, under the peer lock
+            // that still holds the association's slot, so the entry it writes
+            // is that association's own.
+            // Marked while the peer lock is still held, so the teardown that
+            // reads the mark cannot run between recording and marking.
+            if (admit == FlowAdmit::Registered
+                && events_.Record(EventScope::IN_FLOW, flowSlot, readyLanes_.LaneOf(peerSlot),
+                                  SocketEvent::INCOMING_FLOW_OPENED, from, flowId))
+                flows_.MarkEmitting(EventScope::IN_FLOW, flowSlot);
         }
 
         if (reject)
@@ -2539,6 +2576,10 @@ namespace bcp::flux
         if (!flows_.OutAssocEpochIs(flowSlot, flowEpoch)) return;
 
         flows_.FailAssoc(flowSlot, flowId, peer);
+        if (events_.Record(EventScope::OUT_FLOW, flowSlot,
+                           readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
+                           SocketEvent::OUTGOING_FLOW_REFUSED, from, flowId))
+            flows_.MarkEmitting(EventScope::OUT_FLOW, flowSlot);
     }
 
     void Socket::Flow_Ack(const Address& from, const uint8_t* payload, size_t len)
@@ -2962,6 +3003,10 @@ namespace bcp::flux
                 if (Peer* dying = peerHandle.Write())
                 {
                     flows_.FailAssoc(flowSlot, flowId, dying);
+                    if (events_.Record(EventScope::OUT_FLOW, flowSlot,
+                                       readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
+                                       SocketEvent::OUTGOING_FLOW_LOST, addr, flowId))
+                        flows_.MarkEmitting(EventScope::OUT_FLOW, flowSlot);
                     return;
                 }
             }

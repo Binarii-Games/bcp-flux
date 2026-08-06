@@ -18,6 +18,7 @@
 
 #include <flux/peer/peer_recv_state.h>
 #include <flux/socket/ready_lanes.h>
+#include <flux/socket/socket_events.h>
 
 namespace bcp::flux
 {
@@ -323,6 +324,21 @@ namespace bcp::flux
             id's previous generation cannot take down its current one.
             @pre caller holds the peer read lock. */
         [[nodiscard]] bool OutAssocEpochIs(uint32_t assocSlot, uint8_t flowEpoch) noexcept;
+
+        /** Marks an association as having an event out that nobody has read.
+            While it is set, teardown leaves the slot leased rather than
+            returning it, so a later occupant cannot land on the entry that
+            event is sitting in.
+
+            @pre The caller holds the peer's write lock, which is what keeps
+                 this from racing the teardown that reads it. */
+        void MarkEmitting(EventScope scope, uint32_t assocSlot) noexcept;
+
+        /** The other half: the event has been delivered. Clears the mark, and
+            releases the slot if teardown came and went while it was set. Takes
+            no other lock, so it is safe to call with nothing held, which is
+            where it runs. */
+        void ClearEmitting(EventScope scope, uint32_t assocSlot) noexcept;
 
         /** The send gate: creates the association on first send, then admits,
             queues, drops or refuses. The flow is named by the packet's own flow
