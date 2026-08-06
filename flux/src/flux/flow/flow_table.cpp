@@ -1554,7 +1554,14 @@ namespace bcp::flux
         if (acked)
         {
             delta.ackedBytes += entry.wireSize;
-            if (nowMicros >= entry.sentAtMicros)
+            // Zero is not a send time, it is the marker three paths use to say
+            // "overdue, resend this on the next tick". Subtracting it yields the
+            // machine's uptime, which then becomes the smoothed round trip: the
+            // retransmit timeout goes effectively infinite and the pacing rate
+            // effectively zero, so the flow stops sending and stops timing out
+            // while every thread keeps running. Measured at 54 hours from a
+            // single sample.
+            if (entry.sentAtMicros != 0 && nowMicros >= entry.sentAtMicros)
             {
                 const uint64_t sample = nowMicros - entry.sentAtMicros;
                 SampleRtt(flow, sample);   // per-flow RTT, for this flow's RTO
