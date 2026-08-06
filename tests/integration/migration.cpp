@@ -1,10 +1,11 @@
 // Address migration, end to end over real UDP. A connection must survive its
-// peer's address changing — no re-handshake, same keys — without letting an
-// attacker hijack it by replaying a captured packet from a spoofed address.
+// peer's address changing, with no re-handshake and the same keys, and it has
+// to do that without letting an attacker hijack it by replaying a captured
+// packet from a spoofed address.
 //
 // The setup is a two-port UDP relay standing between client and server. The
-// client always talks to the relay's port A and always sees the server there;
-// the relay chooses whether the server sees the client arrive from port A or
+// client always talks to the relay's port A and always sees the server there.
+// The relay chooses whether the server sees the client arrive from port A or
 // port B. Flipping that is exactly a client address change (WiFi->cellular, NAT
 // rebind, IP rotation) from the server's vantage, which is the only thing
 // migration has to survive.
@@ -35,7 +36,7 @@ using RawSocket = udp_raw::Socket;
 using udp_raw::IsHandshake;
 using udp_raw::IsSecure;
 
-// The relay. The client always reaches the server via port A; the server sees
+// The relay. The client always reaches the server via port A. The server sees
 // the client on A, or on B once `forwardViaB` is set. Replies always go back to
 // the client from A, so the client's own view never changes.
 struct Relay
