@@ -143,6 +143,27 @@ namespace bcp::flux::internal
         Nothing is paced before the first round-trip sample, because there is no
         rate to pace at. The initial window bounds that opening burst instead,
         which is what it is for. */
+    /** How many acknowledged packets with higher sequences it takes to call an
+        unacknowledged one lost, without waiting for its timeout. The receiver
+        already reports which sequences it holds, so this costs nothing on the
+        wire and saves most of a timeout.
+
+        Three is the long-standing figure, and the reason it is not one or two
+        is reordering: a packet overtaken by one or two others is late rather
+        than gone, and declaring it lost would cost a needless retransmit and,
+        worse, a congestion reaction on a path that was fine. */
+    static constexpr uint32_t LOSS_PACKET_THRESHOLD         = 3;
+
+    /** Acknowledge at least this often, in packets, rather than only when the
+        delay expires. Holding a reply is worth it on a quiet link, where it
+        turns several replies into one. On a link with data flowing it is pure
+        delay: two packets arrive in microseconds, and the sender is sitting
+        there timing the pause and concluding the path is slow.
+
+        Two is the long-standing figure and it keeps the saving where the saving
+        is real, since a lone packet still waits for the timer. */
+    static constexpr uint32_t ACK_EVERY_PACKETS             = 2;
+
     static constexpr uint32_t CC_PACING_GAIN_PERCENT        = 125;
     static constexpr uint32_t CC_PACING_BURST_BYTES         = 2u * MAX_WIRE_PACKET_SIZE;
 

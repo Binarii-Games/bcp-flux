@@ -604,6 +604,13 @@ namespace bcp::flux
             advance ackBase past them. An acknowledged packet is kept until then
             because a receiver holding it behind a gap can still be made to drop
             it, and the sender would be the only one carrying it. */
+        /** Marks every outstanding packet at least LOSS_PACKET_THRESHOLD behind
+            a sequence that has arrived as overdue, so the next retransmit scan
+            carries it. Detection only: the resend itself stays on the one path
+            that already does it. */
+        void DeclareLostBelow(OutAssociation& flow, uint32_t largestAcked,
+                              CongestionDelta& delta) noexcept;
+
         void ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept;
 
         void RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,

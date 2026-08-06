@@ -301,6 +301,21 @@ namespace bcp::flux
         uint16_t wireSize;     ///< refunded to the congestion budget on resolve
         uint8_t  retries;      ///< give-up counter; the flow fails at the cap
         bool     acked;        ///< resolved, copy retained until the run below it clears
+
+        /** Declared lost by the acks rather than by a timeout. Set once and
+            never again for this sequence: every later ack still names it as
+            missing, and re-marking on each one would keep refreshing its
+            resend. If the resend is lost too, the ordinary timeout catches it.
+
+            `freeResend` is the resend that declaration owes, and it is not
+            charged against the give-up count. That count is asking whether the
+            peer has stopped answering, and a timeout is evidence of silence
+            while this is the opposite: the only way this packet was known to be
+            missing is that acknowledgements arrived. Charging a resend to the
+            proof that the peer is alive kills flows that are working, and does
+            it soonest on the lossy links where the detection helps most. */
+        bool     lostByAck;
+        bool     freeResend;
     };
 
     /** One packet received ahead of order, held until the gap before it fills.
@@ -536,6 +551,17 @@ namespace bcp::flux
 
         /** See OutAssociation::emitting. Same rule, same reason. */
         bool emitting;
+
+        /** A packet arrived out of order, so the next tick answers at once
+            instead of waiting out the ack delay. The sender is blocked on
+            learning which sequence is missing, and holding that back adds the
+            delay to recovery.
+
+            An event and not a state. "A gap is open" stays true for as long as
+            the gap lasts, and answering on that would send one reply per tick
+            for the whole of it. This is raised by an arrival and cleared by the
+            reply, so it is one reply per out-of-order packet. */
+        bool ackImmediate;
 
         uint32_t epoch;
 

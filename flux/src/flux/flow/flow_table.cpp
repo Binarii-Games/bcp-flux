@@ -70,7 +70,7 @@ namespace bcp::flux
             InFlightEntry* inFlight = assoc->InFlight();
             for (uint32_t i = 0; i < inflightCap; ++i)
                 inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID,
-                                             0, 0, false };
+                                             0, 0, false, false, false };
             WaitingEntry* waiting = assoc->Waiting();
             for (uint32_t i = 0; i < waitingCap; ++i)
                 waiting[i] = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };
@@ -88,9 +88,10 @@ namespace bcp::flux
             assoc->flowId     = flowId;
             assoc->mode       = mode;
             assoc->flowEpoch  = flowEpoch;
-            assoc->life       = FlowLifecycle::OPEN;
-            assoc->emitting   = false;
-            assoc->epoch      = assoc->epoch + 1;
+            assoc->life          = FlowLifecycle::OPEN;
+            assoc->emitting      = false;
+            assoc->ackImmediate  = false;
+            assoc->epoch         = assoc->epoch + 1;
 
             assoc->recvNext           = 1;
             assoc->heldCount          = 0;
@@ -378,6 +379,8 @@ namespace bcp::flux
             entry.wireSize     = wireSize;
             entry.retries      = 0;
             entry.acked        = false;
+            entry.lostByAck    = false;
+            entry.freeResend   = false;
 
             flow.unresolved += 1;
             peer.bytesInFlight += wireSize;      // congestion spend
@@ -787,8 +790,23 @@ namespace bcp::flux
                 continue;
             const InAssociation* flow = reinterpret_cast<const InAssociation*>(
                 inAssocPool_.ReadLock(dir[i].flowSlot));
-            if (flow->newSinceFlush > 0 &&
-                Elapsed(now, flow->ackArmedMicros) >= ackDelayMicros_)
+            // Three reasons to answer, and the delay is only the last of them.
+            //
+            // A PACKET ARRIVED OUT OF ORDER. The sender is waiting to learn
+            // which sequence is missing, so holding the reply back adds the
+            // delay to recovery. Raised by the arrival rather than by the gap
+            // still being open, or a gap lasting a hundred packets would send a
+            // reply on every tick for the whole of it.
+            //
+            // ENOUGH OWED. On a link with data flowing, waiting is pure delay.
+            // The packets are already here and the sender is timing the pause.
+            //
+            // THE DELAY EXPIRED. The backstop, for a link that has gone quiet,
+            // which is the case the batching was for in the first place.
+            if (flow->newSinceFlush > 0
+                && (flow->ackImmediate
+                    || flow->newSinceFlush >= internal::ACK_EVERY_PACKETS
+                    || Elapsed(now, flow->ackArmedMicros) >= ackDelayMicros_))
                 ackDue = true;
             inAssocPool_.UnlockRead(dir[i].flowSlot);
         }
@@ -946,6 +964,7 @@ namespace bcp::flux
                 inAssocPool_.WriteLock(flowSlot));
             if (flow->life == FlowLifecycle::OPEN && flow->newSinceFlush > 0)
             {
+                flow->ackImmediate = false;   // this reply is the answer it asked for
                 AckRange ranges[internal::FLOW_ACK_RANGE_COUNT];
                 const uint8_t rc = BuildAckRanges(flow, ranges,
                                                   internal::FLOW_ACK_RANGE_COUNT);
@@ -1009,6 +1028,14 @@ namespace bcp::flux
         {
             const uint32_t cap = flow->inflightCap;
             InFlightEntry* ring = flow->InFlight();
+
+            // The highest sequence this ack proves arrived. Taken from what our
+            // own ring resolved rather than from the numbers the peer sent, so
+            // a peer naming a sequence we never sent cannot make us declare our
+            // own packets lost.
+            uint32_t largestAcked = 0;
+            bool     anyAcked     = false;
+
             for (uint32_t i = 0; i < cap; ++i)
             {
                 if (ring[i].seq == 0) continue;
@@ -1017,8 +1044,17 @@ namespace bcp::flux
                 // it drops are the oldest ones, which is exactly the stretch
                 // the send window is waiting on.
                 if (ring[i].seq < remoteRecvNext || SeqInRanges(ring[i].seq, ranges, count))
+                {
+                    if (!anyAcked || static_cast<int32_t>(ring[i].seq - largestAcked) > 0)
+                    {
+                        largestAcked = ring[i].seq;
+                        anyAcked     = true;
+                    }
                     ResolveOutEntry(flow, ring[i], true, now, delta);
+                }
             }
+
+            if (anyAcked) DeclareLostBelow(*flow, largestAcked, delta);
             ReleaseAckedRun(*flow, remoteRecvNext);
         }
         outAssocPool_.UnlockWrite(flowSlot);
@@ -1577,6 +1613,42 @@ namespace bcp::flux
         outAssocPool_.UnlockWrite(assocSlot);
     }
 
+    void FlowTable::DeclareLostBelow(OutAssociation& flow, uint32_t largestAcked,
+                                     CongestionDelta& delta) noexcept
+    {
+        // Anything still outstanding this far behind a sequence that arrived is
+        // not late, it is gone. Waiting for its timeout instead costs most of a
+        // round trip on a path that has already told us what happened.
+        //
+        // Only reliable flows: an unreliable one is never resent, so declaring
+        // its packets early changes nothing it can act on, and the timeout scan
+        // already gives it the same congestion signal.
+        if (flow.mode == FlowMode::UNRELIABLE) return;
+
+        InFlightEntry* ring = flow.InFlight();
+        for (uint32_t i = 0; i < flow.inflightCap; ++i)
+        {
+            InFlightEntry& entry = ring[i];
+            if (entry.seq == 0 || entry.acked) continue;
+
+            // Signed, so the comparison still holds across a sequence wrap.
+            if (static_cast<int32_t>(largestAcked - entry.seq)
+                < static_cast<int32_t>(internal::LOSS_PACKET_THRESHOLD))
+                continue;
+
+            // Handed to the retransmit scan rather than resent here. Zero reads
+            // as overdue against any timeout, so the next tick carries it
+            // through the one sanctioned resend path instead of growing a
+            // second one beside it. The entry stays in flight, exactly as a
+            // timed-out reliable packet does.
+            if (entry.lostByAck) continue;           // said once, not once per ack
+            entry.lostByAck    = true;
+            entry.freeResend   = true;               // the peer is talking, so this is free
+            entry.sentAtMicros = 0;                  // overdue against any timeout
+            delta.sawLoss      = true;
+        }
+    }
+
     void FlowTable::ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept
     {
         const uint32_t mask = flow.inflightCap - 1;
@@ -1605,6 +1677,8 @@ namespace bcp::flux
                 entry.retries      = 0;
                 entry.sentAtMicros = 0;
                 entry.acked        = false;
+                entry.lostByAck    = false;
+                entry.freeResend   = false;
             }
             // An entry that does not carry this sequence was given up rather
             // than acked, and is already gone.
@@ -1661,7 +1735,12 @@ namespace bcp::flux
                 // entirely. Retrying further only burns budget, so the caller
                 // fails the flow and the app reads it off the handle. This is
                 // the only give-up left now that opening takes no round trip.
-                if (entry.retries >= maxAttempts_)
+                //
+                // A resend the acks asked for is exempt, and neither spends an
+                // attempt nor is refused for want of one. The count is asking
+                // whether the peer has gone quiet, and this packet is only
+                // known to be missing because the peer said so.
+                if (!entry.freeResend && entry.retries >= maxAttempts_)
                 {
                     exhausted = true;
                     continue;
@@ -1673,7 +1752,8 @@ namespace bcp::flux
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
                     entry.sentAtMicros = now;   // don't re-fire before next RTO
-                    ++entry.retries;
+                    if (entry.freeResend) entry.freeResend = false;
+                    else                  ++entry.retries;
                 }
             }
         }
@@ -1910,7 +1990,10 @@ namespace bcp::flux
         // cannot be flooded.
         if (seq < flow.recvNext)
         {
-            ArmAck(&flow);   // already delivered: re-ack cumulatively
+            // Already delivered, so the sender is resending against an ack it
+            // never got. Answer now rather than making it wait again.
+            flow.ackImmediate = true;
+            ArmAck(&flow);
             return 0;
         }
 
@@ -1957,6 +2040,7 @@ namespace bcp::flux
                 peerRecvStates_[flow.peerSlot].PinOne();
                 heldTotal_->fetch_add(1, std::memory_order_relaxed);
                 CommitSeen(&flow, seq);                 // held -> ackable (SACK)
+                flow.ackImmediate = true;               // out of order: answer now
                 ArmAck(&flow);
             }
             // else already held: duplicate, incoming drops (releases its slot)
@@ -1965,7 +2049,10 @@ namespace bcp::flux
 
         // Out of the reorder window: EJECT. Do NOT commit-seen (so the sender
         // still retransmits) and do NOT hold it (no copy, no pin). Arm the
-        // cumulative ack so the sender learns our recvNext and fills the gap.
+        // cumulative ack so the sender learns our recvNext and fills the gap,
+        // and answer at once, since that cursor is the only thing that will
+        // stop it sending more it cannot use.
+        flow.ackImmediate = true;
         ArmAck(&flow);
         return 0;
     }
