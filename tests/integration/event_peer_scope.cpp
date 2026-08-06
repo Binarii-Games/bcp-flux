@@ -23,6 +23,8 @@
 #include <flux/address.h>
 #include <flux/flow/flow_handle.h>
 #include <flux/internal/constants.h>
+#include <flux/peer/peer.h>
+#include <flux/peer/peer_handle.h>
 #include <flux/socket/packet_slot.h>
 #include <flux/wire/packet_builder.h>
 #include <flux/socket/platform/faulty_socket.h>
@@ -97,6 +99,15 @@ namespace
         return false;
     }
 
+    // What this sender still has unresolved with that peer. The remote's grant
+    // bounds it, so it is also how much room is left to send anything new.
+    uint32_t Outstanding(flux::Socket& socket, const flux::Address& peer)
+    {
+        flux::PeerHandle handle = socket.GetPeer(peer);
+        const flux::Peer* state = handle.Read();
+        return state ? state->outstandingToPeer : 0;
+    }
+
     void SetLoss(flux::platform::FaultySocket* kernel, uint8_t percent)
     {
         flux::platform::FaultySocket::Profile profile{};
@@ -167,9 +178,24 @@ namespace
             lost && DriveUntil(sender, &receiver, [&] { return seen.jammed > before; }, 4000);
         SetLoss(senderKernel, 0);
 
-        // Let the retransmits through again, so the next round starts from a
-        // flow that is moving rather than one still stuck on the last gap.
-        for (int i = 0; i < 40; ++i) Drive(sender, &receiver);
+        // Let the backlog clear before the next round, and wait on the backlog
+        // itself rather than on a count of ticks. A retransmit leaves only once
+        // its packet's timeout has run, which is tens of milliseconds, while a
+        // spin of ticks costs almost no wall time, so a fixed number of them
+        // lets nothing through.
+        //
+        // That matters because every packet still unresolved is charged against
+        // the grant the receiver gave us. A round that starts before the last
+        // one has cleared has less room to send than its predecessor, and after
+        // enough rounds there is none: the burst below never reaches the wire,
+        // nothing is lost, and no gap forms to jam. The bound is there so a flow
+        // that genuinely cannot drain fails the assertions rather than hanging.
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (Outstanding(sender, to) > 0
+                   && std::chrono::steady_clock::now() < until)
+                Drive(sender, &receiver);
+        }
         return jammed;
     }
 }
