@@ -111,10 +111,14 @@ struct World
     Relay        relay;
     uint16_t     portA, portB, clientPort, serverPort;
 
-    bool Boot(uint16_t base)
+    bool Boot(uint16_t base, bcp::flux::EventHook serverHook = nullptr)
     {
         portA = base; portB = base + 1; clientPort = base + 2; serverPort = base + 3;
-        if (server.Init({ .type = BACKEND, .port = serverPort, .maxPeers = 8, .pendingPacketCount = 8 }) != common::Error::Ok) return false;
+        flux::Socket::Config serverConfig{ .type = BACKEND, .port = serverPort,
+                                           .maxPeers = 8, .pendingPacketCount = 8 };
+        serverConfig.events.hook       = serverHook;
+        serverConfig.events.subscribed = flux::ToBits(flux::SocketEvent::PEER_MIGRATED);
+        if (server.Init(serverConfig) != common::Error::Ok) return false;
         if (client.Init({ .type = BACKEND, .port = clientPort, .maxPeers = 8, .pendingPacketCount = 8 }) != common::Error::Ok) return false;
         if (!relay.Init(portA, portB, clientPort, serverPort)) return false;
         if (SendOp(client, Loopback(portA), 0x01) != common::Error::Ok) return false;
@@ -150,12 +154,25 @@ struct World
     void Close() { relay.Close(); }
 };
 
+// Counts PEER_MIGRATED on the server. The rebind is the only thing that raises
+// it, and this file already owns the relay that makes a peer appear to move, so
+// the event is checked where the move is rather than in a second copy of all
+// this.
+static uint32_t g_migrated = 0;
+
+static void OnServerEvent(void* context, const bcp::flux::EventInfo& info)
+{
+    (void)context;
+    if (info.Has(bcp::flux::SocketEvent::PEER_MIGRATED)) ++g_migrated;
+}
+
 // A move mid-session: the server recognizes the peer at its new address, rebinds
-// to it, and keeps the same keys — no handshake anywhere.
+// to it, and keeps the same keys, with no handshake anywhere.
 static void move_survives_with_same_keys()
 {
+    g_migrated = 0;
     World world;
-    CHECK(world.Boot(9700));
+    CHECK(world.Boot(9700, OnServerEvent));
 
     world.relay.forwardViaB = true;    // the client's apparent address changes
     world.relay.watching    = true;
@@ -178,6 +195,10 @@ static void move_survives_with_same_keys()
     }
 
     CHECK(delivered >= 1);                                        // data crossed the move
+
+    // The rebind is what raises it, so this fires exactly when the peer is
+    // re-filed under the address it moved to.
+    CHECK(g_migrated >= 1);
     CHECK(Established(world.server, Loopback(world.portB)));      // rebound to the new address
     CHECK(!Established(world.server, Loopback(world.portA)));     // old address released
     CHECK(world.relay.handshakesToClient == 0);                  // no re-handshake: same session
