@@ -249,8 +249,11 @@ namespace bcp::flux
 
     /** Outcome of registering a remote's flow from the packet that named it.
         Stale means a generation already replaced, which is dropped without an
-        answer: nothing is left at the other end to hear one. */
-    enum class FlowAdmit : uint8_t { Registered, Existing, Rejected, Stale };
+        answer: nothing is left at the other end to hear one. Reopened is an
+        Existing whose generation moved on, so the association survived but
+        everything it was holding did not, and a caller that only cares whether
+        the flow is usable treats the two the same. */
+    enum class FlowAdmit : uint8_t { Registered, Existing, Reopened, Rejected, Stale };
 
     /** Feedback gathered under a flow lock and applied to the peer under the
         peer lock. The flow side only accumulates, so it never reaches for the

@@ -265,5 +265,16 @@ namespace bcp::flux
             the pool. Unlock before release: SlotPool lock state survives
             Release. */
         void DrainAndFree(uint32_t slot);
+
+    public:
+        /** An event about this peer has been delivered. Clears Peer::emitting
+            and releases the slot if a removal came and went while it was set.
+
+            There is no matching Mark here on purpose: every site that records a
+            peer event already holds that peer's write lock, so it sets the flag
+            through the Peer it has rather than asking for the lock again. */
+        void ClearEmitting(uint32_t slot) noexcept;
+
+    private:
     };
 }

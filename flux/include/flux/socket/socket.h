@@ -577,6 +577,14 @@ namespace bcp::flux
             event can be let go once it has been delivered. */
         static void OnEventDelivered(void* context, EventScope scope, uint32_t slot) noexcept;
 
+        /** The one way a peer-scoped event is recorded: note it, and mark the
+            peer as owing a delivery so its slot is not returned before then.
+
+            @pre The caller holds this peer's write lock and lends the Peer in,
+                 which is what keeps the mark from needing a second
+                 acquisition. */
+        void RecordPeerEvent(Peer& peer, uint32_t peerSlot, SocketEvent what) noexcept;
+
         // Fixed-at-Init scalars.
         uint32_t                       minCongestionBudget_ = internal::CC_MIN_BUDGET_DEFAULT;
         /** Paces handshake retries. Kept here rather than read from the flow

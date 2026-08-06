@@ -41,6 +41,54 @@ namespace bcp::flux
             Either way the flow stays open for every other peer, which is why
             both name an address. */
         OUTGOING_FLOW_LOST    = (1u << 2),
+
+        /** A remote closed this flow id and opened it again. The association
+            survives, but it numbers from one now and everything held against
+            the old generation has been thrown away. An application reading
+            that flow has to treat what comes next as a fresh start.
+
+            There is no event for a remote merely closing a flow, because
+            closing puts nothing on the wire and this side genuinely cannot
+            know. It finds out here, or when the peer idles out. */
+        INCOMING_FLOW_REOPENED = (1u << 3),
+
+        /** The handshake completed and there is a session with this peer. */
+        PEER_ESTABLISHED       = (1u << 4),
+
+        /** This peer is gone: idled out, removed, or it stopped answering the
+            handshake. The address is a copy, so it names a peer that no longer
+            exists and looking it up finds nothing, which is the point. */
+        PEER_LOST              = (1u << 5),
+
+        /** This peer proved a new address and was rebound to it. Same session,
+            same id, same counters. The address in the event is the new one. */
+        PEER_MIGRATED          = (1u << 6),
+
+        /** This peer changed what it says we may occupy of its receive pool,
+            which is what bounds how much we can have in flight to it. */
+        PEER_GRANT_CHANGED     = (1u << 7),
+
+        /** We cut what this peer may occupy of OUR receive pool, because it
+            kept holding buffer it never used. The other side of
+            PEER_GRANT_CHANGED, and a decision this socket made rather than one
+            it was told. */
+        PEER_GRANT_CUT         = (1u << 8),
+
+        /** A flow from this peer jammed: it held packets behind a gap the
+            sender did not fill for the stall timeout, so the buffer was taken
+            back. The flow itself survives and the sender resends into the same
+            gap, so the cost is a round trip rather than data.
+
+            Fires when the sweep finds a jam AND takes something back. A flow
+            already reclaimed once and still stuck holds nothing, so it stays
+            quiet until the sender puts something there again. The counter
+            behind the grant cut follows the same rule, so the two never tell
+            different stories.
+
+            Peer-scoped rather than per flow, because that is how the count is
+            already kept and because what an application does about it is about
+            the peer. */
+        PEER_FLOW_JAMMED       = (1u << 9),
     };
 
     constexpr uint32_t ToBits(SocketEvent e) noexcept { return static_cast<uint32_t>(e); }
@@ -52,6 +100,7 @@ namespace bcp::flux
     {
         OUT_FLOW = 0,
         IN_FLOW  = 1,
+        PEER     = 2,
     };
 
     /** What one entity had happen to it, handed over by Socket::Poll with
@@ -104,8 +153,8 @@ namespace bcp::flux
 
     /** Where events wait until someone polls for them.
 
-        One entry per association slot, in a row per direction, sized at Init
-        from the same counts the pools are. That is what makes delivery a
+        One entry per association slot in a row per direction, and one per peer
+        slot in a third, all sized at Init from the same counts the pools are. That is what makes delivery a
         property of the shape rather than of the traffic: every entity that
         exists occupies exactly one slot, so it has exactly one entry, and an
         event is only ever recorded while its entity still holds that slot.
@@ -155,8 +204,10 @@ namespace bcp::flux
 
         std::unique_ptr<Entry[]> outFlows_;
         std::unique_ptr<Entry[]> inFlows_;
+        std::unique_ptr<Entry[]> peers_;
         uint32_t outCount_{0};
         uint32_t inCount_{0};
+        uint32_t peerCount_{0};
 
         /** Pending entries per lane, so a poll walks only until it has found
             what is waiting for it rather than to the end of both rows. */
@@ -184,13 +235,15 @@ namespace bcp::flux
             Record a no-op.
 
             `outSlots` and `inSlots` are the association pool capacities, bulk
-            included, since those pools share one slot numbering per direction.
-            `lanes` is the delivery lane count, which entries are grouped by.
+            included, since those pools share one slot numbering per direction,
+            and `peerSlots` is the peer table's. `lanes` is the delivery lane
+            count, which entries are grouped by.
 
             `subscribed` is the OR of the events the hook is called for.
             Anything outside it is never recorded. */
         [[nodiscard]] common::Error Init(EventHook hook, void* context, uint32_t subscribed,
-                                         uint32_t outSlots, uint32_t inSlots, uint32_t lanes);
+                                         uint32_t outSlots, uint32_t inSlots,
+                                         uint32_t peerSlots, uint32_t lanes);
 
         /** Idempotent, and safe to call on an inert table. */
         void Shutdown() noexcept;

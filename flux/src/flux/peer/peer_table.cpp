@@ -457,6 +457,8 @@ namespace bcp::flux
         p->outstandingToPeer    = 0;
         p->theirGrantGeneration = 0;
         p->ourGrantGeneration   = 0;
+        p->emitting             = false;
+        p->freeWhenRead         = false;
         p->grantSendPending     = false;   // raised when a session commits
         p->grantSentAtMicros    = 0;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
@@ -975,8 +977,32 @@ namespace bcp::flux
     {
         // No index entry references the slot anymore, so no new handle can be
         // minted for it; the write lock waits out the handles that still exist.
-        peerPool_.WriteLock(slot);
+        Peer* peer = reinterpret_cast<Peer*>(peerPool_.WriteLock(slot));
+
+        // An unread event about this peer is sitting in the slot's event entry.
+        // Releasing now would let a later peer land on that entry and write
+        // over it, so the lease is held and ClearEmitting releases it once the
+        // event has been delivered. The slot is already unreachable by then,
+        // which is what makes holding it harmless.
+        const bool emitting = peer && peer->emitting;
+        if (emitting) peer->freeWhenRead = true;
+
         peerPool_.UnlockWrite(slot);
-        peerPool_.Release(slot);
+        if (!emitting) peerPool_.Release(slot);
+    }
+
+    void PeerTable::ClearEmitting(uint32_t slot) noexcept
+    {
+        if (slot >= peerPool_.GetCapacity()) return;
+        bool release = false;
+        Peer* peer = reinterpret_cast<Peer*>(peerPool_.WriteLock(slot));
+        if (peer)
+        {
+            peer->emitting = false;
+            release = peer->freeWhenRead;
+            peer->freeWhenRead = false;
+        }
+        peerPool_.UnlockWrite(slot);
+        if (release) peerPool_.Release(slot);
     }
 }

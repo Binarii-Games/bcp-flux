@@ -194,7 +194,7 @@ namespace bcp::flux
                 config.events.hook, config.events.context, config.events.subscribed,
                 config.flows.outCount + config.flows.bulkOutCount,
                 config.flows.inCount + config.flows.bulkInCount,
-                readyLanes_.LaneCount());
+                config.maxPeers, readyLanes_.LaneCount());
             error != common::Error::Ok)
             return error;
 
@@ -1131,11 +1131,23 @@ namespace bcp::flux
         }
     }
 
+    void Socket::RecordPeerEvent(Peer& peer, uint32_t peerSlot, SocketEvent what) noexcept
+    {
+        // The caller holds this peer's write lock, so the flag is set through
+        // the peer it already has. Asking the table for the lock again would be
+        // the re-acquire that self-deadlocks.
+        if (events_.Record(EventScope::PEER, peerSlot, readyLanes_.LaneOf(peerSlot),
+                           what, peer.addr, internal::INVALID_FLOW_ID))
+            peer.emitting = true;
+    }
+
     void Socket::OnEventDelivered(void* context, EventScope scope, uint32_t slot) noexcept
     {
         // The slot may have been torn down while its event waited, in which
         // case the teardown left the lease alone for this moment.
-        static_cast<Socket*>(context)->flows_.ClearEmitting(scope, slot);
+        Socket& socket = *static_cast<Socket*>(context);
+        if (scope == EventScope::PEER) socket.peers_.ClearEmitting(slot);
+        else                           socket.flows_.ClearEmitting(scope, slot);
     }
 
     PollCursor Socket::Poll(PacketSlotHandle* outPackets, size_t max,
@@ -1418,10 +1430,18 @@ namespace bcp::flux
             // is that association's own.
             // Marked while the peer lock is still held, so the teardown that
             // reads the mark cannot run between recording and marking.
-            if (admit == FlowAdmit::Registered
-                && events_.Record(EventScope::IN_FLOW, flowSlot, readyLanes_.LaneOf(peerSlot),
-                                  SocketEvent::INCOMING_FLOW_OPENED, from, flowId))
-                flows_.MarkEmitting(EventScope::IN_FLOW, flowSlot);
+            // Reopened is the same association numbering from one again, with
+            // everything it held thrown away, so it is news in the same way a
+            // first registration is.
+            if (admit == FlowAdmit::Registered || admit == FlowAdmit::Reopened)
+            {
+                const SocketEvent what = admit == FlowAdmit::Registered
+                    ? SocketEvent::INCOMING_FLOW_OPENED
+                    : SocketEvent::INCOMING_FLOW_REOPENED;
+                if (events_.Record(EventScope::IN_FLOW, flowSlot,
+                                   readyLanes_.LaneOf(peerSlot), what, from, flowId))
+                    flows_.MarkEmitting(EventScope::IN_FLOW, flowSlot);
+            }
         }
 
         if (reject)
@@ -1686,9 +1706,20 @@ namespace bcp::flux
             // A refused rebind (the address raced into use by another peer)
             // leaves the old route; the mover's next packet simply starts a
             // fresh validation round.
-            (void)peers_.UpdateAddress(slot, from);
+            const bool moved = peers_.UpdateAddress(slot, from) == common::Error::Ok;
             SlideTagWindow(slot, session, theirLane, oldBase, newBase);
             common::crypto::Wipe(session.data(), session.size());
+
+            // Recorded after the rebind and under a fresh borrow, because the
+            // table ops above cannot run with a handle held, and because the
+            // address worth reporting is the one it moved to.
+            if (moved)
+            {
+                PeerHandle movedHandle = peers_.GetPeer(from);
+                if (Peer* movedPeer = movedHandle.Failed() ? nullptr : movedHandle.Write())
+                    RecordPeerEvent(*movedPeer, movedHandle.GetSlotIndex(),
+                                    SocketEvent::PEER_MIGRATED);
+            }
         }
     }
 
@@ -1993,6 +2024,7 @@ namespace bcp::flux
             }
             Peer* peer = peerHandle.Write();
             CommitSession(*peer, pk, ephSk, ephI, transcript, sizeof(transcript));
+            RecordPeerEvent(*peer, peerHandle.GetSlotIndex(), SocketEvent::PEER_ESTABLISHED);
             common::crypto::Wipe(ephSk.data(), ephSk.size());   // the whole point
 
             common::crypto::ComputeMac(confirm, peer->session, transcript, sizeof(transcript));
@@ -2142,6 +2174,7 @@ namespace bcp::flux
             }
             Peer* peer = peerHandle.Write();
             CommitSession(*peer, pk, ephSk, ephR, transcript, sizeof(transcript));
+            RecordPeerEvent(*peer, peerHandle.GetSlotIndex(), SocketEvent::PEER_ESTABLISHED);
             std::memcpy(peer->announcedTag, tag.data(), tag.size());
             peer->authenticated = (match == CertStore::Match::Trusted);
             ReplayFor(peerHandle.GetSlotIndex()).Reset();   // fresh session -> remote's counter starts at 0
@@ -2416,6 +2449,7 @@ namespace bcp::flux
         Peer* peer = peerHandle.Write();
         if (!peer) return;
         ApplyGrant(slot, *peer, cut);
+        RecordPeerEvent(*peer, slot, SocketEvent::PEER_GRANT_CUT);
     }
 
     common::Error Socket::SetRecvGrant(const Address& peer, uint32_t slots)
@@ -2487,7 +2521,12 @@ namespace bcp::flux
             if (age > 0)
             {
                 peer->theirGrantGeneration = generation;
-                peer->theirGrant           = grant;
+                if (peer->theirGrant != grant)
+                {
+                    peer->theirGrant = grant;
+                    RecordPeerEvent(*peer, peerHandle.GetSlotIndex(),
+                                    SocketEvent::PEER_GRANT_CHANGED);
+                }
             }
             materials = GatherSendMaterials(*peer);
         }
@@ -2697,8 +2736,16 @@ namespace bcp::flux
 
             // The sweep mutates both directories, so it needs the peer's write
             // lock rather than the read lock above.
-            if ((flows_.SendEnabled() || flows_.ReceiveEnabled()) && peer.Write())
-                flows_.SweepPeer(peer.GetSlotIndex());
+            if (Peer* dying = peer.Write())
+            {
+                // Recorded before the removal below, which is what leaves the
+                // slot leased until this is read. Idle eviction and a handshake
+                // that stopped answering both reach here too, so this one site
+                // covers every way a peer goes away.
+                RecordPeerEvent(*dying, peer.GetSlotIndex(), SocketEvent::PEER_LOST);
+                if (flows_.SendEnabled() || flows_.ReceiveEnabled())
+                    flows_.SweepPeer(peer.GetSlotIndex());
+            }
         }
         return peers_.RemovePeer(addr);
     }
@@ -2944,9 +2991,12 @@ namespace bcp::flux
                 if (jammed)
                 {
                     PeerHandle reclaimHandle = peers_.GetPeer(addr);
-                    if (!reclaimHandle.Failed() && reclaimHandle.Write())
-                        (void)flows_.ReclaimJammedInFlows(reclaimHandle.GetSlotIndex(),
-                                                        Now(nowOverride));
+                    Peer* stalled = reclaimHandle.Failed() ? nullptr : reclaimHandle.Write();
+                    if (stalled
+                        && flows_.ReclaimJammedInFlows(reclaimHandle.GetSlotIndex(),
+                                                       Now(nowOverride)) > 0)
+                        RecordPeerEvent(*stalled, reclaimHandle.GetSlotIndex(),
+                                        SocketEvent::PEER_FLOW_JAMMED);
                 }
             }
         }

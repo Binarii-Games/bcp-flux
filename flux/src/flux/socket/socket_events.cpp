@@ -3,7 +3,8 @@
 namespace bcp::flux
 {
     common::Error EventTable::Init(EventHook hook, void* context, uint32_t subscribed,
-                                   uint32_t outSlots, uint32_t inSlots, uint32_t lanes)
+                                   uint32_t outSlots, uint32_t inSlots,
+                                   uint32_t peerSlots, uint32_t lanes)
     {
         Shutdown();
 
@@ -28,6 +29,12 @@ namespace bcp::flux
             if (!inFlows_) return common::Error::AllocFailed;
             inCount_ = inSlots;
         }
+        if (peerSlots > 0)
+        {
+            peers_ = std::make_unique<Entry[]>(peerSlots);
+            if (!peers_) return common::Error::AllocFailed;
+            peerCount_ = peerSlots;
+        }
 
         hook_       = hook;
         context_    = context;
@@ -45,9 +52,11 @@ namespace bcp::flux
 
         outFlows_.reset();
         inFlows_.reset();
+        peers_.reset();
         pending_.reset();
         outCount_  = 0;
         inCount_   = 0;
+        peerCount_ = 0;
         laneCount_ = 0;
     }
 
@@ -55,7 +64,9 @@ namespace bcp::flux
     {
         if (scope == EventScope::OUT_FLOW)
             return slot < outCount_ ? &outFlows_[slot] : nullptr;
-        return slot < inCount_ ? &inFlows_[slot] : nullptr;
+        if (scope == EventScope::IN_FLOW)
+            return slot < inCount_ ? &inFlows_[slot] : nullptr;
+        return slot < peerCount_ ? &peers_[slot] : nullptr;
     }
 
     bool EventTable::Record(EventScope scope, uint32_t slot, uint32_t lane,
@@ -145,10 +156,13 @@ namespace bcp::flux
         const uint32_t wanted = pending_[lane].load(std::memory_order_acquire);
         if (wanted == 0) return;
 
-        const uint32_t taken = DispatchRow(outFlows_.get(), outCount_, EventScope::OUT_FLOW,
-                                           lane, wanted, done, doneContext);
+        uint32_t taken = DispatchRow(outFlows_.get(), outCount_, EventScope::OUT_FLOW,
+                                     lane, wanted, done, doneContext);
         if (taken < wanted)
-            (void)DispatchRow(inFlows_.get(), inCount_, EventScope::IN_FLOW,
+            taken += DispatchRow(inFlows_.get(), inCount_, EventScope::IN_FLOW,
+                                 lane, wanted - taken, done, doneContext);
+        if (taken < wanted)
+            (void)DispatchRow(peers_.get(), peerCount_, EventScope::PEER,
                               lane, wanted - taken, done, doneContext);
     }
 }

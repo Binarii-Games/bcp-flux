@@ -1182,8 +1182,9 @@ namespace bcp::flux
             }
             inAssocPool_.UnlockWrite(existing);
 
-            return order == FlowEpochOrder::Stale ? FlowAdmit::Stale
-                                                  : FlowAdmit::Existing;
+            if (order == FlowEpochOrder::Stale)  return FlowAdmit::Stale;
+            if (order == FlowEpochOrder::Newer)  return FlowAdmit::Reopened;
+            return FlowAdmit::Existing;
         }
 
         // This is the one path where a REMOTE makes this socket allocate, so
@@ -1221,7 +1222,8 @@ namespace bcp::flux
         // First packet of a flow registers it: the flow data byte carries
         // everything registration needs.
         const FlowAdmit admit = AdmitInFlow(peerSlot, from, peerId, flowId, flowData);
-        if (admit != FlowAdmit::Registered && admit != FlowAdmit::Existing)
+        if (admit != FlowAdmit::Registered && admit != FlowAdmit::Existing
+            && admit != FlowAdmit::Reopened)
             return admit;
 
         outAssoc = FindFlowSlot(InDirFor(peerSlot), maxInAssocPerPeer_, flowId);

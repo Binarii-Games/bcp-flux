@@ -196,6 +196,16 @@ namespace bcp::flux
             here is only what the message claimed. */
         bool    confirmed;
 
+        /** An event about this peer has been recorded and nobody has read it
+            yet. Removal leaves the slot leased while it is set, so a later peer
+            cannot land on the entry the event is sitting in, and whoever
+            delivers it releases the slot instead. `freeWhenRead` is how the
+            deferred removal is remembered, since unlike an association there is
+            no lifecycle value already meaning it. Both written under this
+            peer's write lock. */
+        bool emitting;
+        bool freeWhenRead;
+
         bool IsValid() const { return state == HandshakeState::ESTABLISHED; }
     };
 
