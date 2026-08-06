@@ -62,6 +62,11 @@ static void OnReceiverEvent(void* context, const flux::EventInfo& info)
 {
     flux::Socket& socket = *static_cast<flux::Socket*>(context);
 
+    // A peer event carries no flow, so it reports INVALID_FLOW_ID. Asking per
+    // event rather than switching is what lets one call report both.
+    if (info.Has(flux::SocketEvent::PEER_ESTABLISHED))
+        common::LogF(common::LogLevel::Info, "receiver: a peer completed its handshake");
+
     if (!info.Has(flux::SocketEvent::INCOMING_FLOW_OPENED)) return;
 
     // Calling back into the socket from inside a handler is the reason this
@@ -128,7 +133,8 @@ int main()
     receiverConfig.flows.maxInPerPeer = FLOWS_ALLOWED;
     receiverConfig.events.hook        = OnReceiverEvent;
     receiverConfig.events.context     = &receiver;
-    receiverConfig.events.subscribed  = flux::ToBits(flux::SocketEvent::INCOMING_FLOW_OPENED);
+    receiverConfig.events.subscribed  = flux::ToBits(flux::SocketEvent::INCOMING_FLOW_OPENED)
+                                      | flux::ToBits(flux::SocketEvent::PEER_ESTABLISHED);
 
     flux::Socket::Config senderConfig{};
     senderConfig.type              = examples::BACKEND;
