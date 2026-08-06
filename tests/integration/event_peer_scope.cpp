@@ -143,15 +143,28 @@ namespace
         // ticks to come out. Cutting the link before that would lose the whole
         // burst rather than a packet out of the middle of it, and there would be
         // no gap to hold anything behind.
-        for (int i = 0; i < 60; ++i) Drive(sender, &receiver);
+        //
+        // Driven until the injector confirms it swallowed something, rather than
+        // for a fixed number of ticks. How many ticks a burst needs depends on
+        // how fast the build runs, and a sanitised one needs far more.
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+            while (senderKernel->GetStats().dropped == dropped
+                   && std::chrono::steady_clock::now() < until)
+                Drive(sender, &receiver);
+        }
 
         // The control for this helper: with nothing lost there is no gap, and a
         // jam that then failed to appear would be measuring the harness.
         const bool lost = senderKernel->GetStats().dropped > dropped;
 
         SetLoss(senderKernel, 100);
+        // Generous, because this has to hold under a sanitised build too. TSan
+        // runs several times slower, so the ticks that carry the stall timeout
+        // are that much further apart, and a budget tuned to a plain build
+        // fails there for no reason worth reporting.
         const bool jammed =
-            lost && DriveUntil(sender, &receiver, [&] { return seen.jammed > before; }, 800);
+            lost && DriveUntil(sender, &receiver, [&] { return seen.jammed > before; }, 4000);
         SetLoss(senderKernel, 0);
 
         // Let the retransmits through again, so the next round starts from a
