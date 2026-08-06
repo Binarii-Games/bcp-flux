@@ -865,7 +865,8 @@ namespace bcp::flux
                     // packet that never flies never burns a nonce counter.
                     const SendAdmission admission = flows_.AdmitOut(
                         *peer, peerHandle.GetSlotIndex(), *writable,
-                        pHandle.GetSlotIndex(), writable->dataSize, sessionUp);
+                        pHandle.GetSlotIndex(), writable->dataSize, sessionUp,
+                        common::MonotonicMicros());
                     switch (admission)
                     {
                     case SendAdmission::Sent:
@@ -3147,7 +3148,8 @@ namespace bcp::flux
                     return;
                 }
 
-                claimed = flows_.ClaimWaiting(candidate, *peer, *packet);
+                claimed = flows_.ClaimWaiting(candidate, *peer, *packet,
+                                              common::MonotonicMicros());
 
                 if (claimed)
                     materials = GatherSendMaterials(*peer);

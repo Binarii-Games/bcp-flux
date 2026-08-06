@@ -350,9 +350,13 @@ namespace bcp::flux
             the session opens.
 
             @pre caller holds the packet slot write lock and the peer write lock. */
+        /** `now` is monotonic micros, used for the pacing allowance. Room and
+            time are both decided here, and a packet refused on either waits on
+            the association's ring. */
         [[nodiscard]] SendAdmission AdmitOut(Peer& peer, uint32_t peerSlot,
                                              PacketSlot& packet, uint32_t packetSlot,
-                                             uint16_t wireSize, bool flying) noexcept;
+                                             uint16_t wireSize, bool flying,
+                                             uint64_t now) noexcept;
 
         /** Registers a remote's flow from the first packet that names it, and
             reports the association the packet belongs to. A packet naming a
@@ -415,7 +419,7 @@ namespace bcp::flux
             packet slot owned by whoever holds it.
             @pre caller holds the packet slot write lock and the peer write lock. */
         [[nodiscard]] bool ClaimWaiting(const WaitingCandidate& candidate, Peer& peer,
-                                        PacketSlot& packet) noexcept;
+                                        PacketSlot& packet, uint64_t now) noexcept;
 
         // --- Delivery. Owns the recv slot for the duration. ---
 

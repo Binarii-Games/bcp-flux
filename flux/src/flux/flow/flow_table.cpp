@@ -275,6 +275,65 @@ namespace bcp::flux
         // ownership of packetSlot (staging for reliable, kernel send for
         // unreliable) moves with it. See SendAdmission.
 
+        /** Tops the peer's pacing allowance up for the time that has passed, and
+            caps it at a small burst so an idle peer cannot bank a flood.
+
+            The rate is the congestion budget over the smoothed round trip, with
+            a little gain so the window still has room to grow. Before the first
+            round-trip sample there is no rate to work from, so the allowance is
+            left alone and the gate below does not pace at all.
+
+            @pre Caller holds the peer write lock. */
+        void RefillPacing(Peer& peer, uint64_t now) noexcept
+        {
+            if (peer.pathSrttMicros == 0) return;
+
+            if (peer.pacingRefilledAt == 0 || now < peer.pacingRefilledAt)
+            {
+                peer.pacingRefilledAt = now;
+                return;
+            }
+
+            const uint64_t elapsed = now - peer.pacingRefilledAt;
+            if (elapsed == 0) return;
+
+            // budget per round trip, scaled by how much of one has passed. In
+            // 64 bits throughout: budget times elapsed overflows 32 in under a
+            // millisecond on a fast path.
+            const uint64_t gained =
+                static_cast<uint64_t>(peer.congestionBudget)
+                * internal::CC_PACING_GAIN_PERCENT * elapsed
+                / (100ull * peer.pathSrttMicros);
+            if (gained == 0) return;   // keep the remainder for the next look
+
+            const uint64_t topped = static_cast<uint64_t>(peer.pacingTokens) + gained;
+            peer.pacingTokens = topped > internal::CC_PACING_BURST_BYTES
+                ? internal::CC_PACING_BURST_BYTES : static_cast<uint32_t>(topped);
+            peer.pacingRefilledAt = now;
+        }
+
+        /** Whether the clock allows this many bytes out right now.
+
+            Deliberately not part of CanSend. CanSend answers whether there is
+            ROOM, and the drain's peek asks it under a read lock where nothing
+            can be refilled or spent. This answers whether it is TIME, and is
+            only asked where the peer is write-locked, so the allowance is
+            topped up in the same breath. Folding the two together would let a
+            peer whose allowance reached zero stop nominating candidates, and it
+            would then never reach the write lock that refills it.
+
+            An untimed path is unpaced: with no round-trip sample there is no
+            rate to pace at, and the initial window is what bounds the opening
+            burst.
+
+            @pre Caller holds the peer write lock. */
+        bool PacingAllows(Peer& peer, uint64_t now, uint16_t wireSize) noexcept
+        {
+            if (peer.pathSrttMicros == 0) return true;
+            RefillPacing(peer, now);
+            return peer.pacingTokens >= wireSize;
+        }
+
         /** Pure predicate over the already-locked flow and peer, running every check
             a send needs. The window bounds PACKETS per flow (the receiver's dedupe
             guarantee; reliable only), the congestion budget bounds BYTES per peer
@@ -322,6 +381,8 @@ namespace bcp::flux
 
             flow.unresolved += 1;
             peer.bytesInFlight += wireSize;      // congestion spend
+            peer.pacingTokens = peer.pacingTokens > wireSize        // pacing spend
+                ? peer.pacingTokens - wireSize : 0;
             peer.outstandingToPeer += 1;         // grant spend
             flow.nextSeq = seq + 1;
             if (flow.nextSeq == 0) flow.nextSeq = 1;   // 0 is the never-sent sentinel
@@ -1080,7 +1141,7 @@ namespace bcp::flux
         @pre Caller holds the peer write lock; the peer is lent in. */
     SendAdmission FlowTable::AdmitOut(Peer& peer, uint32_t peerSlot, PacketSlot& packet,
                                       uint32_t packetSlot, uint16_t wireSize,
-                                      bool flying) noexcept
+                                      bool flying, uint64_t now) noexcept
     {
         // The peer is lent, already write-locked: no re-lookup. Take only the
         // flow lock (peer->flow), decide, and mutate.
@@ -1108,7 +1169,12 @@ namespace bcp::flux
         else
         {
             const bool unreliable = assoc->mode == FlowMode::UNRELIABLE;
-            if (assoc->waitingCount == 0 && CanSend(*assoc, peer, wireSize, !unreliable))
+            // Room and time are separate questions. Refused on time, a packet
+            // waits on the ring exactly as one refused on room does, and the
+            // tick releases it when the clock has caught up.
+            if (assoc->waitingCount == 0
+                && CanSend(*assoc, peer, wireSize, !unreliable)
+                && PacingAllows(peer, now, wireSize))
             {
                 StampFlowPacket(*assoc, peer, packet,
                                 unreliable ? common::collections::SlotPool::INVALID
@@ -1707,7 +1773,7 @@ namespace bcp::flux
     }
 
     bool FlowTable::ClaimWaiting(const WaitingCandidate& candidate, Peer& peer,
-                                 PacketSlot& packet) noexcept
+                                 PacketSlot& packet, uint64_t now) noexcept
     {
         // A concurrent Update may have drained the head between the peek and
         // this lock, so the current head is re-checked against the very slot
@@ -1724,7 +1790,8 @@ namespace bcp::flux
                 flow->Waiting()[flow->waitingHead & (flow->waitingCap - 1u)];
             const bool windowed = flow->mode != FlowMode::UNRELIABLE;
             if (head.packetSlot == candidate.packetSlot
-                && CanSend(*flow, peer, head.wireSize, windowed))
+                && CanSend(*flow, peer, head.wireSize, windowed)
+                && PacingAllows(peer, now, head.wireSize))
             {
                 const uint16_t wireSize = head.wireSize;
                 head = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };

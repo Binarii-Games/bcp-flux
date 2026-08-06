@@ -196,6 +196,17 @@ namespace bcp::flux
             here is only what the message claimed. */
         bool    confirmed;
 
+        /** Pacing. `pacingTokens` is how many bytes may still leave right now,
+            topped up from the rate since `pacingRefilledAt` and capped at a
+            small burst. Zero tokens with a live round-trip sample is the gate
+            saying wait, not saying no: the packet goes to a flow's waiting ring
+            and the tick releases it when the clock has caught up.
+
+            Untouched until a round trip has been measured, since there is no
+            rate to pace at before that. */
+        uint32_t pacingTokens;
+        uint64_t pacingRefilledAt;
+
         /** An event about this peer has been recorded and nobody has read it
             yet. Removal leaves the slot leased while it is set, so a later peer
             cannot land on the entry the event is sitting in, and whoever

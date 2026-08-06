@@ -138,6 +138,13 @@ namespace
             sender.Flush();
         }
 
+        // Sending is paced, so a flush no longer means a datagram left. Most of
+        // that burst is sitting on the association's waiting ring, and it takes
+        // ticks to come out. Cutting the link before that would lose the whole
+        // burst rather than a packet out of the middle of it, and there would be
+        // no gap to hold anything behind.
+        for (int i = 0; i < 60; ++i) Drive(sender, &receiver);
+
         // The control for this helper: with nothing lost there is no gap, and a
         // jam that then failed to appear would be measuring the harness.
         const bool lost = senderKernel->GetStats().dropped > dropped;

@@ -457,6 +457,8 @@ namespace bcp::flux
         p->outstandingToPeer    = 0;
         p->theirGrantGeneration = 0;
         p->ourGrantGeneration   = 0;
+        p->pacingTokens         = 0;
+        p->pacingRefilledAt     = 0;
         p->emitting             = false;
         p->freeWhenRead         = false;
         p->grantSendPending     = false;   // raised when a session commits

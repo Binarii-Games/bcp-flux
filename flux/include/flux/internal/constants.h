@@ -125,6 +125,27 @@ namespace bcp::flux::internal
     static constexpr uint8_t  CC_LOSS_RETAIN_PERCENT        = 85;
     static constexpr uint32_t CC_MIN_BUDGET_DEFAULT         = 2u * MAX_WIRE_PACKET_SIZE;
 
+    /** Pacing. The window says how much may be outstanding, not how fast it may
+        leave, and releasing it all at once is what overflows a queue that the
+        average rate would never have troubled. So the send gate also refuses a
+        packet that is within every other limit but ahead of the clock.
+
+        The rate is the congestion budget over the round trip, which is the
+        definition of the window: as much in flight as the path holds. The gain
+        is the headroom the window needs to grow, since pacing exactly at the
+        current rate means never sending more than the current window and never
+        discovering there is room for more.
+
+        The burst is how much may go back to back, which absorbs the coarseness
+        of releasing on a tick rather than on a timer, and the granularity of a
+        tick is why this is not the fine pacing a dedicated timer would give.
+
+        Nothing is paced before the first round-trip sample, because there is no
+        rate to pace at. The initial window bounds that opening burst instead,
+        which is what it is for. */
+    static constexpr uint32_t CC_PACING_GAIN_PERCENT        = 125;
+    static constexpr uint32_t CC_PACING_BURST_BYTES         = 2u * MAX_WIRE_PACKET_SIZE;
+
     // --- I/O ---
     static constexpr uint32_t  MAX_READ_PER_TICK            = 258;
 
