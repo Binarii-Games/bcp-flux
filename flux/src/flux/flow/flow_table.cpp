@@ -1285,7 +1285,7 @@ namespace bcp::flux
         if (!emitting) outAssocPool_.Release(flowSlot);
     }
 
-    void FlowTable::FailAssoc(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept
+    bool FlowTable::FailAssoc(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept
     {
         // FAILED, not freed: the app has to be able to see what happened, so
         // the slot stays leased until CloseFlow. What it held goes back now,
@@ -1294,18 +1294,27 @@ namespace bcp::flux
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(flowSlot));
 
+        // Already FAILED is not failed again. A peer answers every packet on a
+        // refused flow with its own rejection, so several arrive for one
+        // association, and re-running the drain would also let a caller report
+        // the same failure once per reply.
         uint32_t drained = 0;
-        if (flow->flowId == flowId && flow->life != FlowLifecycle::CLOSED)
+        bool     failed  = false;
+        if (flow->flowId == flowId
+            && flow->life != FlowLifecycle::CLOSED
+            && flow->life != FlowLifecycle::FAILED)
         {
             drained = DrainOutInflight(flow);
             DrainOutWaiting(flow);
             flow->life = FlowLifecycle::FAILED;
+            failed = true;
         }
         outAssocPool_.UnlockWrite(flowSlot);
 
         if (refundTo && drained)
             refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
                 ? drained : refundTo->bytesInFlight;
+        return failed;
     }
 
     void FlowTable::SweepPeer(uint32_t peerSlot) noexcept

@@ -2614,7 +2614,7 @@ namespace bcp::flux
         // the remote has never objected to.
         if (!flows_.OutAssocEpochIs(flowSlot, flowEpoch)) return;
 
-        flows_.FailAssoc(flowSlot, flowId, peer);
+        if (!flows_.FailAssoc(flowSlot, flowId, peer)) return;
         if (events_.Record(EventScope::OUT_FLOW, flowSlot,
                            readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
                            SocketEvent::OUTGOING_FLOW_REFUSED, from, flowId))
@@ -3052,8 +3052,8 @@ namespace bcp::flux
             {
                 if (Peer* dying = peerHandle.Write())
                 {
-                    flows_.FailAssoc(flowSlot, flowId, dying);
-                    if (events_.Record(EventScope::OUT_FLOW, flowSlot,
+                    const bool justFailed = flows_.FailAssoc(flowSlot, flowId, dying);
+                    if (justFailed && events_.Record(EventScope::OUT_FLOW, flowSlot,
                                        readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
                                        SocketEvent::OUTGOING_FLOW_LOST, addr, flowId))
                         flows_.MarkEmitting(EventScope::OUT_FLOW, flowSlot);

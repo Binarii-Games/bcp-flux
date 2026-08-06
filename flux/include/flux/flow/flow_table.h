@@ -367,7 +367,10 @@ namespace bcp::flux
         /** Fails one target of a flow, draining its rings and refunding what it
             held. The flow stays open for every other peer.
             @pre caller holds the peer write lock. */
-        void FailAssoc(uint32_t assocSlot, uint16_t flowId, Peer* refundTo) noexcept;
+        /** @return true only when this call is what moved the association to
+                    FAILED, so a caller reports the failure once however many
+                    times it is told. */
+        bool FailAssoc(uint32_t assocSlot, uint16_t flowId, Peer* refundTo) noexcept;
 
         /** Unpublishes one association from its peer's outbound directory, so
             no lookup reaches it while it is being torn down.
