@@ -27,11 +27,15 @@ namespace bcp::flux
         peer.outstandingToPeer -= delta.resolvedPackets <= peer.outstandingToPeer
             ? delta.resolvedPackets : peer.outstandingToPeer;
 
-        // Smooth the per-peer round-trip from the newest acked sample.
+        // The only place a measurement enters. The association gathered it
+        // under its own lock and reported it here, because a flow may never
+        // reach for a peer.
         if (delta.rttSampleMicros != 0)
-            peer.pathSrttMicros = peer.pathSrttMicros == 0
-                ? delta.rttSampleMicros
-                : (peer.pathSrttMicros * 7 + delta.rttSampleMicros) / 8;
+        {
+            const bool usable = peer.rtt.Sample(delta.rttSampleMicros, delta.ackDelayMicros);
+            assert(usable && "round trip sample out of band: check what produced sentAtMicros");
+            (void)usable;
+        }
 
         // Grow on acknowledged bytes: double the budget per round-trip below the
         // threshold, one packet per round-trip at or above it. Saturating, so
@@ -57,8 +61,7 @@ namespace bcp::flux
         // one-packet-per-round-trip crawl rather than doubling.
         if (delta.sawLoss)
         {
-            const uint32_t interval = peer.pathSrttMicros != 0
-                ? peer.pathSrttMicros : flows_.RetryIntervalMicros();
+            const uint32_t interval = peer.rtt.RoundTripOr(flows_.RetryIntervalMicros());
             if (peer.lastLossReactionMicros == 0
                 || nowMicros - peer.lastLossReactionMicros >= interval)
             {

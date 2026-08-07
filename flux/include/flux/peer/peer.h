@@ -7,6 +7,7 @@
 
 #include <flux/address.h>
 #include <flux/internal/constants.h>
+#include <flux/internal/rtt.h>
 #include <flux/peer/peer_id.h>
 
 namespace bcp::flux
@@ -181,7 +182,9 @@ namespace bcp::flux
 
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
                                           ///< at or above, it grows one packet per round-trip
-        uint32_t pathSrttMicros;          ///< smoothed round-trip time; 0 until the first sample
+        /** The path to this peer, and the deadline built from it. Every flow
+            to this peer shares it, because they all cross the same wire. */
+        internal::RttEstimate rtt;
         uint64_t lastLossReactionMicros;  ///< last trim, so a loss trims at most once per round-trip
 
         HandshakeState state;

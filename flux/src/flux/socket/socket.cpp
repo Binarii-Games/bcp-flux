@@ -3048,7 +3048,7 @@ namespace bcp::flux
             flowSlot = flows_.OutAssocAt(peerHandle.GetSlotIndex(), dirIndex);
             if (flowSlot == common::collections::SlotPool::INVALID) return;
 
-            flows_.RetransmitPass(flowSlot, now, ccDelta, flowId, resendSeqs, resendSlots,
+            flows_.RetransmitPass(flowSlot, *readPeer, now, ccDelta, flowId, resendSeqs, resendSlots,
                                   resendN, exhausted);
 
             // Out of retransmits: the remote stopped answering this target.
@@ -3215,7 +3215,9 @@ namespace bcp::flux
                 PeerHandle peerHandle = peers_.GetPeer(batch[b]);
                 if (peerHandle.Failed() || !peerHandle.Read()) continue;
 
-                const uint64_t deadline = flows_.NextDeadline(peerHandle.GetSlotIndex());
+                const Peer* readPeer = peerHandle.Read();
+                const uint64_t deadline =
+                    flows_.NextDeadline(peerHandle.GetSlotIndex(), *readPeer);
                 if (deadline != UINT64_MAX) consider(deadline);
             }
         }

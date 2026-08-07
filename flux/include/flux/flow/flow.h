@@ -6,6 +6,7 @@
 
 #include <flux/address.h>
 #include <flux/internal/constants.h>
+#include <flux/internal/rtt.h>
 #include <flux/peer/peer_id.h>
 
 // A flow is what the application opens; an association is the state a flow
@@ -264,6 +265,7 @@ namespace bcp::flux
         uint32_t resolvedPackets = 0;   ///< of those, the count, against the peer's grant
         uint32_t ackedBytes      = 0;   ///< of those, the acked ones; grow the budget
         uint32_t rttSampleMicros = 0;   ///< newest acked round-trip, 0 if none
+        uint32_t ackDelayMicros  = 0;   ///< how long the peer held that acknowledgement
         bool     sawLoss         = false;
     };
 
@@ -427,23 +429,6 @@ namespace bcp::flux
             Everything below it has been released, so it is the floor a
             receiver can no longer ask about. */
         uint32_t ackBase;
-
-        uint32_t srttMicros;    ///< 0 until the first sample
-        uint32_t rttvarMicros;
-
-        /** The longest this peer has recently admitted to holding an
-            acknowledgement, from the figure it reports in every one.
-
-            The timeout has to allow for it. A round trip sample has the hold
-            time taken out of it, so the smoothed value measures the path, while
-            the wait for an acknowledgement is the path plus however long the
-            far side sits on it. Without this term the timeout is built from one
-            quantity and compared against a larger one.
-
-            Peak with decay: it rises the instant a longer hold is seen, and
-            falls slowly, so a single stalled moment on the remote cannot pin
-            the timeout high for the rest of the connection. */
-        uint32_t peerAckDelayMicros;
 
         uint16_t inflightCap;
         uint16_t waitingCap;

@@ -285,7 +285,7 @@ namespace bcp::flux
         /** Soonest deadline across this peer's associations, UINT64_MAX when
             none is armed.
             @pre caller holds the peer read lock. */
-        [[nodiscard]] uint64_t NextDeadline(uint32_t peerSlot) noexcept;
+        [[nodiscard]] uint64_t NextDeadline(uint32_t peerSlot, const Peer& peer) noexcept;
 
         /** Writes the ack body for every association owing one, and clears what
             it acked. The peer is only read here, and the caller upgrades to
@@ -398,7 +398,8 @@ namespace bcp::flux
             attempts, which fails the association. Loss feedback accumulates in
             delta, never on the peer.
             @pre caller holds the peer read lock. */
-        void RetransmitPass(uint32_t assocSlot, uint64_t now, CongestionDelta& delta,
+        void RetransmitPass(uint32_t assocSlot, const Peer& peer,
+                            uint64_t now, CongestionDelta& delta,
                             uint16_t& outFlowId, uint32_t* resendSeqs, uint32_t* resendSlots,
                             uint32_t& resendCount, bool& exhausted) noexcept;
 
@@ -617,7 +618,8 @@ namespace bcp::flux
 
         void ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept;
 
-        void RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
+        void RetransmitInflight(OutAssociation& flow, const Peer& peer,
+                                uint64_t now, CongestionDelta& delta,
                                 /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots,
                                 uint32_t& resendCount, /*out*/ bool& exhausted) noexcept;
 

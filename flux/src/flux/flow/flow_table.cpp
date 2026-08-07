@@ -53,9 +53,6 @@ namespace bcp::flux
             assoc->nextSeq      = 1;
             assoc->unresolved   = 0;
             assoc->ackBase      = 1;
-            assoc->srttMicros   = 0;
-            assoc->rttvarMicros = 0;
-            assoc->peerAckDelayMicros = 0;
             assoc->inflightCap  = inflightCap;
             assoc->waitingCap   = waitingCap;
             assoc->waitingHead  = 0;
@@ -250,72 +247,6 @@ namespace bcp::flux
             return now > then ? now - then : 0;
         }
 
-        /** RTT smoothing (Jacobson/Karels), microseconds. */
-        void SampleRtt(OutAssociation* flow, uint64_t sampleMicros)
-        {
-            const uint32_t sample = sampleMicros > UINT32_MAX
-                ? UINT32_MAX : static_cast<uint32_t>(sampleMicros);
-            if (flow->srttMicros == 0)
-            {
-                flow->srttMicros   = sample;
-                flow->rttvarMicros = sample / 2;
-                return;
-            }
-            const uint32_t diff = flow->srttMicros > sample
-                ? flow->srttMicros - sample : sample - flow->srttMicros;
-            flow->rttvarMicros = (flow->rttvarMicros * 3 + diff) / 4;
-            flow->srttMicros   = (flow->srttMicros * 7 + sample) / 8;
-        }
-
-        /** The retransmit timeout: RTT-derived once sampled, else the Config
-            fallback, clamped to a 1 ms floor.
-
-            Three terms, and each covers a different way an acknowledgement can
-            be later than average. The smoothed round trip is the path. The
-            variance covers the path moving, floored so a steady path cannot
-            shrink the allowance to nothing. The peer's hold time covers the far
-            side waiting for a second packet before it answers, which the
-            smoothed value no longer contains because the sample has it
-            subtracted out. */
-        uint64_t RetransmitTimeout(const OutAssociation* flow, uint32_t fallbackMicros,
-                                   uint32_t ackCadenceMicros)
-        {
-            if (flow->srttMicros == 0)
-            {
-                const uint64_t fallback = fallbackMicros < 1000 ? 1000 : fallbackMicros;
-                return fallback > internal::RTO_MAX_MICROS
-                    ? internal::RTO_MAX_MICROS : fallback;
-            }
-
-            uint64_t variance = 4ull * flow->rttvarMicros;
-            if (variance < internal::RTO_VARIANCE_MIN_MICROS)
-                variance = internal::RTO_VARIANCE_MIN_MICROS;
-
-            // The allowance for the far side sitting on its answer. The cadence
-            // is the ceiling that side runs to, and the observed figure only
-            // ever describes the newest sequence in an acknowledgement, which is
-            // the one that waited least. In a stream of full packets that reads
-            // near zero while the older sequences in the same batch waited far
-            // longer, and it is those the timeout is measured against. So the
-            // cadence is the floor and a peer that holds longer than we would
-            // raises it.
-            uint64_t hold = ackCadenceMicros;
-            if (flow->peerAckDelayMicros > hold) hold = flow->peerAckDelayMicros;
-
-            const uint64_t rto = static_cast<uint64_t>(flow->srttMicros) + variance + hold;
-            if (rto < 1000) return 1000;
-            return rto > internal::RTO_MAX_MICROS ? internal::RTO_MAX_MICROS : rto;
-        }
-
-        /** Peak with decay, so a longer hold is believed at once and a one-off
-            stall on the remote fades instead of pinning the timeout high. */
-        void TrackPeerAckDelay(OutAssociation* flow, uint16_t reportedMicros)
-        {
-            flow->peerAckDelayMicros = reportedMicros > flow->peerAckDelayMicros
-                ? reportedMicros
-                : (flow->peerAckDelayMicros * 7 + reportedMicros) / 8;
-        }
-
         // --- The send gate, as decision then mutation ---
         // CanSend is a pure predicate over the (already-locked) flow and peer:
         // ring slot free, unresolved < inflightCap (reliable only), and the
@@ -344,7 +275,7 @@ namespace bcp::flux
             @pre Caller holds the peer write lock. */
         void RefillPacing(Peer& peer, uint64_t now) noexcept
         {
-            if (peer.pathSrttMicros == 0) return;
+            if (peer.rtt.srttMicros == 0) return;
 
             if (peer.pacingRefilledAt == 0 || now < peer.pacingRefilledAt)
             {
@@ -361,7 +292,7 @@ namespace bcp::flux
             const uint64_t gained =
                 static_cast<uint64_t>(peer.congestionBudget)
                 * internal::CC_PACING_GAIN_PERCENT * elapsed
-                / (100ull * peer.pathSrttMicros);
+                / (100ull * peer.rtt.srttMicros);
             if (gained == 0) return;   // keep the remainder for the next look
 
             const uint64_t topped = static_cast<uint64_t>(peer.pacingTokens) + gained;
@@ -387,7 +318,7 @@ namespace bcp::flux
             @pre Caller holds the peer write lock. */
         bool PacingAllows(Peer& peer, uint64_t now, uint16_t wireSize) noexcept
         {
-            if (peer.pathSrttMicros == 0) return true;
+            if (peer.rtt.srttMicros == 0) return true;
             RefillPacing(peer, now);
             return peer.pacingTokens >= wireSize;
         }
@@ -949,7 +880,7 @@ namespace bcp::flux
         return count;
     }
 
-    uint64_t FlowTable::NextDeadline(uint32_t peerSlot) noexcept
+    uint64_t FlowTable::NextDeadline(uint32_t peerSlot, const Peer& peer) noexcept
     {
         uint64_t soonest = UINT64_MAX;   // nothing armed
         auto consider = [&](uint64_t deadline) {
@@ -982,7 +913,8 @@ namespace bcp::flux
                 {
                     // Earliest RTO across in-flight entries; a full scan
                     // is bounded by the ring cap.
-                    const uint64_t rto = RetransmitTimeout(flow, retryIntervalMicros_, ackDelayMicros_);
+                    const uint64_t rto = peer.rtt.RetransmitTimeout(
+                        retryIntervalMicros_, ackDelayMicros_);
                     const uint32_t cap = flow->inflightCap;
                     const InFlightEntry* ring = flow->InFlight();
                     uint64_t oldest = 0;
@@ -1185,16 +1117,13 @@ namespace bcp::flux
                 // falls and a timeout built from a poisoned average stops
                 // firing at all. The assert is the point: a clamp that silently
                 // corrected this would hide the next one.
-                assert(sample <= internal::RTT_SAMPLE_MAX_MICROS
-                       && "round trip sample out of band: check what produced sentAtMicros");
-                if (sample != 0 && sample <= internal::RTT_SAMPLE_MAX_MICROS)
-                {
-                    SampleRtt(flow, sample);   // per-flow, for this flow's timeout
-                    // The timeout has to allow for the same hold time that was
-                    // just taken out of the sample.
-                    TrackPeerAckDelay(flow, remoteAckDelayMicros);
-                    delta.rttSampleMicros = static_cast<uint32_t>(sample);
-                }
+                // Reported, not folded. The estimate lives on the peer, an
+                // association may never reach for one, so the measurement
+                // travels up in the delta and the socket folds it under the
+                // peer's lock.
+                delta.rttSampleMicros = sample > UINT32_MAX
+                    ? UINT32_MAX : static_cast<uint32_t>(sample);
+                delta.ackDelayMicros  = remoteAckDelayMicros;
             }
 
             if (anyAcked) DeclareLostBelow(*flow, largestAcked, delta);
@@ -1817,7 +1746,8 @@ namespace bcp::flux
         }
     }
 
-    void FlowTable::RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
+    void FlowTable::RetransmitInflight(OutAssociation& flow, const Peer& peer,
+                                       uint64_t now, CongestionDelta& delta,
                                        uint32_t* resendSeqs, uint32_t* resendSlots,
                                        uint32_t& resendCount, bool& exhausted) noexcept
     {
@@ -1825,7 +1755,7 @@ namespace bcp::flux
         // collected for retransmit (refresh sentAt, keep them in flight);
         // unreliable ones are declared lost and resolved. Loss feedback goes into
         // `delta`, never the peer: the caller applies it under the peer lock.
-        const uint64_t rto  = RetransmitTimeout(&flow, retryIntervalMicros_, ackDelayMicros_);
+        const uint64_t rto  = peer.rtt.RetransmitTimeout(retryIntervalMicros_, ackDelayMicros_);
         const uint32_t cap  = flow.inflightCap;
         const FlowMode mode = flow.mode;
         InFlightEntry* ring = flow.InFlight();
@@ -1889,7 +1819,8 @@ namespace bcp::flux
         }
     }
 
-    void FlowTable::RetransmitPass(uint32_t assocSlot, uint64_t now, CongestionDelta& delta,
+    void FlowTable::RetransmitPass(uint32_t assocSlot, const Peer& peer,
+                                   uint64_t now, CongestionDelta& delta,
                                    uint16_t& outFlowId, uint32_t* resendSeqs,
                                    uint32_t* resendSlots, uint32_t& resendCount,
                                    bool& exhausted) noexcept
@@ -1901,7 +1832,7 @@ namespace bcp::flux
         switch (flow->life)
         {
         case FlowLifecycle::OPEN:
-            RetransmitInflight(*flow, now, delta, resendSeqs, resendSlots, resendCount,
+            RetransmitInflight(*flow, peer, now, delta, resendSeqs, resendSlots, resendCount,
                                exhausted);
             break;
         default: break;
