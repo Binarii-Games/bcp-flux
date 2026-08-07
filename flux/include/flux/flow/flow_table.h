@@ -315,7 +315,7 @@ namespace bcp::flux
             closed, and its sequence numbers mean something else now.
             @pre caller holds the peer read lock. */
         void ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
-                            uint32_t remoteRecvNext,
+                            uint32_t remoteRecvNext, uint16_t remoteAckDelayMicros,
                             const AckRange* ranges, uint8_t count, uint64_t now,
                             CongestionDelta& delta) noexcept;
 
@@ -596,9 +596,13 @@ namespace bcp::flux
 
         /** Resolve one in-flight entry (acked or lost); accumulate feedback into
             `delta` (never touches the peer). The socket does the peer-side
-            arithmetic under the peer's write lock. */
+            arithmetic under the peer's write lock.
+
+            The round-trip sample is not taken here. One acknowledgement yields
+            one sample, from the newest sequence it resolves, and only the
+            caller sweeping the ring can tell which entry that is. */
         void ResolveOutEntry(OutAssociation* flow, InFlightEntry& entry,
-                             bool acked, uint64_t nowMicros, CongestionDelta& delta) noexcept;
+                             bool acked, CongestionDelta& delta) noexcept;
 
         /** Free the retained copies below the receiver's reported cursor and
             advance ackBase past them. An acknowledged packet is kept until then

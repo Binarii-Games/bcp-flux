@@ -431,6 +431,20 @@ namespace bcp::flux
         uint32_t srttMicros;    ///< 0 until the first sample
         uint32_t rttvarMicros;
 
+        /** The longest this peer has recently admitted to holding an
+            acknowledgement, from the figure it reports in every one.
+
+            The timeout has to allow for it. A round trip sample has the hold
+            time taken out of it, so the smoothed value measures the path, while
+            the wait for an acknowledgement is the path plus however long the
+            far side sits on it. Without this term the timeout is built from one
+            quantity and compared against a larger one.
+
+            Peak with decay: it rises the instant a longer hold is seen, and
+            falls slowly, so a single stalled moment on the remote cannot pin
+            the timeout high for the rest of the connection. */
+        uint32_t peerAckDelayMicros;
+
         uint16_t inflightCap;
         uint16_t waitingCap;
 
@@ -579,6 +593,17 @@ namespace bcp::flux
         /** When this association first owed an ack. The deadline is this plus
             Config::timers::ackDelayMicros; 0 means nothing is owed. */
         uint64_t ackArmedMicros;
+
+        /** When the newest sequence this association will report arrived. The
+            reply carries now minus this, so the sender can subtract the time we
+            sat on it and measure the path rather than our ack cadence.
+
+            A different moment from ackArmedMicros, which is when the FIRST
+            unanswered arrival started the deadline. Acking every second packet
+            makes those two the ends of the same wait, and the sender takes its
+            sample against the newest, so that is the one to report. Zero until
+            something has been committed. */
+        uint64_t newestArrivalMicros;
 
         uint16_t windowBits;    ///< seen-bitmap width, the window for this mode
         uint16_t reorderCap;

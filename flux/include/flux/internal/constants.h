@@ -108,8 +108,14 @@ namespace bcp::flux::internal
     static constexpr uint32_t HANDSHAKE_RETRY_DEFAULT       = 200000;  ///< used when Config leaves it at zero
 
     /** Bytes in front of a FLOW_ACK entry's ranges:
-        [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)]. */
-    static constexpr uint8_t  WIRE_ACK_ENTRY_HEAD_SIZE      = 8;
+        [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][ackDelay(2)].
+
+        ackDelay is how long this reply was held after the newest sequence it
+        reports arrived. The sender takes it back out of the round trip, which
+        then measures the path instead of the path plus the far side's ack
+        cadence. Microseconds, saturating, so the ceiling is about 65 ms against
+        a cadence measured in single milliseconds. */
+    static constexpr uint8_t  WIRE_ACK_ENTRY_HEAD_SIZE      = 10;
 
     /** Ranges per flow, per FLOW_ACK packet, bounding wire bytes. The list is
         built from the newest seq downward, so what a cap discards is always the
@@ -153,6 +159,45 @@ namespace bcp::flux::internal
         than gone, and declaring it lost would cost a needless retransmit and,
         worse, a congestion reaction on a path that was fine. */
     static constexpr uint32_t LOSS_PACKET_THRESHOLD         = 3;
+
+    /** Smallest the variance half of the retransmit timeout may be.
+
+        Variance is what separates the timeout from the average round trip, and
+        on a steady path it decays towards nothing. The average is the middle of
+        the distribution, so a timeout that sits on it expires on about half of
+        all acknowledgements, every one of which is then read as congestion.
+        Measured on a clean 40 ms link the margin fell to 256 microseconds and
+        the sender declared 582 losses in eight seconds without a single packet
+        being dropped.
+
+        One millisecond is the same lower bound the timeout already had on its
+        own, and the same granularity RFC 9002 gives QUIC. */
+    static constexpr uint32_t RTO_VARIANCE_MIN_MICROS       = 1000;
+
+    /** Largest round trip that can be a measurement rather than a mistake.
+
+        Ten seconds is more than an order of magnitude past the worst real path,
+        including a geostationary hop with a full buffer in front of it. A
+        sample beyond it did not come from the network, it came from subtracting
+        something that was never a timestamp, and folding it into the smoothed
+        value poisons every decision built on that value afterwards. One such
+        sample once produced a smoothed round trip of 54 hours, which put the
+        retransmit timeout past any clock and stopped the flow without failing
+        it. Out of band samples are dropped, and an assert reports them, because
+        a clamp that quietly corrects a wrong number means the next one is never
+        found. */
+    static constexpr uint32_t RTT_SAMPLE_MAX_MICROS         = 10000000;
+
+    /** Largest the retransmit timeout may be.
+
+        RTT_SAMPLE_MAX_MICROS already bounds everything the timeout derives from
+        the network. This bounds the other input: the Config fallback used
+        before the first sample arrives, which is whatever the application set
+        and is not otherwise checked. Sixty seconds is the same ceiling TCP
+        uses. Its job is to make a silent flow eventually try again rather than
+        wait forever, so the worst outcome of a bad number is slow instead of
+        dead. */
+    static constexpr uint32_t RTO_MAX_MICROS                = 60000000;
 
     /** Acknowledge at least this often, in packets, rather than only when the
         delay expires. Holding a reply is worth it on a quiet link, where it

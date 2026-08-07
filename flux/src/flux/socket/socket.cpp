@@ -2625,11 +2625,14 @@ namespace bcp::flux
     void Socket::Flow_Ack(const Address& from, const uint8_t* payload, size_t len)
     {
         // Answers OUR sent packets: OUT side. Body is a run of
-        // [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][first(4),last(4)]*count
-        // for one peer. The epoch names which generation of that id the entry
-        // belongs to, and an entry naming any other one resolves nothing.
-        // recvNext is the remote's delivery cursor: everything below it has
-        // been handed to its application and can never be asked for again.
+        // [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][ackDelay(2)]
+        // [first(4),last(4)]*count for one peer. The epoch names which
+        // generation of that id the entry belongs to, and an entry naming any
+        // other one resolves nothing. recvNext is the remote's delivery cursor:
+        // everything below it has been handed to its application and can never
+        // be asked for again. ackDelay is how long the remote sat on this reply
+        // after the newest sequence it names arrived, which comes back out of
+        // the round trip so what we measure is the path.
         if (!flows_.SendEnabled()) return;
         const uint64_t now = common::MonotonicMicros();
 
@@ -2655,6 +2658,8 @@ namespace bcp::flux
                                           | static_cast<uint32_t>(payload[off + 5]) << 8
                                           | static_cast<uint32_t>(payload[off + 6]) << 16
                                           | static_cast<uint32_t>(payload[off + 7]) << 24;
+            const uint16_t remoteAckDelay = static_cast<uint16_t>(payload[off + 8])
+                                          | static_cast<uint16_t>(payload[off + 9]) << 8;
             off += internal::WIRE_ACK_ENTRY_HEAD_SIZE;
             if (rangeCount > internal::FLOW_ACK_RANGE_COUNT) break;   // malformed: apply what we have
 
@@ -2676,7 +2681,7 @@ namespace bcp::flux
             if (truncated) break;
 
             flows_.ApplyAckRanges(peerSlot, flowId, flowEpoch, remoteRecvNext,
-                                  ranges, rangeCount, now, ccDelta);
+                                  remoteAckDelay, ranges, rangeCount, now, ccDelta);
         }
 
         // Apply the gathered feedback once, on the same handle upgraded to

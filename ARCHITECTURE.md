@@ -648,8 +648,8 @@ cursor past that sequence, which is the point where it can no longer ask for it.
 
 #### The acknowledgement carries a cursor as well as ranges
 
-An entry is `[flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)]` followed by that
-many `[first(4)][last(4)]` pairs.
+An entry is `[flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][ackDelay(2)]`
+followed by that many `[first(4)][last(4)]` pairs.
 
 `recvNext` is the receiver's delivery cursor. Everything below it has reached
 the application and can never be requested again, so it is what the sender
@@ -668,6 +668,24 @@ A flow that has just given up its buffered packets sends an entry with no ranges
 at all. The cursor is then the whole message, and it is the only way the sender
 learns that copies it had already released on the strength of an acknowledgement
 are owed again.
+
+#### The acknowledgement says how long it was held
+
+A reply waits for a second packet or for the ack timer, so anything up to the
+full ack delay passes between an arrival and the reply going out. Measured raw,
+that wait looks exactly like a slower path.
+
+The entry carries it instead. `ackDelay` is the microseconds between the newest
+sequence in the entry arriving and the reply leaving, and the sender takes it
+back out of the round trip. It saturates at about 65 milliseconds, well past any
+cadence a receiver runs at, and saturating makes the sender subtract too little,
+so an overflow reads as a slow path rather than a fast one.
+
+The sender takes one sample per acknowledgement, from the newest sequence that
+acknowledgement resolves for the first time, which is the sequence the hold time
+was measured against. A sequence that has been retransmitted is skipped. The
+reply cannot say which transmission it answers, and measuring from the most
+recent send would give a sample shorter than the path.
 
 ### 3.7 Lifecycles
 
