@@ -580,7 +580,8 @@ namespace bcp::flux
                                             const BcpId& peerId, uint16_t flowId,
                                             uint8_t flowData) noexcept;
 
-        [[nodiscard]] uint32_t DrainOutInflight(OutAssociation* flow) noexcept;
+        [[nodiscard]] uint32_t DrainOutInflight(OutAssociation* flow,
+                                          uint32_t* outPackets = nullptr) noexcept;
         void DrainOutWaiting(OutAssociation* flow) noexcept;
         /** Frees every packet this association is buffering behind its gap and
             clears their bits from the seen window, so a resend is not taken for

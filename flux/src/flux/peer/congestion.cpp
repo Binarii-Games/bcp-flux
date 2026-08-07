@@ -69,8 +69,14 @@ namespace bcp::flux
             constexpr int64_t OFFSET_LIMIT = 2000000;   // well past any real curve
             const int64_t bounded = offset >  OFFSET_LIMIT ?  OFFSET_LIMIT
                                   : offset < -OFFSET_LIMIT ? -OFFSET_LIMIT : offset;
+            // One expression, divided once. Cubing three separately truncated
+            // second counts is C * floor(t)^3, which is zero for any offset
+            // under a second and flat in whole-second steps after it. With K
+            // typically two to four seconds that resolved the entire concave
+            // phase to a couple of values and left the curve contributing
+            // nothing, so the controller was Reno wearing CUBIC's name.
             const int64_t growth = static_cast<int64_t>(cBytes)
-                                 * (bounded / 1000) * (bounded / 1000) * (bounded / 1000);
+                                 * bounded * bounded * bounded / 1000000000ll;
 
             const int64_t window = static_cast<int64_t>(wMaxBytes) + growth;
             if (window < 0) return 0;
@@ -139,10 +145,20 @@ namespace bcp::flux
                 // a curve from a two packet window, and a path that has just
                 // come back deserves to find its capacity the fast way, exactly
                 // as a new one would.
-                peer.congestionBudget      = minCongestionBudget_;
-                peer.wMaxBytes             = minCongestionBudget_;
-                peer.congestionEpochMicros = nowMicros;
-                ++peer.congestionEpoch;
+                // Only when it changes something. This fires on every resend
+                // round through a stall, and the epoch is what bounds the
+                // response to one trim per congestion event: walking it on a
+                // collapse that has already happened eventually carries it
+                // past the stamp on packets still in flight, and the signed
+                // comparison then reads genuinely new losses as old ones and
+                // stops trimming for them at all.
+                if (peer.congestionBudget != minCongestionBudget_)
+                {
+                    peer.congestionBudget      = minCongestionBudget_;
+                    peer.wMaxBytes             = minCongestionBudget_;
+                    peer.congestionEpochMicros = nowMicros;
+                    ++peer.congestionEpoch;
+                }
             }
         }
 
@@ -199,6 +215,13 @@ namespace bcp::flux
             const uint32_t retain = congested ? internal::CC_LOSS_RETAIN_PERCENT
                                               : internal::CC_NOISE_RETAIN_PERCENT;
 
+            // Captured before the cut. wMax is the curve's memory of where
+            // trouble was found, and the whole shape depends on it naming the
+            // window that was actually running when it appeared. Recording the
+            // trimmed value instead puts the plateau below where we already
+            // know the path reaches, and every event ratchets it down again.
+            const uint32_t budgetAtLoss = peer.congestionBudget;
+
             uint32_t trimmed = static_cast<uint32_t>(
                 static_cast<uint64_t>(peer.congestionBudget) * retain / 100);
             if (trimmed < minCongestionBudget_) trimmed = minCongestionBudget_;
@@ -217,7 +240,7 @@ namespace bcp::flux
             // keeps climbing through it and the trim is the whole cost.
             if (congested)
             {
-                peer.wMaxBytes             = peer.congestionBudget;
+                peer.wMaxBytes             = budgetAtLoss;
                 peer.slowStartThreshold    = trimmed;
                 peer.congestionEpochMicros = nowMicros;
             }

@@ -2702,7 +2702,18 @@ namespace bcp::flux
         // write. The upgrade drops the read lock before taking write, so the
         // peer is revalidated on the other side of the gap.
         Peer* peer = peerHandle.Write();
-        if (peer && peer->IsValid()) ApplyCongestion(*peer, ccDelta, now);
+        if (peer && peer->IsValid())
+        {
+            // This reply arrived and named this peer, so the peer is there.
+            // That is true whether or not its ranges resolved anything: an ack
+            // for a generation we have already moved past resolves nothing and
+            // is still proof of life, and so is a pure duplicate. Reading the
+            // silence off resolved bytes instead let a peer answering
+            // continuously look dead, which backs the timeout off, collapses
+            // the window, and eventually evicts it.
+            peer->rtt.MarkAcked(now);
+            ApplyCongestion(*peer, ccDelta, now);
+        }
     }
 
     void Socket::FlushPeerAcks(const Address& addr, PeerHandle peer)

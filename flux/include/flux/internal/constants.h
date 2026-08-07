@@ -243,6 +243,32 @@ namespace bcp::flux::internal
         Measured on a 25 percent loss link that stalled a transfer outright. */
     static constexpr uint32_t RTO_MAX_BACKOFF_SHIFT         = 3;
 
+    /** Round trips of silence before a sending association is declared dead.
+
+        A time, not a count of attempts. A count spends itself in a burst on a
+        lossy but living link and stretches over minutes on a slow one, and
+        both are the wrong verdict. Sixteen because on a link losing a quarter
+        of everything the chance of that many consecutive probes all failing is
+        about one in ten billion, so it is a conclusion rather than a guess.
+
+        Deliberately NOT the flow stall timeout. That one is the receiver
+        reclaiming buffer it is pinning for a gap nobody is filling, and it is
+        generous on purpose because it is about memory. This asks whether the
+        far side has stopped answering, which is a question about the path, so
+        it is measured in the path's own units. */
+    static constexpr uint32_t FLOW_DEATH_ROUNDS             = 16;
+
+    /** Fewest probes that must go unanswered before that verdict is allowed.
+
+        The backoff and the deadline have to agree about the same silence. Left
+        independent they multiply: the interval grows, the window collapses
+        beside it, and the offered rate falls far enough that the deadline
+        expires having asked two or three times. A verdict of death taken on
+        three questions is a guess, so the interval is capped at the deadline
+        divided by this, and the doubling is spent inside the window instead of
+        eating it. */
+    static constexpr uint32_t FLOW_DEATH_MIN_PROBES         = 8;
+
     /** Unanswered probes before the path is treated as gone rather than
         congested. Three is the same count RFC 9002 uses. At that point trimming
         a percentage off the budget is arithmetic on a number that no longer

@@ -927,16 +927,40 @@ namespace bcp::flux
                 {
                     // Earliest RTO across in-flight entries; a full scan
                     // is bounded by the ring cap.
-                    const uint64_t rto = peer.rtt.RetransmitTimeout(
+                    // The same cap the retransmit scan applies, so the
+                    // deadline this reports is the one that will actually
+                    // fire.
+                    const uint64_t rtoBase = peer.rtt.RetransmitTimeout(
+                        retryIntervalMicros_, ackDelayMicros_);
+                    uint64_t bound = internal::FLOW_DEATH_ROUNDS * rtoBase;
+                    if (bound < retryIntervalMicros_) bound = retryIntervalMicros_;
+                    uint64_t probeCap = bound / internal::FLOW_DEATH_MIN_PROBES;
+                    if (probeCap < rtoBase) probeCap = rtoBase;
+                    uint64_t rto = peer.rtt.RetransmitTimeout(
                         retryIntervalMicros_, ackDelayMicros_, now);
+                    if (rto > probeCap) rto = probeCap;
                     const uint32_t cap = flow->inflightCap;
                     const InFlightEntry* ring = flow->InFlight();
+                    // `found` is tracked apart from the value, because zero is
+                    // a stored send time meaning "overdue, go now" as well as
+                    // the empty answer. Folding the two makes the result depend
+                    // on ring order: a zero seen last erases a real deadline,
+                    // and a zero seen first is overwritten by a later one. An
+                    // entry carrying it is due immediately, which is exactly
+                    // when a caller sizing a blocking wait must not sleep.
                     uint64_t oldest = 0;
+                    bool     found  = false;
                     for (uint32_t k = 0; k < cap; ++k)
-                        if (ring[k].seq != 0 && !ring[k].acked &&
-                            (oldest == 0 || ring[k].sentAtMicros < oldest))
+                    {
+                        if (ring[k].seq == 0 || ring[k].acked) continue;
+                        if (ring[k].sentAtMicros == 0) { oldest = 0; found = true; break; }
+                        if (!found || ring[k].sentAtMicros < oldest)
+                        {
                             oldest = ring[k].sentAtMicros;
-                    if (oldest != 0) consider(oldest + rto);
+                            found  = true;
+                        }
+                    }
+                    if (found) consider(oldest == 0 ? now : oldest + rto);
                 }
                 outAssocPool_.UnlockRead(dir[i].flowSlot);
             }
@@ -1156,7 +1180,7 @@ namespace bcp::flux
             {
                 flow->lastResolvedMicros = now;
                 DeclareLostBelow(*flow, largestAcked, now,
-                                 peer.rtt.LossDelayMicros(), delta);
+                                 peer.rtt.LossDelayMicros(retryIntervalMicros_), delta);
             }
             ReleaseAckedRun(*flow, remoteRecvNext);
         }
@@ -1381,6 +1405,24 @@ namespace bcp::flux
                 // ever be completed. Drain first: the reset only stamps the
                 // hold-back entries free, and the slots they name are ours to
                 // release.
+                //
+                // The mode has to be the one this slot was cut for. A slot's
+                // stride is fixed by the sub-pool it came from at first
+                // registration, and the reset writes a seen bitmap and a
+                // hold-back ring sized from the mode it is handed. A remote
+                // that registers an id as standard and reopens it as bulk
+                // would have us lay 8 KB of ring into a 2 KB slot, off the end
+                // and into whatever the pool put next. Two bytes on the wire,
+                // chosen by the sender, so this is refused rather than
+                // reasoned about: the remote is told, and it may open a
+                // different id for the other mode.
+                if (inAssocPool_.IsBulk(existing)
+                        != (mode == FlowMode::RELIABLE_ORDERED_BULK))
+                {
+                    inAssocPool_.UnlockWrite(existing);
+                    return FlowAdmit::Rejected;
+                }
+
                 DrainInHoldback(assoc);
                 ResetInAssoc(assoc, peerSlot, from, &peerId, flowId, mode,
                              flowEpoch, WindowFor(mode), ReorderCapFor(mode));
@@ -1474,7 +1516,8 @@ namespace bcp::flux
 
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(flowSlot));
-        const uint32_t drained = DrainOutInflight(flow);
+        uint32_t drainedPackets = 0;
+        const uint32_t drained = DrainOutInflight(flow, &drainedPackets);
         DrainOutWaiting(flow);
         flow->life = FlowLifecycle::CLOSED;
         // An unread event about this association is sitting in the slot's event
@@ -1485,8 +1528,18 @@ namespace bcp::flux
         outAssocPool_.UnlockWrite(flowSlot);
 
         if (refundTo)
+        {
             refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
                 ? drained : refundTo->bytesInFlight;
+            // The grant these packets spent goes back too. It is only ever
+            // repaid by an acknowledgement, and one that never comes would
+            // otherwise leave the spend charged for the life of the peer,
+            // until the send gate refuses every flow to it with nothing able
+            // to notice: the death clock only watches associations that still
+            // owe packets, and this one owes none.
+            refundTo->outstandingToPeer -= drainedPackets <= refundTo->outstandingToPeer
+                ? drainedPackets : refundTo->outstandingToPeer;
+        }
         if (!emitting) outAssocPool_.Release(flowSlot);
     }
 
@@ -1503,13 +1556,14 @@ namespace bcp::flux
         // refused flow with its own rejection, so several arrive for one
         // association, and re-running the drain would also let a caller report
         // the same failure once per reply.
-        uint32_t drained = 0;
+        uint32_t drained        = 0;
+        uint32_t drainedPackets = 0;
         bool     failed  = false;
         if (flow->flowId == flowId
             && flow->life != FlowLifecycle::CLOSED
             && flow->life != FlowLifecycle::FAILED)
         {
-            drained = DrainOutInflight(flow);
+            drained = DrainOutInflight(flow, &drainedPackets);
             DrainOutWaiting(flow);
             flow->life = FlowLifecycle::FAILED;
             failed = true;
@@ -1517,8 +1571,12 @@ namespace bcp::flux
         outAssocPool_.UnlockWrite(flowSlot);
 
         if (refundTo && drained)
+        {
             refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
                 ? drained : refundTo->bytesInFlight;
+            refundTo->outstandingToPeer -= drainedPackets <= refundTo->outstandingToPeer
+                ? drainedPackets : refundTo->outstandingToPeer;
+        }
         return failed;
     }
 
@@ -1567,14 +1625,19 @@ namespace bcp::flux
 
     // --- Ring drains ---
 
-    uint32_t FlowTable::DrainOutInflight(OutAssociation* flow) noexcept
+    uint32_t FlowTable::DrainOutInflight(OutAssociation* flow,
+                                         uint32_t* outPackets) noexcept
     {
-        uint32_t drainedBytes = 0;
+        uint32_t drainedBytes   = 0;
+        uint32_t drainedPackets = 0;
         InFlightEntry* ring = flow->InFlight();
         for (uint32_t i = 0; i < flow->inflightCap; ++i)
         {
             if (ring[i].seq != 0 && !ring[i].acked)
+            {
                 drainedBytes += ring[i].wireSize;   // still in flight: refund
+                ++drainedPackets;                   // and the grant it spent
+            }
             if (ring[i].packetSlot != common::collections::SlotPool::INVALID)
                 stagingPool_.Release(ring[i].packetSlot);
             ring[i].packetSlot = common::collections::SlotPool::INVALID;
@@ -1583,6 +1646,7 @@ namespace bcp::flux
             ring[i].acked      = false;
         }
         flow->unresolved = 0;
+        if (outPackets) *outPackets = drainedPackets;
         return drainedBytes;
     }
 
@@ -1635,8 +1699,23 @@ namespace bcp::flux
         HoldbackEntry* ring = flow->Holdback();
         for (uint32_t i = 0; i < flow->reorderCap; ++i)
         {
-            if (ring[i].packetSlot != common::collections::SlotPool::INVALID)
-                recvPool_->Release(ring[i].packetSlot);
+            if (ring[i].packetSlot == common::collections::SlotPool::INVALID)
+                continue;
+
+            // Every count that was raised when the packet was held comes back
+            // down with it. Releasing the slot alone turns two occupancy
+            // measurements into monotonic event counts: the socket-wide held
+            // total gates HasRoomFor and is reset nowhere, so a leak there
+            // eventually refuses hold-back for every peer, and the per-peer
+            // pin is charged against that peer's grant for as long as it
+            // lives. This differs from DropInHoldback only in leaving the seen
+            // bit alone, because the whole generation is going away and the
+            // sender will not be resending into it.
+            recvPool_->Release(ring[i].packetSlot);
+            peerRecvStates_[flow->peerSlot].ReleaseOne();
+            heldTotal_->fetch_sub(1, std::memory_order_relaxed);
+            if (flow->heldCount > 0) --flow->heldCount;
+
             ring[i].packetSlot = common::collections::SlotPool::INVALID;
             ring[i].seq = 0;
         }
@@ -1654,8 +1733,21 @@ namespace bcp::flux
 
         delta.resolvedBytes += entry.wireSize;
         delta.resolvedPackets += 1;
-        if (acked) delta.ackedBytes += entry.wireSize;
-        else       delta.sawLoss = true;
+        if (acked)
+        {
+            delta.ackedBytes += entry.wireSize;
+        }
+        else
+        {
+            // The epoch travels with the verdict. The peer discards a loss
+            // whose epoch is older than its own, so reporting one without
+            // naming it leaves the default of zero and the whole signal is
+            // dropped for every epoch from one to a hundred and twenty eight.
+            if (!delta.sawLoss
+                || static_cast<int8_t>(entry.congestionEpoch - delta.lostEpoch) > 0)
+                delta.lostEpoch = entry.congestionEpoch;
+            delta.sawLoss = true;
+        }
 
         if (flow->unresolved > 0) --flow->unresolved;
 
@@ -1811,25 +1903,40 @@ namespace bcp::flux
         // collected for retransmit (refresh sentAt, keep them in flight);
         // unreliable ones are declared lost and resolved. Loss feedback goes into
         // `delta`, never the peer: the caller applies it under the peer lock.
-        const uint64_t rto  = peer.rtt.RetransmitTimeout(retryIntervalMicros_, ackDelayMicros_,
-                                                         now);
+        // Three quantities from one measurement, and they have to agree.
+        //
+        // `base` is the timeout this path has earned, with no backoff. The
+        // deadline is a multiple of it, so a slow path gets proportionally
+        // longer to answer and a fast one is not left waiting on a constant
+        // that has nothing to do with it.
+        //
+        // The probe interval is then capped so at least FLOW_DEATH_MIN_PROBES
+        // of them fit inside that deadline. Backing off is right, and it must
+        // not be allowed to shrink the evidence the verdict is taken on: with
+        // the interval free to grow while the window collapses alongside it,
+        // the offered rate fell far enough that the deadline expired having
+        // asked three times, on a link that was merely lossy. Never below
+        // `base`, so a genuinely slow measured path is never rushed.
+        const uint64_t base = peer.rtt.RetransmitTimeout(retryIntervalMicros_,
+                                                         ackDelayMicros_);
+        uint64_t deathBound = internal::FLOW_DEATH_ROUNDS * base;
+        if (deathBound < retryIntervalMicros_) deathBound = retryIntervalMicros_;
+
+        uint64_t probeCap = deathBound / internal::FLOW_DEATH_MIN_PROBES;
+        if (probeCap < base) probeCap = base;
+
+        uint64_t rto = peer.rtt.RetransmitTimeout(retryIntervalMicros_, ackDelayMicros_,
+                                                  now);
+        if (rto > probeCap) rto = probeCap;
 
         // The death, judged before anything is resent. Owing packets and
-        // resolving none for the whole bound means this target has stopped
-        // answering the flow. Elapsed time rather than an attempt count: a
-        // count spends itself in a burst on a lossy-but-alive link and takes
-        // minutes on a slow one, and both are the wrong verdict. The round
-        // trip term keeps a genuinely slow path alive, the stall term keeps
-        // the bound tight everywhere else.
-        if (flow.unresolved > 0)
+        // resolving none for the whole deadline means this target has stopped
+        // answering the flow.
+        if (flow.unresolved > 0
+            && Elapsed(now, flow.lastResolvedMicros) > deathBound)
         {
-            uint64_t bound = 3 * rto;
-            if (bound < flowStallTimeout_) bound = flowStallTimeout_;
-            if (Elapsed(now, flow.lastResolvedMicros) > bound)
-            {
-                assocDead = true;
-                return;   // the caller fails it; resending into silence buys nothing
-            }
+            assocDead = true;
+            return;   // the caller fails it; resending into silence buys nothing
         }
 
         const uint32_t cap  = flow.inflightCap;
@@ -1846,7 +1953,13 @@ namespace bcp::flux
                 // old the flow is stalled anyway, so re-offering costs a packet
                 // and is the only path by which a dropped one comes back. It is
                 // not a loss: no budget trim, no retry spent.
-                if (Elapsed(now, entry.sentAtMicros) < flowStallTimeout_) continue;
+                // Zero is the resend marker, not a time, so an entry carrying
+                // it is not old, it is unsent. Reading it as a timestamp makes
+                // the machine's uptime the age and re-offers an acknowledged
+                // packet on every tick, ahead of genuinely lost ones in the
+                // per-tick budget.
+                if (entry.sentAtMicros == 0
+                    || Elapsed(now, entry.sentAtMicros) < flowStallTimeout_) continue;
                 if (entry.packetSlot != common::collections::SlotPool::INVALID
                     && resendCount < RESENDS_PER_ASSOC_PER_TICK)
                 {
@@ -1872,9 +1985,10 @@ namespace bcp::flux
             if (mode == FlowMode::UNRELIABLE)
             {
                 // Never resent, so there is nothing to probe with and nothing
-                // the application can do about it. Resolve it and move on.
+                // the application can do about it. Resolve it and move on,
+                // which is also what reports the loss and the epoch it
+                // belongs to.
                 ResolveOutEntry(&flow, entry, false, delta);
-                delta.sawLoss = true;
             }
             else
             {
@@ -1886,8 +2000,15 @@ namespace bcp::flux
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
                     entry.sentAtMicros = now;   // don't re-fire before next deadline
-                    if (entry.freeResend) entry.freeResend = false;
-                    else                  ++entry.retries;
+                    // Saturating. Nothing bounds this count since the give-up
+                    // moved to a clock, and it is the marker that keeps a
+                    // retransmitted packet out of the round-trip sample. A
+                    // wrap to zero would make one sample-eligible again and
+                    // measure it from its last resend, which forges a round
+                    // trip below the physical path into a minimum that only
+                    // ever falls.
+                    if (entry.freeResend)                 entry.freeResend = false;
+                    else if (entry.retries < UINT8_MAX)   ++entry.retries;
                 }
             }
         }

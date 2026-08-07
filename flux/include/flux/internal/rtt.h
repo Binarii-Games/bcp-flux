@@ -230,9 +230,17 @@ namespace bcp::flux::internal
             path that has just slowed has not moved the average yet. Nine
             eighths is the spare eighth that separates a reordered packet from a
             lost one, and it is the figure RFC 9002 uses. */
-        [[nodiscard]] uint64_t LossDelayMicros() const noexcept
+        [[nodiscard]] uint64_t LossDelayMicros(uint32_t fallbackMicros) const noexcept
         {
-            const uint64_t base = latestMicros > srttMicros ? latestMicros : srttMicros;
+            // The fallback matters more here than anywhere. This is asked on
+            // the very first acknowledgement, before that same reply's sample
+            // has been folded, so with nothing measured the raw fields are
+            // zero and the rule becomes "outstanding longer than a
+            // millisecond". That declares every packet below the newest one
+            // lost, takes the full congestion cut, and re-anchors the curve,
+            // all before a single round trip has been measured.
+            uint64_t base = latestMicros > srttMicros ? latestMicros : srttMicros;
+            if (base == 0) base = fallbackMicros;
             const uint64_t delay = base + base / 8;
             return delay < RTO_VARIANCE_MIN_MICROS ? RTO_VARIANCE_MIN_MICROS : delay;
         }
