@@ -2443,6 +2443,20 @@ namespace bcp::flux
         const uint32_t slot = peerHandle.GetSlotIndex();
         PeerRecvState& state = peerRecvStates_[slot];
 
+        // Stale strikes are dropped before they are counted. The policy is
+        // about a rate and the counter only knows a total, so without this a
+        // peer accumulates its way to a permanent halving over any length of
+        // connection, and nothing ever gives the grant back.
+        const uint64_t lastStall = state.lastStallMicros.load(std::memory_order_relaxed);
+        const uint64_t now = common::MonotonicMicros();
+        if (lastStall != 0 && now > lastStall
+            && now - lastStall > internal::GRANT_STRIKE_WINDOW_MICROS)
+        {
+            state.stallReclaims.store(0, std::memory_order_relaxed);
+            state.lastStallMicros.store(0, std::memory_order_relaxed);
+            return;
+        }
+
         if (state.stallReclaims.load(std::memory_order_relaxed)
             < internal::GRANT_STRIKES_BEFORE_CUT)
             return;
@@ -2851,7 +2865,15 @@ namespace bcp::flux
         // falls back to the protocol default rather than flooding.
         const uint32_t interval = handshakeRetryMicros_ != 0
             ? handshakeRetryMicros_ : internal::HANDSHAKE_RETRY_DEFAULT;
-        const uint32_t retryStamps = interval >> internal::SEEN_STAMP_SHIFT;
+        // At least one stamp. The interval is carried in microseconds and the
+        // gate compares it in stamp grains, so anything under a grain
+        // truncates to zero, the gate becomes "elapsed < 0", and the attempt
+        // count is spent once per tick instead of once per interval. A tight
+        // polling loop then declares a peer unreachable in microseconds. The
+        // same rounding is why the pacing clock keeps its remainder rather
+        // than dropping it.
+        uint32_t retryStamps = interval >> internal::SEEN_STAMP_SHIFT;
+        if (retryStamps == 0) retryStamps = 1;
 
         uint32_t retried = 0;
         uint32_t cursor  = 0;

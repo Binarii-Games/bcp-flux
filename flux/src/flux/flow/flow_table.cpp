@@ -869,6 +869,8 @@ namespace bcp::flux
                     ++reclaimed;
                     peerRecvStates_[peerSlot].stallReclaims.fetch_add(
                         1, std::memory_order_relaxed);
+                    peerRecvStates_[peerSlot].lastStallMicros.store(
+                        now, std::memory_order_relaxed);
                 }
                 // Tell the sender where the cursor actually is. It has been
                 // holding copies on the strength of acks this side just took

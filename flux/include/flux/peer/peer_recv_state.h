@@ -47,6 +47,14 @@ namespace bcp::flux
             because the reclaim runs without the peer lock. */
         std::atomic<uint32_t> stallReclaims{0};
 
+        /** When the most recent of those happened. The count alone is a
+            lifetime total, and the policy it feeds is reasoning about a rate:
+            a peer that stalls occasionally over hours is on a lossy link,
+            while one that stalls four times in half a minute is holding buffer
+            it does not use. Strikes older than the window are weather, not a
+            pattern, so the count is dropped rather than carried forward. */
+        std::atomic<uint64_t> lastStallMicros{0};
+
         void PinOne() noexcept { occupancy.fetch_add(1, std::memory_order_relaxed); }
 
         /** Saturates at zero instead of wrapping.
@@ -74,6 +82,7 @@ namespace bcp::flux
             occupancy.store(0, std::memory_order_relaxed);
             grant.store(0, std::memory_order_relaxed);
             stallReclaims.store(0, std::memory_order_relaxed);
+            lastStallMicros.store(0, std::memory_order_relaxed);
         }
     };
 }

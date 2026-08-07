@@ -368,6 +368,16 @@ namespace bcp::flux::internal
     /** What a cut leaves, as a divisor. Halving rather than closing, because a
         peer that recovers should still be able to work, and repeated cuts reach
         the floor soon enough. */
+    /** How recent the strikes have to be to count as a pattern.
+
+        Without a window the count is a peer's whole lifetime, so four stalls an
+        hour apart read the same as four in a row, and the grant is halved for
+        something that is a lossy link rather than a peer holding buffer it does
+        not use. Nothing ever raises a grant back, so that verdict is permanent.
+        Thirty seconds is the same order as the idle timeout: four stalls inside
+        it is a pattern, four spread past it is weather. */
+    static constexpr uint64_t GRANT_STRIKE_WINDOW_MICROS    = 30000000;
+
     static constexpr uint32_t GRANT_CUT_DIVISOR             = 2;
     static constexpr uint32_t GRANT_CUT_FLOOR               = 2;
 
