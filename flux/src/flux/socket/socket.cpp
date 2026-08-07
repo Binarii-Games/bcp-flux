@@ -297,7 +297,6 @@ namespace bcp::flux
         params.unreliableWait      = f.unreliableWaitCount;
         params.ackDelayMicros      = config.timers.ackDelayMicros;
         params.retryIntervalMicros = config.timers.retryIntervalMicros;
-        params.maxAttempts         = config.timers.maxAttempts;
         params.flowStallTimeoutMicros = config.liveness.flowStallTimeoutMicros;
 
         if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyLanes_,
@@ -311,6 +310,16 @@ namespace bcp::flux
         // "throttled, never strangled" requires the floor to admit one.
         minCongestionBudget_ = f.minCongestionBudget != 0
             ? f.minCongestionBudget : internal::CC_MIN_BUDGET_DEFAULT;
+        {
+            // No budget larger than every flow window on this peer full at
+            // once can ever bind a send, it can only store a burst.
+            const uint64_t ceiling = static_cast<uint64_t>(config.flows.maxOutPerPeer)
+                                   * internal::FLOW_WINDOW_BULK
+                                   * internal::MAX_WIRE_PACKET_SIZE;
+            maxCongestionBudget_ = ceiling == 0 ? internal::CC_INITIAL_WINDOW_BYTES
+                                 : ceiling > UINT32_MAX ? UINT32_MAX
+                                 : static_cast<uint32_t>(ceiling);
+        }
         if (minCongestionBudget_ < internal::MAX_WIRE_PACKET_SIZE)
             minCongestionBudget_ = internal::MAX_WIRE_PACKET_SIZE;
         return common::Error::Ok;
@@ -338,7 +347,8 @@ namespace bcp::flux
             (idleMicros >> internal::SEEN_STAMP_SHIFT) + seenGrainStamp_;
         if (idleStamp == 0 || idleStamp >= (1ull << 31))
             return common::Error::InvalidParam;
-        evictAfterStamp_ = static_cast<uint32_t>(idleStamp);
+        evictAfterStamp_   = static_cast<uint32_t>(idleStamp);
+        idleTimeoutMicros_ = idleMicros;
 
         acceptUnsecureFromUnknown_ = config.liveness.acceptUnsecureFromUnknown;
         return common::Error::Ok;
@@ -2245,6 +2255,10 @@ namespace bcp::flux
         }
         peer.myTag        = DerivePeerTag(peer.session, LaneTo(theirPk), 0);
         peer.state        = HandshakeState::ESTABLISHED;
+        // The acknowledgement silence clock starts here, so a peer that never
+        // acknowledges anything still has a defined death, measured from the
+        // moment it could first have answered.
+        peer.rtt.MarkAcked(common::MonotonicMicros());
     }
 
     common::Result<PacketSlotWriter> Socket::BuildInternal(SocketOpCode op)
@@ -2680,7 +2694,7 @@ namespace bcp::flux
             }
             if (truncated) break;
 
-            flows_.ApplyAckRanges(peerSlot, flowId, flowEpoch, remoteRecvNext,
+            flows_.ApplyAckRanges(peerSlot, *peerHandle.Read(), flowId, flowEpoch, remoteRecvNext,
                                   remoteAckDelay, ranges, rangeCount, now, ccDelta);
         }
 
@@ -2939,10 +2953,26 @@ namespace bcp::flux
                     // that never completes gets a single timeout to live.
                     if (evicted < internal::MAX_EVICT_PER_UPDATE)
                     {
+                        const Peer* alive = peerHandle.Read();
                         const uint32_t nowStamp = SeenStamp(Now(nowOverride));
-                        const uint32_t idleFor =
-                            nowStamp - peerHandle.Read()->lastSeenAt;
+                        const uint32_t idleFor  = nowStamp - alive->lastSeenAt;
                         if (idleFor > evictAfterStamp_) evictIdle = true;
+
+                        // The second silence. A peer can stay alive on the
+                        // receive clock, its data reaches us, while it
+                        // acknowledges nothing we send. Retransmission cannot
+                        // mend a session broken like that, and without this
+                        // check it limps forever: flows fail, the application
+                        // reopens them, and the loop never ends. Same timeout
+                        // as the receive silence, ending in the same clear
+                        // death, and the application answers PEER_LOST with a
+                        // reconnect that rebuilds the state fresh.
+                        if (!evictIdle
+                            && alive->IsValid()
+                            && alive->bytesInFlight > 0
+                            && alive->rtt.SilentForMicros(Now(nowOverride))
+                                   > idleTimeoutMicros_)
+                            evictIdle = true;
                     }
                     if (!evictIdle && flows_.ReceiveEnabled())
                     {
@@ -3019,7 +3049,7 @@ namespace bcp::flux
 
         // Gather what to do (and the peer materials) under the transferred
         // handle, then send after it drops: nothing locked across a send.
-        bool exhausted = false;   // a reliable packet ran out of retransmits
+        bool assocDead = false;   // owed packets, and nothing resolved for the whole bound
         uint16_t flowId = 0;
         uint32_t resendSlots[FlowTable::RESENDS_PER_ASSOC_PER_TICK];
         uint32_t resendSeqs[FlowTable::RESENDS_PER_ASSOC_PER_TICK];
@@ -3049,12 +3079,14 @@ namespace bcp::flux
             if (flowSlot == common::collections::SlotPool::INVALID) return;
 
             flows_.RetransmitPass(flowSlot, *readPeer, now, ccDelta, flowId, resendSeqs, resendSlots,
-                                  resendN, exhausted);
+                                  resendN, assocDead);
 
-            // Out of retransmits: the remote stopped answering this target.
-            // Runs here because the refund needs the peer's write lock, and
-            // after the association lock dropped so the two never nest wrong.
-            if (exhausted)
+            // The target stopped resolving this flow for the whole stall
+            // bound: a clear death, reported through the event, rather than
+            // probing into silence forever. Runs here because the teardown
+            // needs the peer's write lock, after the association lock dropped
+            // so the two never nest wrong.
+            if (assocDead)
             {
                 if (Peer* dying = peerHandle.Write())
                 {

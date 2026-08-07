@@ -52,6 +52,7 @@ namespace bcp::flux
 
             assoc->nextSeq      = 1;
             assoc->unresolved   = 0;
+            assoc->lastResolvedMicros = common::MonotonicMicros();
             assoc->ackBase      = 1;
             assoc->inflightCap  = inflightCap;
             assoc->waitingCap   = waitingCap;
@@ -70,7 +71,7 @@ namespace bcp::flux
             InFlightEntry* inFlight = assoc->InFlight();
             for (uint32_t i = 0; i < inflightCap; ++i)
                 inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID,
-                                             0, 0, false, false, false };
+                                             0, 0, 0, false, false, false };
             WaitingEntry* waiting = assoc->Waiting();
             for (uint32_t i = 0; i < waitingCap; ++i)
                 waiting[i] = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };
@@ -187,18 +188,25 @@ namespace bcp::flux
             if (flow->newSinceFlush < UINT32_MAX) ++flow->newSinceFlush;
         }
 
-        /** The same, for an arrival, which also stamps when that arrival landed
-            if it is the newest sequence the reply will report.
+        /** The same, for an arrival. `committed` says the packet entered the
+            flow (delivered or held), and only then does the arrival stamp move:
+            the reply's hold time is measured from this stamp, and it must name
+            an arrival the reply actually reports. A duplicate or a refused
+            packet commits nothing and the reply says nothing about it.
 
-            CommitSeen has already moved recvHighest by the time this runs, so
-            the newest arrival is the one whose seq now equals it. An arrival
-            that committed nothing sits below it and leaves the stamp alone,
-            which is what we want, since the reply does not report it. */
-        void ArmAckForArrival(InAssociation* flow, uint32_t seq)
+            Any committed arrival moves the stamp, not only one that advances
+            recvHighest. A resend filling a gap sits below recvHighest, and
+            leaving the stamp on the packet above the gap made the immediate
+            ack it triggers report the whole life of the gap as time this side
+            spent holding the reply. The sender subtracts what is reported, so
+            that fiction came straight out of its round trip and forged samples
+            below the physical path. */
+        void ArmAckForArrival(InAssociation* flow, uint32_t seq, bool committed)
         {
+            (void)seq;
             const uint64_t now = common::MonotonicMicros();
             ArmAck(flow, now);
-            if (seq == flow->recvHighest) flow->newestArrivalMicros = now;
+            if (committed) flow->newestArrivalMicros = now;
         }
 
         /** Coalesces the set bits into inclusive [first,last] seq ranges, newest
@@ -366,6 +374,7 @@ namespace bcp::flux
             entry.packetSlot   = stagingSlot;   // INVALID for an unreliable flow
             entry.wireSize     = wireSize;
             entry.retries      = 0;
+            entry.congestionEpoch = peer.congestionEpoch;
             entry.acked        = false;
             entry.lostByAck    = false;
             entry.freeResend   = false;
@@ -524,7 +533,6 @@ namespace bcp::flux
 
         ackDelayMicros_      = params.ackDelayMicros;
         retryIntervalMicros_ = params.retryIntervalMicros;
-        maxAttempts_         = params.maxAttempts;
         flowStallTimeout_    = params.flowStallTimeoutMicros > 0
             ? params.flowStallTimeoutMicros : internal::FLOW_STALL_TIMEOUT_DEFAULT;
         return common::Error::Ok;
@@ -569,6 +577,11 @@ namespace bcp::flux
     uint32_t FlowTable::RetryIntervalMicros() const noexcept
     {
         return retryIntervalMicros_;
+    }
+
+    uint32_t FlowTable::AckDelayMicros() const noexcept
+    {
+        return ackDelayMicros_;
     }
 
     // --- Flow lifecycle ---
@@ -882,6 +895,7 @@ namespace bcp::flux
 
     uint64_t FlowTable::NextDeadline(uint32_t peerSlot, const Peer& peer) noexcept
     {
+        const uint64_t now = common::MonotonicMicros();
         uint64_t soonest = UINT64_MAX;   // nothing armed
         auto consider = [&](uint64_t deadline) {
             if (deadline < soonest) soonest = deadline;
@@ -914,7 +928,7 @@ namespace bcp::flux
                     // Earliest RTO across in-flight entries; a full scan
                     // is bounded by the ring cap.
                     const uint64_t rto = peer.rtt.RetransmitTimeout(
-                        retryIntervalMicros_, ackDelayMicros_);
+                        retryIntervalMicros_, ackDelayMicros_, now);
                     const uint32_t cap = flow->inflightCap;
                     const InFlightEntry* ring = flow->InFlight();
                     uint64_t oldest = 0;
@@ -1019,7 +1033,8 @@ namespace bcp::flux
         return bodyLen;
     }
 
-    void FlowTable::ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
+    void FlowTable::ApplyAckRanges(uint32_t peerSlot, const Peer& peer,
+                                   uint16_t flowId, uint8_t flowEpoch,
                                    uint32_t remoteRecvNext, uint16_t remoteAckDelayMicros,
                                    const AckRange* ranges, uint8_t count, uint64_t now,
                                    CongestionDelta& delta) noexcept
@@ -1052,9 +1067,9 @@ namespace bcp::flux
             // wants one that was outstanding until this moment, since an entry
             // acknowledged by an earlier reply would be measured from a send
             // that finished long ago.
-            uint32_t sampleSeq     = 0;
+            uint32_t sampleSeq    = 0;
             uint64_t sampleSentAt  = 0;
-            uint8_t  sampleRetries = 0;
+            bool     sampleResent  = false;
             bool     haveSample    = false;
 
             for (uint32_t i = 0; i < cap; ++i)
@@ -1077,7 +1092,18 @@ namespace bcp::flux
                     {
                         sampleSeq     = ring[i].seq;
                         sampleSentAt  = ring[i].sentAtMicros;
-                        sampleRetries = ring[i].retries;
+                        // Retransmitted in EITHER way. retries counts only the
+                        // charged attempts, because the give-up count asks
+                        // whether the peer is silent and an ack-driven resend
+                        // is proof it is not. Sampling asks a different
+                        // question, which transmission this ack answers, and a
+                        // free resend is exactly as ambiguous as a charged one.
+                        // Reusing the give-up counter here once let resends be
+                        // sampled from their resend time, which read 31 ms on a
+                        // path that is physically 40, and a minimum only ever
+                        // falls: the phantom queue that made parked the budget
+                        // at its initial window for entire transfers.
+                        sampleResent  = ring[i].retries != 0 || ring[i].lostByAck;
                         haveSample    = true;
                     }
                     ResolveOutEntry(flow, ring[i], true, delta);
@@ -1100,7 +1126,7 @@ namespace bcp::flux
             // retransmit timeout beyond any clock and the pacing rate at zero,
             // so the flow stopped sending and stopped timing out while every
             // thread kept running.
-            if (haveSample && sampleRetries == 0 && sampleSentAt != 0
+            if (haveSample && !sampleResent && sampleSentAt != 0
                 && now >= sampleSentAt)
             {
                 uint64_t sample = now - sampleSentAt;
@@ -1126,7 +1152,12 @@ namespace bcp::flux
                 delta.ackDelayMicros  = remoteAckDelayMicros;
             }
 
-            if (anyAcked) DeclareLostBelow(*flow, largestAcked, delta);
+            if (anyAcked)
+            {
+                flow->lastResolvedMicros = now;
+                DeclareLostBelow(*flow, largestAcked, now,
+                                 peer.rtt.LossDelayMicros(), delta);
+            }
             ReleaseAckedRun(*flow, remoteRecvNext);
         }
         outAssocPool_.UnlockWrite(flowSlot);
@@ -1673,38 +1704,63 @@ namespace bcp::flux
     }
 
     void FlowTable::DeclareLostBelow(OutAssociation& flow, uint32_t largestAcked,
+                                     uint64_t now, uint64_t lossDelayMicros,
                                      CongestionDelta& delta) noexcept
     {
-        // Anything still outstanding this far behind a sequence that arrived is
-        // not late, it is gone. Waiting for its timeout instead costs most of a
-        // round trip on a path that has already told us what happened.
+        // Everything that turns an acknowledgement into a verdict of loss is
+        // here, and nothing else declares one. The timer used to as well, and
+        // that was the mistake: a deadline that fires early then cost half the
+        // window instead of one wasted packet.
+        //
+        // Two rules, both needing something above the gap to have arrived,
+        // because without that there is no evidence at all and a timer alone
+        // cannot conclude anything.
+        //
+        // Count: three sequences past it have landed. Reordering that deep is
+        // rare enough that waiting longer only delays the repair.
+        //
+        // Time: fewer than three have landed, but this one has been out longer
+        // than a round trip and an eighth. Fills the gap between the count rule
+        // and the probe, which is where a tail sits.
         //
         // Only reliable flows: an unreliable one is never resent, so declaring
-        // its packets early changes nothing it can act on, and the timeout scan
-        // already gives it the same congestion signal.
+        // its packets early changes nothing it can act on.
         if (flow.mode == FlowMode::UNRELIABLE) return;
 
         InFlightEntry* ring = flow.InFlight();
         for (uint32_t i = 0; i < flow.inflightCap; ++i)
         {
             InFlightEntry& entry = ring[i];
-            if (entry.seq == 0 || entry.acked) continue;
+            if (entry.seq == 0 || entry.acked || entry.lostByAck) continue;
 
             // Signed, so the comparison still holds across a sequence wrap.
-            if (static_cast<int32_t>(largestAcked - entry.seq)
-                < static_cast<int32_t>(internal::LOSS_PACKET_THRESHOLD))
-                continue;
+            if (static_cast<int32_t>(largestAcked - entry.seq) <= 0) continue;
+
+            const bool farBehind =
+                static_cast<int32_t>(largestAcked - entry.seq)
+                    >= static_cast<int32_t>(internal::LOSS_PACKET_THRESHOLD);
+            // A send time of zero is the marker for a packet that has not been
+            // on the wire, not a packet sent at the dawn of time. It cannot be
+            // overdue, because it has not been anywhere.
+            const bool longOverdue =
+                entry.sentAtMicros != 0 && Elapsed(now, entry.sentAtMicros) > lossDelayMicros;
+
+            if (!farBehind && !longOverdue) continue;
 
             // Handed to the retransmit scan rather than resent here. Zero reads
             // as overdue against any timeout, so the next tick carries it
             // through the one sanctioned resend path instead of growing a
-            // second one beside it. The entry stays in flight, exactly as a
-            // timed-out reliable packet does.
-            if (entry.lostByAck) continue;           // said once, not once per ack
+            // second one beside it.
             entry.lostByAck    = true;
-            entry.freeResend   = true;               // the peer is talking, so this is free
-            entry.sentAtMicros = 0;                  // overdue against any timeout
-            delta.sawLoss      = true;
+            entry.freeResend   = true;   // the peer is talking, so this is free
+            entry.sentAtMicros = 0;
+            delta.lostDeclaredBytes += entry.wireSize;
+            // The newest epoch among the losses. An older one was already in
+            // flight when the peer last reacted.
+            if (!delta.sawLoss
+                || static_cast<int8_t>(entry.congestionEpoch - delta.lostEpoch) > 0)
+                delta.lostEpoch = entry.congestionEpoch;
+            delta.sawLoss = true;
         }
     }
 
@@ -1749,13 +1805,33 @@ namespace bcp::flux
     void FlowTable::RetransmitInflight(OutAssociation& flow, const Peer& peer,
                                        uint64_t now, CongestionDelta& delta,
                                        uint32_t* resendSeqs, uint32_t* resendSlots,
-                                       uint32_t& resendCount, bool& exhausted) noexcept
+                                       uint32_t& resendCount, bool& assocDead) noexcept
     {
         // Scan the in-flight ring for entries past their RTO. Reliable ones are
         // collected for retransmit (refresh sentAt, keep them in flight);
         // unreliable ones are declared lost and resolved. Loss feedback goes into
         // `delta`, never the peer: the caller applies it under the peer lock.
-        const uint64_t rto  = peer.rtt.RetransmitTimeout(retryIntervalMicros_, ackDelayMicros_);
+        const uint64_t rto  = peer.rtt.RetransmitTimeout(retryIntervalMicros_, ackDelayMicros_,
+                                                         now);
+
+        // The death, judged before anything is resent. Owing packets and
+        // resolving none for the whole bound means this target has stopped
+        // answering the flow. Elapsed time rather than an attempt count: a
+        // count spends itself in a burst on a lossy-but-alive link and takes
+        // minutes on a slow one, and both are the wrong verdict. The round
+        // trip term keeps a genuinely slow path alive, the stall term keeps
+        // the bound tight everywhere else.
+        if (flow.unresolved > 0)
+        {
+            uint64_t bound = 3 * rto;
+            if (bound < flowStallTimeout_) bound = flowStallTimeout_;
+            if (Elapsed(now, flow.lastResolvedMicros) > bound)
+            {
+                assocDead = true;
+                return;   // the caller fails it; resending into silence buys nothing
+            }
+        }
+
         const uint32_t cap  = flow.inflightCap;
         const FlowMode mode = flow.mode;
         InFlightEntry* ring = flow.InFlight();
@@ -1782,36 +1858,34 @@ namespace bcp::flux
             }
             if (Elapsed(now, entry.sentAtMicros) < rto) continue;
 
-            // RTO fired: a loss on this path either way.
+            // The deadline passed with nothing above this packet
+            // acknowledged, so no evidence exists either way. Send it again to
+            // provoke an answer, and say a probe went out.
+            //
+            // This is NOT a loss and does not touch the budget. A deadline can
+            // only be a guess about a path nobody can see, and the guess is
+            // wrong most often exactly when the path is worst. Reacting to it
+            // as congestion once cost 582 phantom losses in eight seconds on a
+            // link that dropped nothing. What the probe buys is an
+            // acknowledgement, and the acknowledgement is what can actually
+            // say which packets are missing.
             if (mode == FlowMode::UNRELIABLE)
             {
-                ResolveOutEntry(&flow, entry, false, delta);   // lost, dropped
+                // Never resent, so there is nothing to probe with and nothing
+                // the application can do about it. Resolve it and move on.
+                ResolveOutEntry(&flow, entry, false, delta);
+                delta.sawLoss = true;
             }
             else
             {
-                delta.sawLoss = true;   // reliable: trim the budget, keep it in flight
-
-                // Out of attempts: the remote has stopped answering this flow
-                // entirely. Retrying further only burns budget, so the caller
-                // fails the flow and the app reads it off the handle. This is
-                // the only give-up left now that opening takes no round trip.
-                //
-                // A resend the acks asked for is exempt, and neither spends an
-                // attempt nor is refused for want of one. The count is asking
-                // whether the peer has gone quiet, and this packet is only
-                // known to be missing because the peer said so.
-                if (!entry.freeResend && entry.retries >= maxAttempts_)
-                {
-                    exhausted = true;
-                    continue;
-                }
+                delta.sawProbe = true;
 
                 if (entry.packetSlot != common::collections::SlotPool::INVALID
                     && resendCount < RESENDS_PER_ASSOC_PER_TICK)
                 {
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
-                    entry.sentAtMicros = now;   // don't re-fire before next RTO
+                    entry.sentAtMicros = now;   // don't re-fire before next deadline
                     if (entry.freeResend) entry.freeResend = false;
                     else                  ++entry.retries;
                 }
@@ -1823,7 +1897,7 @@ namespace bcp::flux
                                    uint64_t now, CongestionDelta& delta,
                                    uint16_t& outFlowId, uint32_t* resendSeqs,
                                    uint32_t* resendSlots, uint32_t& resendCount,
-                                   bool& exhausted) noexcept
+                                   bool& assocDead) noexcept
     {
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(assocSlot));
@@ -1833,7 +1907,7 @@ namespace bcp::flux
         {
         case FlowLifecycle::OPEN:
             RetransmitInflight(*flow, peer, now, delta, resendSeqs, resendSlots, resendCount,
-                               exhausted);
+                               assocDead);
             break;
         default: break;
         }
@@ -2014,7 +2088,7 @@ namespace bcp::flux
         // and only a fresh ack stops the resend.
         if (AlreadySeen(&flow, seq))
         {
-            ArmAckForArrival(&flow, seq);
+            ArmAckForArrival(&flow, seq, false);
             return 0;
         }
         // Unreliable is newest only: a packet older than the newest delivered
@@ -2024,7 +2098,7 @@ namespace bcp::flux
         if (flow.mode == FlowMode::UNRELIABLE && seq <= flow.recvHighest)
         {
             CommitSeen(&flow, seq);
-            ArmAckForArrival(&flow, seq);
+            ArmAckForArrival(&flow, seq, true);
             return 0;
         }
         // No cursor here, so nothing waits behind this packet and refusing it
@@ -2032,7 +2106,7 @@ namespace bcp::flux
         // fill the pool with traffic nobody is blocked on.
         if (!HasRoomFor(flow.peerSlot))
         {
-            ArmAckForArrival(&flow, seq);
+            ArmAckForArrival(&flow, seq, false);
             return 0;   // uncommitted and unacked, so the sender resends
         }
 
@@ -2040,7 +2114,7 @@ namespace bcp::flux
         if (!QueueReady(incoming, flow.peerSlot))
             return 0;   // ready queue full: uncommitted, unacked -> dropped/resent
         CommitSeen(&flow, seq);
-        ArmAckForArrival(&flow, seq);
+        ArmAckForArrival(&flow, seq, true);
         return 1;
     }
 
@@ -2054,7 +2128,7 @@ namespace bcp::flux
             // Already delivered, so the sender is resending against an ack it
             // never got. Answer now rather than making it wait again.
             flow.ackImmediate = true;
-            ArmAckForArrival(&flow, seq);
+            ArmAckForArrival(&flow, seq, false);
             return 0;
         }
 
@@ -2066,7 +2140,7 @@ namespace bcp::flux
             // an ordinary entry and asks like any other.
             if (flow.heldCount == 0 && !HasRoomFor(flow.peerSlot))
             {
-                ArmAckForArrival(&flow, seq);
+                ArmAckForArrival(&flow, seq, false);
                 return 0;
             }
             // Queue the cursor packet first; only advance and commit if it took
@@ -2074,7 +2148,7 @@ namespace bcp::flux
             if (!QueueReady(incoming, flow.peerSlot))
                 return 0;
             CommitSeen(&flow, seq);
-            ArmAckForArrival(&flow, seq);
+            ArmAckForArrival(&flow, seq, true);
             flow.recvNext = seq + 1;
             if (flow.recvNext == 0) flow.recvNext = 1;
             return 1 + DrainHoldbackRun(flow);
@@ -2102,7 +2176,7 @@ namespace bcp::flux
                 heldTotal_->fetch_add(1, std::memory_order_relaxed);
                 CommitSeen(&flow, seq);                 // held -> ackable (SACK)
                 flow.ackImmediate = true;               // out of order: answer now
-                ArmAckForArrival(&flow, seq);
+                ArmAckForArrival(&flow, seq, true);
             }
             // else already held: duplicate, incoming drops (releases its slot)
             return 0;
@@ -2114,7 +2188,7 @@ namespace bcp::flux
         // and answer at once, since that cursor is the only thing that will
         // stop it sending more it cannot use.
         flow.ackImmediate = true;
-        ArmAckForArrival(&flow, seq);
+        ArmAckForArrival(&flow, seq, false);
         return 0;
     }
 

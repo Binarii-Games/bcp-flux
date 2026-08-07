@@ -128,7 +128,39 @@ namespace bcp::flux::internal
     // Per peer, in bytes, spent only by flow packets. Grows on acknowledgement,
     // trims to CC_LOSS_RETAIN_PERCENT on loss, never below the Config floor.
     static constexpr uint32_t CC_INITIAL_WINDOW_BYTES       = 10u * MAX_WIRE_PACKET_SIZE;
-    static constexpr uint8_t  CC_LOSS_RETAIN_PERCENT        = 85;
+
+    /** What the budget keeps on a congestion event. 70 percent is CUBIC's
+        figure, and it is deeper than the 85 that came before it. Two reasons it
+        is affordable now. The curve returns to the previous window in a fraction
+        of the time a straight line took, so the cut costs far less than it used
+        to. And every other controller sharing a bottleneck uses roughly this,
+        so a sender that keeps more than they do takes more than its share on
+        every loss, permanently, and that is a property of the sender rather
+        than of the network. */
+    static constexpr uint8_t  CC_LOSS_RETAIN_PERCENT        = 70;
+
+    /** What the budget keeps when a loss arrives with no queue behind it.
+
+        Loss is only evidence of congestion when something was actually
+        queueing. A wireless link drops for radio reasons with the path empty,
+        and the queue estimate can see the difference: at the moment of these
+        losses it reads a few hundred microseconds against a multi-millisecond
+        target. Trimming 30 percent there settles the window at the textbook
+        AIMD equilibrium, about sixteen packets at one percent loss, which
+        measured 19x slower than the link allows.
+
+        Still a trim rather than an exemption. The queue estimate can be
+        stale for up to a bucket rotation after a route change, and a sender
+        that ignores loss outright for that long is a flood. Five percent
+        keeps the response proportional: noise costs a little, real
+        congestion, corroborated by the queue, costs the full cut. */
+    static constexpr uint8_t  CC_NOISE_RETAIN_PERCENT       = 95;
+
+    /** CUBIC's aggression, scaled by 100 so the curve stays in integers. The
+        window follows C*(t - K)^3 + wMax with t in seconds, where K is how long
+        the curve takes to climb back to wMax. 0.4 is the standard value. */
+    static constexpr uint32_t CC_CUBIC_C_SCALED             = 40;
+    static constexpr uint32_t CC_CUBIC_C_SCALE              = 100;
     static constexpr uint32_t CC_MIN_BUDGET_DEFAULT         = 2u * MAX_WIRE_PACKET_SIZE;
 
     /** Pacing. The window says how much may be outstanding, not how fast it may
@@ -198,6 +230,52 @@ namespace bcp::flux::internal
         wait forever, so the worst outcome of a bad number is slow instead of
         dead. */
     static constexpr uint32_t RTO_MAX_MICROS                = 60000000;
+
+    /** Most the timeout may be doubled while a peer stays silent.
+
+        Three, so eight times the base, and the ceiling is low on purpose. A
+        give-up count sits behind the timeout, so the shift multiplies the time
+        to give up exponentially rather than just spacing the probes out. At six
+        the tail of a transfer, which is the one case a probe exists for because
+        no acknowledgement can ever reveal it, becomes the slowest thing in the
+        system: nothing is outstanding but the last packet, so nothing arrives
+        to reset the silence, and each attempt waits 64 times the round trip.
+        Measured on a 25 percent loss link that stalled a transfer outright. */
+    static constexpr uint32_t RTO_MAX_BACKOFF_SHIFT         = 3;
+
+    /** Unanswered probes before the path is treated as gone rather than
+        congested. Three is the same count RFC 9002 uses. At that point trimming
+        a percentage off the budget is arithmetic on a number that no longer
+        describes anything, so it goes straight to the floor. */
+    static constexpr uint32_t PERSISTENT_CONGESTION_PROBES  = 3;
+
+    /** The windowed minimum round trip: how many buckets, and how long each
+        covers. Three at four seconds gives between eight and twelve seconds of
+        memory, which is long enough that a busy path still contains one quiet
+        moment and short enough that a route change is noticed. */
+    static constexpr uint32_t MIN_RTT_BUCKETS               = 3;
+    static constexpr uint32_t MIN_RTT_BUCKET_MICROS         = 4000000;
+
+    /** How much standing queue the sender will tolerate before it stops growing
+        the window, as a fraction of the minimum round trip.
+
+        A fraction rather than a fixed figure, because a millisecond count that
+        is right on one link is wrong on every other. An eighth of the path's
+        own delay is small enough to keep the queue out of the way of anything
+        latency-sensitive sharing the link, and large enough that ordinary
+        jitter does not read as congestion.
+
+        This is what stops a loss-based controller resting at a full buffer.
+        Growth waits while the queue is above it, whatever the curve wants. */
+    static constexpr uint32_t QUEUE_TARGET_DIVISOR          = 8;
+
+    /** Floor under that target, because a fraction of a very short path lands
+        below the noise. On loopback the minimum round trip is tens of
+        microseconds, an eighth of it is single digits, and ordinary scheduling
+        jitter is larger than that, so the sender reads a standing queue that
+        does not exist and never grows again. A millisecond is above the jitter
+        on any path and far below the point where a queue starts mattering. */
+    static constexpr uint32_t QUEUE_TARGET_MIN_MICROS       = 1000;
 
     /** Acknowledge at least this often, in packets, rather than only when the
         delay expires. Holding a reply is worth it on a quiet link, where it

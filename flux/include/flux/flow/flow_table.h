@@ -166,7 +166,6 @@ namespace bcp::flux
             uint32_t unreliableWait = 0;
             uint32_t ackDelayMicros = 0;
             uint32_t retryIntervalMicros = 0;
-            uint8_t  maxAttempts    = 0;
             uint32_t flowStallTimeoutMicros = 0;
         };
 
@@ -208,6 +207,7 @@ namespace bcp::flux
         /** The configured retry interval, which the peer-side congestion trim
             reads as its fallback when a peer has no round-trip sample yet. */
         [[nodiscard]] uint32_t RetryIntervalMicros() const noexcept;
+        [[nodiscard]] uint32_t AckDelayMicros() const noexcept;
 
         // --- Flow lifecycle. No peer involved: a flow knows no address. ---
 
@@ -314,7 +314,8 @@ namespace bcp::flux
             it describes a generation of this flow id that has already been
             closed, and its sequence numbers mean something else now.
             @pre caller holds the peer read lock. */
-        void ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
+        void ApplyAckRanges(uint32_t peerSlot, const Peer& peer,
+                            uint16_t flowId, uint8_t flowEpoch,
                             uint32_t remoteRecvNext, uint16_t remoteAckDelayMicros,
                             const AckRange* ranges, uint8_t count, uint64_t now,
                             CongestionDelta& delta) noexcept;
@@ -401,7 +402,7 @@ namespace bcp::flux
         void RetransmitPass(uint32_t assocSlot, const Peer& peer,
                             uint64_t now, CongestionDelta& delta,
                             uint16_t& outFlowId, uint32_t* resendSeqs, uint32_t* resendSlots,
-                            uint32_t& resendCount, bool& exhausted) noexcept;
+                            uint32_t& resendCount, bool& assocDead) noexcept;
 
         /** Whether the in-flight ring still owns stagingSlot at expectedSeq. A
             concurrent ack may have resolved it, and recycled the slot, since
@@ -540,7 +541,6 @@ namespace bcp::flux
         uint16_t outUnreliableWaitCap_ = 0;
         uint32_t ackDelayMicros_       = 0;
         uint32_t retryIntervalMicros_  = 0;
-        uint8_t  maxAttempts_          = 0;
         uint64_t flowStallTimeout_     = 0;
         bool     bulkEnabled_          = false;   ///< a bulk pool was provisioned
 
@@ -614,6 +614,7 @@ namespace bcp::flux
             carries it. Detection only: the resend itself stays on the one path
             that already does it. */
         void DeclareLostBelow(OutAssociation& flow, uint32_t largestAcked,
+                              uint64_t now, uint64_t lossDelayMicros,
                               CongestionDelta& delta) noexcept;
 
         void ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept;
@@ -621,7 +622,7 @@ namespace bcp::flux
         void RetransmitInflight(OutAssociation& flow, const Peer& peer,
                                 uint64_t now, CongestionDelta& delta,
                                 /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots,
-                                uint32_t& resendCount, /*out*/ bool& exhausted) noexcept;
+                                uint32_t& resendCount, /*out*/ bool& assocDead) noexcept;
 
         /** Commit one packet to the ready queue (Detaches on success so Poll
             rebuilds the handle). False = queue full, caller must not ack it. */

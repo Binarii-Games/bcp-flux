@@ -465,7 +465,9 @@ namespace bcp::flux
         p->grantSentAtMicros    = 0;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
         p->rtt.Reset();
-        p->lastLossReactionMicros = 0;
+        p->wMaxBytes             = 0;
+        p->congestionEpochMicros = 0;
+        p->congestionEpoch       = 0;
         p->state       = HandshakeState::AWAITING_CHALLENGE;
         p->attempts    = 0;
         p->hasId       = (id != nullptr);

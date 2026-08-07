@@ -230,10 +230,11 @@ int main()
     senderConfig.flows.inCount  = 8;
     // Long on purpose. A gap the sender refills promptly never becomes a jam.
     senderConfig.timers.retryIntervalMicros = 30000000;
-    // The link is cut outright while a gap is being left to go stale, and every
-    // retransmit that leaves during that spends an attempt. Without headroom the
-    // flow gives up partway through and there is nothing left to jam.
-    senderConfig.timers.maxAttempts         = 200;
+    // The link is cut outright while gaps are left to go stale, for seconds at
+    // a time, and a sending flow that resolves nothing for the whole stall
+    // bound is declared dead. Generous, so the deliberate outages stay outages
+    // rather than deaths.
+    senderConfig.liveness.flowStallTimeoutMicros = 30000000;
     senderConfig.events.hook       = OnSenderEvent;
     senderConfig.events.context    = &senderSeen;
     senderConfig.events.subscribed = flux::ToBits(flux::SocketEvent::PEER_GRANT_CHANGED);

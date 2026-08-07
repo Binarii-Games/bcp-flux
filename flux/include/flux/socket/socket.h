@@ -302,7 +302,6 @@ namespace bcp::flux
                 /** Paces handshake retries and is the retransmit fallback
                     before a peer has a round-trip sample. */
                 uint32_t retryIntervalMicros = 200000;
-                uint8_t  maxAttempts         = 8;        ///< give-up bound on open/close
             } timers;
 
             /** Idle-peer eviction and the unsecured-inbound gate. See each
@@ -587,6 +586,17 @@ namespace bcp::flux
 
         // Fixed-at-Init scalars.
         uint32_t                       minCongestionBudget_ = internal::CC_MIN_BUDGET_DEFAULT;
+
+        /** Largest the congestion budget may be, from what every flow window on
+            one peer could hold in flight at once. Above that the number cannot
+            bind anything, it only stores a burst for the moment a real limit
+            lifts. Computed at Init from the per-peer association cap. */
+        uint32_t                       maxCongestionBudget_ = UINT32_MAX;
+
+        /** The idle timeout in raw microseconds, kept beside the stamp form
+            because the acknowledgement clock runs on the monotonic clock, not
+            on SeenStamp grains. */
+        uint64_t                       idleTimeoutMicros_ = 0;
         /** Paces handshake retries. Kept here rather than read from the flow
             table because a handshake happens whether or not flows are
             configured, and the table is empty when they are not. */

@@ -267,6 +267,25 @@ namespace bcp::flux
         uint32_t rttSampleMicros = 0;   ///< newest acked round-trip, 0 if none
         uint32_t ackDelayMicros  = 0;   ///< how long the peer held that acknowledgement
         bool     sawLoss         = false;
+
+        /** Bytes declared lost by this acknowledgement. Not part of
+            resolvedBytes, because a declared packet stays in flight for its
+            resend. This is the size of the bite the event took, and the bite
+            is what tells interference from overflow: noise takes a small
+            fraction of packets at any send rate, overflow takes the whole
+            excess. */
+        uint32_t lostDeclaredBytes = 0;
+
+        /** The congestion epoch the lost packets were sent during. The peer
+            compares it against its own: anything older was already in flight
+            when we last reacted, so it is the same event rather than a new
+            one. Only meaningful while sawLoss is set. */
+        uint8_t  lostEpoch       = 0;
+
+        /** A probe went unanswered long enough to fire. Not a loss: the timer
+            only asks the question, and the answer comes back as an
+            acknowledgement that reveals what is actually missing. */
+        bool     sawProbe        = false;
     };
 
     /** A flow the application opened. Socket-wide, one per flow id, and what a
@@ -301,7 +320,9 @@ namespace bcp::flux
         uint32_t seq;
         uint32_t packetSlot;
         uint16_t wireSize;     ///< refunded to the congestion budget on resolve
-        uint8_t  retries;      ///< give-up counter; the flow fails at the cap
+        uint8_t  retries;      ///< resend count; nonzero excludes this entry from
+                               ///< round-trip sampling (Karn), nothing more
+        uint8_t  congestionEpoch;  ///< which congestion event this packet was sent during
         bool     acked;        ///< resolved, copy retained until the run below it clears
 
         /** Declared lost by the acks rather than by a timeout. Set once and
@@ -424,6 +445,16 @@ namespace bcp::flux
 
         uint32_t nextSeq;
         uint32_t unresolved;    ///< stamped and unacked; the send gate refuses at inflightCap
+
+        /** When an acknowledgement last resolved something here. The clock a
+            sending association dies by: owing packets and resolving nothing
+            for longer than the stall bound means the target has stopped
+            answering this flow, and that is a verdict about elapsed time, not
+            about how many probes happened to fire inside it. A counter of
+            attempts was the old detector and it lied in both directions, a
+            burst of probes spent it in an instant and a slow path spent it
+            over minutes. */
+        uint64_t lastResolvedMicros;
 
         /** Lowest sequence whose ring entry may still hold a retained copy.
             Everything below it has been released, so it is the floor a

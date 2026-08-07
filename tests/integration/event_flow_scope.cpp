@@ -128,10 +128,12 @@ int main()
     senderConfig.maxPeers       = 4;
     senderConfig.flows.outCount = 8;
     senderConfig.flows.inCount  = 8;
-    // Short enough that running out of retransmits happens inside the test
-    // rather than inside a minute.
-    senderConfig.timers.retryIntervalMicros = 20000;
-    senderConfig.timers.maxAttempts         = 4;
+    // Short enough that the flow's death happens inside the test rather than
+    // inside the five second default. The flow dies when it resolves nothing
+    // for this long while owing packets, which is exactly what the shutdown
+    // below produces.
+    senderConfig.timers.retryIntervalMicros      = 20000;
+    senderConfig.liveness.flowStallTimeoutMicros = 300000;
     senderConfig.events.hook       = OnSenderEvent;
     senderConfig.events.context    = &senderSeen;
     senderConfig.events.subscribed = flux::ToBits(flux::SocketEvent::OUTGOING_FLOW_REFUSED)

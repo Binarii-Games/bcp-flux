@@ -181,11 +181,27 @@ namespace bcp::flux
         uint64_t grantSentAtMicros;
 
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
-                                          ///< at or above, it grows one packet per round-trip
+                                          ///< at or above, the curve decides
+
+        /** The budget this peer held when congestion was last detected, and
+            when that happened. The curve climbs back toward the first as a
+            function of time since the second, which is what makes recovery
+            independent of how long the path is. */
+        uint32_t wMaxBytes;
+        uint64_t congestionEpochMicros;
+
+        /** Which congestion event the packets now in flight belong to.
+            Incremented on every reaction, and stamped onto each packet as it is
+            sent, so a loss reported afterwards can be told apart: one carrying
+            an older epoch was already on the path when we reacted and is part
+            of the event we already answered, while one carrying the current
+            epoch left after it and is news. Bounds the reaction to one per
+            event exactly, where a clock could only ever approximate it. */
+        uint8_t congestionEpoch;
+
         /** The path to this peer, and the deadline built from it. Every flow
             to this peer shares it, because they all cross the same wire. */
         internal::RttEstimate rtt;
-        uint64_t lastLossReactionMicros;  ///< last trim, so a loss trims at most once per round-trip
 
         HandshakeState state;
         uint8_t attempts;      ///< handshake attempts so far; retry policy is the caller's
