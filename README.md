@@ -222,8 +222,7 @@ entities, the ownership rules, and how many ways there are to do each thing.
 The wire format is not frozen before 1.0. It can change between versions, and a
 security fix is allowed to change it.
 
-Not there yet: path MTU discovery, NAT traversal, session resumption, and
-congestion control beyond AIMD. There is no 0-RTT. A certificate authenticates
+Not there yet: path MTU discovery, NAT traversal, and session resumption. There is no 0-RTT. A certificate authenticates
 a peer, it does not shorten the handshake.
 
 ## Test

@@ -420,7 +420,7 @@ because each is one job and neither of those is:
 | `crypto/packet_seal.cpp` | the two seals and the two opens, and nothing that reaches a peer, a flow or a pool |
 | `flow/flow_batching.cpp` | the open batch on a sending association: what may join it and what its bytes cost |
 | `flow/assoc_directory.cpp` | flow id to slot index, per peer, per direction |
-| `peer/congestion.cpp` | the AIMD budget, which belongs to the peer and not to any one flow |
+| `peer/congestion.cpp` | the budget, loss and delay signals both, which belongs to the peer and not to any one flow |
 
 The split is by job, not by size. The handshake and the migration receive path
 are both larger than any of these and both stay where they are: each reaches
@@ -871,8 +871,12 @@ its receive state can never end the flow, only lose one association. An
 association is freed by `CloseFlow` or by its peer going away, and by nothing
 else: there is no idle timer on an association.
 
-`FAILED` is terminal, reached when the remote rejects the flow or a packet
-exhausts its retransmits. The rings drain and the congestion bytes refund
+`FAILED` is terminal, reached when the remote rejects the flow or the target
+stops answering it. Stopping answering is judged by a clock, not by a count of
+attempts: an association that owes packets and has resolved none of them for
+sixteen of the path's own round trips is dead. A count of attempts spends
+itself in a burst on a lossy but living link and stretches over minutes on a
+slow one, and both are the wrong verdict. The rings drain and the congestion bytes refund
 immediately, and the slot stays leased until `CloseFlow` or the peer's teardown
 frees it. `GetFlowState` reports the failure and does not clear it.
 
@@ -899,20 +903,53 @@ directory, `FLOW_REJECT` against the out.
 #### Congestion control
 
 The budget is per peer, in bytes, and only flow packets spend it. It starts at
-ten full packets, grows on acknowledgement, trims on loss to a percentage of
-itself, and never drops below a configured floor of at least one full wire
-packet, so the gate can always admit a packet once the path drains. Feedback
-crosses locks in one direction: a `CongestionDelta` accumulates under the flow
-lock and is applied to the peer under the peer lock.
+ten full packets and never drops below a configured floor of at least one full
+wire packet, so the gate can always admit a packet once the path drains, nor
+rises above what every flow window on that peer could hold at once, past which
+the number cannot bind anything and only stores a burst. Feedback crosses locks
+in one direction: a `CongestionDelta` accumulates under the flow lock and is
+applied to the peer under the peer lock.
+
+Two signals decide how it moves, and they answer different questions. Loss says
+the path could not carry what was sent. Delay says a queue is forming, which is
+the same news arriving earlier, before anything has had to be thrown away. A
+controller with only the first has one resting place and it is a full buffer,
+because a full buffer is the only thing that produces a loss.
+
+While the budget is below the slow-start threshold it doubles per round trip.
+Above it, growth is a function of time since the last reduction rather than of
+acknowledged bytes, so a long path recovers as fast as a short one, with a
+straight-line estimate underneath so a short path is not punished for running a
+curve designed for long ones. Over both sits a governor: whatever the curve
+wants, the budget does not grow while a standing queue already exceeds a
+fraction of the path's minimum round trip.
+
+A loss trims, and how far depends on whether it was congestion. Two witnesses
+answer that. The queue at the moment of the loss, and the size of the bite,
+because the queue estimate goes blind in exactly one case, a burst overflowing
+a shallow buffer, where the packets that would have carried the deep reading
+are the ones the overflow dropped. Interference takes a small fraction of
+packets at any send rate while overflow takes the whole excess. A corroborated
+loss takes the full cut and re-anchors the curve. An uncorroborated one takes a
+few percent and leaves the curve alone. A congestion epoch stamped on each
+packet as it is sent bounds the response to one reaction per event, so a burst
+losing ten packets is one trim rather than ten.
 
 #### Peer eviction
 
 Always on. A zero timeout selects the default rather than switching it off, so
 there is no configuration in which a silent peer is kept forever. A peer from
 whom nothing has been received for the
-configured timeout is torn down on the tick, bounded per call. Received traffic
-is the only signal, because this socket's own sends prove nothing, and
-forgeable handshake chatter does not refresh the clock. Liveness stamps are
+configured timeout is torn down on the tick, bounded per call. This socket's own
+sends prove nothing, and forgeable handshake chatter does not refresh the clock.
+
+A second silence ends a peer the same way. One can stay alive on the receive
+clock, its data reaching us, while it acknowledges nothing we send.
+Retransmission cannot mend a session broken like that, and without a verdict it
+limps forever: flows fail, the application reopens them, and the loop never
+ends. So a peer that owes acknowledgements and has produced none for the same
+timeout is lost, reported through the same event, and the application answers
+it by reconnecting, which rebuilds the state fresh. Liveness stamps are
 monotonic microseconds shifted to roughly 1 ms units, wrapping in 32 bits about
 every 51 days, with wrapped subtraction, so a peer idle past a full wrap can
 only be evicted late.

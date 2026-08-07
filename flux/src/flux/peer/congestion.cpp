@@ -18,10 +18,13 @@
     rather than of the curve. So the curve decides how fast to climb, the queue
     decides whether to climb at all, and the more cautious of the two wins.
 
-    Nothing here reacts to a deadline. A deadline is a guess about a path nobody
-    can see, and it is wrong most often exactly when the path is worst. The
-    retransmit timer sends a probe and says so, and the acknowledgement that
-    comes back is what says which packets are actually missing.
+    A deadline is a guess about a path nobody can see, and it is wrong most
+    often exactly when the path is worst, so for a reliable flow it buys a probe
+    and nothing more: the acknowledgement that comes back is what says which
+    packets are missing. The exception is an unreliable flow, whose packets are
+    never resent. There the deadline is not a guess about whether the packet
+    might still arrive, it is the moment the packet stops existing, so it is the
+    only loss signal that flow will ever produce and it is taken.
 
     It lives beside the socket rather than in the flow table because the budget
     is the peer's and not any one flow's. The gate that spends it is CanSend, in
@@ -31,6 +34,20 @@ namespace bcp::flux
 {
     namespace
     {
+        /** How much standing queue this path tolerates before growth stops.
+
+            A fraction of the path's own delay, floored, because a fraction of a
+            very short path lands below the noise: on loopback an eighth of the
+            minimum is single-digit microseconds and ordinary scheduling jitter
+            is larger than that, so the sender reads a queue that is not there
+            and never grows again. */
+        uint32_t QueueTargetMicros(uint32_t minRttMicros) noexcept
+        {
+            const uint32_t target = minRttMicros / internal::QUEUE_TARGET_DIVISOR;
+            return target < internal::QUEUE_TARGET_MIN_MICROS
+                ? internal::QUEUE_TARGET_MIN_MICROS : target;
+        }
+
         /** CUBIC's window at `elapsedMicros` past the last reduction.
 
             W(t) = C(t - K)^3 + wMax, where K is how long the curve takes to
@@ -101,6 +118,16 @@ namespace bcp::flux
                                     / (100 + internal::CC_LOSS_RETAIN_PERCENT);
             return retained + rounds * perRound;
         }
+    }
+
+    void Socket::AssertBudgetInRange(const Peer& peer) const noexcept
+    {
+        // A value outside the range is not a tuning problem, it is a
+        // bookkeeping bug, and a silent clamp would hide it from the person who
+        // has to find it.
+        assert(peer.congestionBudget >= minCongestionBudget_
+            && peer.congestionBudget <= maxCongestionBudget_);
+        (void)peer;
     }
 
     void Socket::ApplyCongestion(Peer& peer, const CongestionDelta& delta,
@@ -179,9 +206,6 @@ namespace bcp::flux
             // settles the window at the AIMD equilibrium for the loss rate,
             // which on a lossy-but-idle link is a fraction of what it carries.
             const uint32_t minRtt = peer.rtt.MinRttMicros();
-            uint32_t queueTarget = minRtt / internal::QUEUE_TARGET_DIVISOR;
-            if (queueTarget < internal::QUEUE_TARGET_MIN_MICROS)
-                queueTarget = internal::QUEUE_TARGET_MIN_MICROS;
 
             // The queue is one witness and the size of the bite is the other,
             // because the queue estimate goes blind in exactly one case: a
@@ -209,7 +233,7 @@ namespace bcp::flux
             const bool inSlowStart = peer.congestionBudget < peer.slowStartThreshold;
 
             const bool congested = minRtt == 0
-                                || peer.rtt.QueueMicros() > queueTarget
+                                || peer.rtt.QueueMicros() > QueueTargetMicros(minRtt)
                                 || bigBite
                                 || inSlowStart;
             const uint32_t retain = congested ? internal::CC_LOSS_RETAIN_PERCENT
@@ -245,6 +269,7 @@ namespace bcp::flux
                 peer.congestionEpochMicros = nowMicros;
             }
             ++peer.congestionEpoch;
+            AssertBudgetInRange(peer);
             return;   // nothing grows in the same breath as a reduction
         }
 
@@ -261,13 +286,10 @@ namespace bcp::flux
         // holding it there would be worse than any queue it could build: after
         // a reduction the budget sits at the floor, and a governor that refuses
         // to let it leave freezes the peer at two packets for good.
-        const uint32_t minRtt = peer.rtt.MinRttMicros();
-        uint32_t target = minRtt / internal::QUEUE_TARGET_DIVISOR;
-        if (target < internal::QUEUE_TARGET_MIN_MICROS)
-            target = internal::QUEUE_TARGET_MIN_MICROS;
-        if (minRtt != 0
+        const uint32_t queueMinRtt = peer.rtt.MinRttMicros();
+        if (queueMinRtt != 0
             && peer.congestionBudget >= internal::CC_INITIAL_WINDOW_BYTES
-            && peer.rtt.QueueMicros() > target)
+            && peer.rtt.QueueMicros() > QueueTargetMicros(queueMinRtt))
         {
             // A queue found while still doubling means the bottleneck is here.
             // Stop and stay, rather than carrying on until the buffer overflows
@@ -290,6 +312,7 @@ namespace bcp::flux
             if (grown < peer.congestionBudget) grown = UINT32_MAX;
             if (grown > maxCongestionBudget_)  grown = maxCongestionBudget_;
             peer.congestionBudget = grown;
+            AssertBudgetInRange(peer);
             return;
         }
 
@@ -322,10 +345,6 @@ namespace bcp::flux
             peer.congestionBudget = grown;
         }
 
-        // The whole range, asserted at the one place the budget moves. A value
-        // outside it is not a tuning problem, it is a bookkeeping bug, and a
-        // clamp alone would hide it from the person who needs to find it.
-        assert(peer.congestionBudget >= minCongestionBudget_
-            && peer.congestionBudget <= maxCongestionBudget_);
+        AssertBudgetInRange(peer);
     }
 }

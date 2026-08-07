@@ -885,6 +885,10 @@ namespace bcp::flux
             smooth the round-trip, grow on acks and trim on loss. */
         void ApplyCongestion(Peer& peer, const CongestionDelta& delta, uint64_t nowMicros) noexcept;
 
+        /** Debug guard on the congestion budget, asked on every path that
+            leaves ApplyCongestion. */
+        void AssertBudgetInRange(const Peer& peer) const noexcept;
+
         // --- Tick / eviction ---
         // Update threads `nowOverride` (0 = real clock) to each sub-step, which
         // reads Now(nowOverride) fresh, never a captured value. Idle eviction is
