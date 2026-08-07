@@ -1432,7 +1432,34 @@ namespace bcp::flux
         {
             InAssociation* assoc = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(existing));
-            const FlowEpochOrder order = CompareFlowEpoch(assoc->flowEpoch, flowEpoch);
+            FlowEpochOrder order = CompareFlowEpoch(assoc->flowEpoch, flowEpoch);
+
+            // A way out of falling too far behind. The comparison walks forward
+            // from what this side holds and calls a long walk a straggler,
+            // because the field wraps and a late packet from a generation that
+            // is gone must not pull the association back onto a sequence space
+            // nothing will ever send on again.
+            //
+            // But three missed generations is a cliff with nothing beyond it.
+            // Past that every arrival reads as a straggler and is dropped with
+            // no delivery, no acknowledgement and no rejection, so the sender
+            // resolves nothing, its association dies, the application reopens,
+            // and the distance grows by one more. The only exit is the field
+            // coming round again, which lands on a generation this side still
+            // holds and is worse than the stall.
+            //
+            // Silence is what separates the two cases. A straggler arrives
+            // while the association is otherwise busy, so the cursor has moved
+            // recently. An association that has delivered nothing for the whole
+            // stall timeout has no live generation left to protect, so the
+            // arriving one is believed. Being wrong costs one reset onto a dead
+            // sequence space, which goes silent and is reset again by the next
+            // real generation. Being right ends a stall that has no other end.
+            if (order == FlowEpochOrder::Stale
+                && Elapsed(common::MonotonicMicros(), assoc->lastProgressMicros)
+                       > flowStallTimeout_)
+                order = FlowEpochOrder::Newer;
+
             if (order == FlowEpochOrder::Newer)
             {
                 // The sender closed this id and opened it again, so it numbers
