@@ -129,6 +129,33 @@ namespace bcp::flux::internal
     // trims to CC_LOSS_RETAIN_PERCENT on loss, never below the Config floor.
     static constexpr uint32_t CC_INITIAL_WINDOW_BYTES       = 10u * MAX_WIRE_PACKET_SIZE;
 
+    /** What fraction of itself the budget adds per round trip in slow start,
+        once it is past the opening window, as a percentage.
+
+        Doubling cannot know the ceiling until it passes it, so the last step
+        always overshoots, and the size of that overshoot is the size of the
+        step. Measured on a 100 ms path holding 625 KB: the budget went from
+        517 KB to 1032 KB in one round trip, 407 KB past what the path holds,
+        overflowed the buffer and took 21 percent self-inflicted loss with 18.2
+        MB on the wire to move 10 MB.
+
+        Seventy five rather than a hundred, chosen by measurement rather than
+        taste. Swept against the head to head on three link shapes: at 75 the
+        long path improves from 2.66 s to 2.47 while the short ones do not
+        move, at 65 it costs 0.08 s on the long path and 2 percent on the
+        others, at 50 it costs 0.20 s and 6 percent. Below 75 the slower ramp
+        takes back more than the smaller overshoot saves.
+
+        Small windows still double. Below the opening window the overshoot is a
+        few packets and the ramp matters more than the miss.
+
+        This pairs with the staging pool default and neither works alone. With
+        the pool at 512 the pool itself capped in flight below a fat path, so
+        it hid the overshoot and no measurement could see it. Raising the pool
+        without this made the long path markedly worse, 3.60 s, because the
+        overshoot was finally free to happen. */
+    static constexpr uint32_t CC_SLOW_START_GROWTH_PERCENT  = 75;
+
     /** What the budget keeps on a congestion event. 70 percent is CUBIC's
         figure, and it is deeper than the 85 that came before it. Two reasons it
         is affordable now. The curve returns to the previous window in a fraction

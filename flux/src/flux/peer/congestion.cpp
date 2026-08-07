@@ -305,10 +305,23 @@ namespace bcp::flux
 
         if (peer.congestionBudget < peer.slowStartThreshold)
         {
-            // Slow start: double per round trip. Saturating, so growth can
-            // never wrap the budget, and capped at the ceiling because a
-            // budget past what every window can hold is a stored burst.
-            uint32_t grown = peer.congestionBudget + delta.ackedBytes;
+            // Slow start. Small windows double, because their overshoot is a
+            // few packets and the ramp is what matters. Past the opening
+            // window the step is what gets overshot, so it is taken at a
+            // fraction: the acknowledged bytes are what a full doubling would
+            // add, and only part of that is taken.
+            //
+            // Saturating, so growth can never wrap the budget, and capped at
+            // the ceiling because a budget past what every window can hold is
+            // a stored burst rather than a window.
+            uint32_t step = delta.ackedBytes;
+            if (peer.congestionBudget >= internal::CC_INITIAL_WINDOW_BYTES)
+                step = static_cast<uint32_t>(
+                    static_cast<uint64_t>(step)
+                    * internal::CC_SLOW_START_GROWTH_PERCENT / 100);
+            if (step == 0) step = 1;   // never stall the ramp on rounding
+
+            uint32_t grown = peer.congestionBudget + step;
             if (grown < peer.congestionBudget) grown = UINT32_MAX;
             if (grown > maxCongestionBudget_)  grown = maxCongestionBudget_;
             peer.congestionBudget = grown;

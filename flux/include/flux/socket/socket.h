@@ -270,8 +270,17 @@ namespace bcp::flux
                     passes it, so a flow whose receiver has stalled holds on to
                     everything in its window. Few enough of those and the pool
                     is gone, and then every reliable send on the socket fails,
-                    including the ones to peers that are perfectly healthy. */
-                uint32_t stagingCount      = 512;
+                    including the ones to peers that are perfectly healthy.
+
+                    It is also a ceiling on throughput, and a quiet one. Every
+                    reliable packet in flight holds a slot, so the pool caps
+                    what can be on the path however large the congestion budget
+                    grows. At 512 that was about 520 KB, below what a 50 Mbit
+                    link at 100 ms holds, so the pool was the limit rather than
+                    the controller and no measurement said so. 2048 clears any
+                    path this transport is likely to meet. Lower it deliberately
+                    if memory is tighter than throughput. */
+                uint32_t stagingCount      = 2048;
                 /** In-flight byte budget never drops below this on a loss run:
                     throttled, never strangled. 0 takes CC_MIN_BUDGET_DEFAULT;
                     floored at one full wire packet either way, so the gate can
