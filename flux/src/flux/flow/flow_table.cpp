@@ -394,6 +394,16 @@ namespace bcp::flux
             seqField[1] = static_cast<uint8_t>(seq >> 8);
             seqField[2] = static_cast<uint8_t>(seq >> 16);
             seqField[3] = static_cast<uint8_t>(seq >> 24);
+
+            // The generation goes on beside it, from the association rather
+            // than from the handle the packet was built with. The two belong
+            // together: a generation names one run of sequence numbers, and
+            // the run is the association's. A handle is fixed at open and
+            // outlives any number of associations, so a byte taken from it
+            // would still claim the first generation after the fourth restart.
+            uint8_t* dataField = seqField + internal::WIRE_FLOW_SEQ_SIZE;
+            *dataField = static_cast<uint8_t>(
+                (*dataField & ~(FLOW_EPOCH_MASK << 3)) | (flow.flowEpoch << 3));
         }
 
         /** Appends to the waiting FIFO. Ownership of packetSlot passes to the ring.
@@ -1257,11 +1267,34 @@ namespace bcp::flux
         FlowMode mode{};
         uint8_t  flowEpoch = 0;
         {
-            const Flow* flow = reinterpret_cast<const Flow*>(flowPool_.ReadLock(flowSlot));
+            // A generation is minted here, where the sequence space restarts,
+            // and not only where the application opens the flow. Those are
+            // different events, and treating them as one loses data silently.
+            //
+            // An association is freed when its peer goes away, while the flow
+            // stays open. The next send builds a fresh one numbering from one
+            // again. The far side is a different socket and evicted nothing, so
+            // it still holds its association with the cursor far ahead, reads
+            // the same generation as current, and discards every restarted
+            // sequence as a duplicate it already has. Worse, its acknowledgement
+            // carries that old cursor and resolves the whole restarted run,
+            // so this side frees its retained copies and reports success for
+            // data that was never delivered.
+            //
+            // The write lock is what serialises this against OpenFlow, which
+            // is the only other writer of the byte.
+            Flow* flow = reinterpret_cast<Flow*>(flowPool_.WriteLock(flowSlot));
             const bool open = flow->life == FlowLifecycle::OPEN;
-            mode      = flow->mode;
-            flowEpoch = FlowDataEpoch(flow->flowData);
-            flowPool_.UnlockRead(flowSlot);
+            mode = flow->mode;
+            if (open)
+            {
+                flowEpoch = static_cast<uint8_t>(
+                    (FlowDataEpoch(flow->flowData) + 1u) & FLOW_EPOCH_MASK);
+                flow->flowData = static_cast<uint8_t>(
+                    (flow->flowData & ~(FLOW_EPOCH_MASK << 3))
+                    | (flowEpoch << 3));
+            }
+            flowPool_.UnlockWrite(flowSlot);
             if (!open)
                 return common::collections::SlotPool::INVALID;
         }
