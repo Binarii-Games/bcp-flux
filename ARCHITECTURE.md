@@ -942,6 +942,13 @@ wire answers to the same clock, retransmits included. A resend released at
 tick speed rather than path speed re-overflows the very buffer whose loss it
 is answering, and each wave of copies then drowns the wave before it.
 
+Loss only counts as a congestion signal at all once the path is losing more
+than a congested path needs to. A flow at its fair share of a busy link loses a
+fraction of a percent, because that is all the feedback requires, so a link
+dropping whole percentages steadily is describing itself rather than asking
+anyone to slow down. Below that tolerance the delay signal is the whole
+detector, which is what it was built to be.
+
 A loss trims, and how far depends on whether it was congestion. Two witnesses
 answer that. The queue at the moment of the loss, and the size of the bite,
 because the queue estimate goes blind in exactly one case, a burst overflowing

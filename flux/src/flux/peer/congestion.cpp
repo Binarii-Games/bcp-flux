@@ -167,9 +167,20 @@ namespace bcp::flux
             // filling and the bite for a shallow one overflowing, and the
             // ramp itself now ends on the delay sighting rather than waiting
             // for loss to be the messenger.
+            // A link losing whole percentages steadily is describing itself,
+            // not asking this sender to slow down, so below the tolerance the
+            // queue is the entire congestion detector and the bite witness
+            // has no vote. That is not a loosening: the queue sees a
+            // bottleneck filling before anything is dropped, which is earlier
+            // and more specific than loss ever is. The witness regains its
+            // vote the moment the link loses more than a congested one needs
+            // to, which is where a shallow buffer overflowing lands.
+            const bool lossAboveTolerance =
+                peer.delivery.LossPercent() > internal::CC_LOSS_TOLERANCE_PERCENT;
+
             const bool congested = minRtt == 0
                                 || peer.rtt.QueueMicros() > internal::QueueTargetMicros(minRtt)
-                                || bigBite;
+                                || (bigBite && lossAboveTolerance);
             const uint32_t retain = congested ? internal::CC_LOSS_RETAIN_PERCENT
                                               : internal::CC_NOISE_RETAIN_PERCENT;
 

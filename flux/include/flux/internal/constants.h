@@ -191,6 +191,27 @@ namespace bcp::flux::internal
     static constexpr uint32_t DELIVERY_BUCKETS              = 4;
     static constexpr uint32_t DELIVERY_BUCKET_MICROS        = 250000;
 
+    /** The share of loss this path may sustain before loss is believed as a
+        congestion signal at all.
+
+        A flow at its fair share of a congested link loses a fraction of a
+        percent, because that is all it takes for the feedback to work. A link
+        losing whole percentages steadily is not telling a sender to slow down,
+        it is telling it what the link is: interference, a fade, a bad cable.
+        Reacting to that as congestion settles the window at the equilibrium
+        for the loss rate, which is a small fraction of what the path carries
+        and is where seven seconds of a ten second transfer went.
+
+        Below this figure the delay signal is the whole congestion detector,
+        which it is designed to be: the queue estimate sees a bottleneck
+        filling before anything is dropped, and the governor stops growth on
+        it. Loss only regains its vote once the link is losing more than a
+        congested link ever needs to.
+
+        Two percent is the figure BBRv2 uses for the same judgement, arrived at
+        from the same reasoning. */
+    static constexpr uint32_t CC_LOSS_TOLERANCE_PERCENT     = 2;
+
     /** How close to the path's measured capacity a sender must be before a
         burst of losses may be read as its own buffer overflow.
 
