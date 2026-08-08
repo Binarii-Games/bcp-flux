@@ -183,6 +183,15 @@ namespace bcp::flux
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
                                           ///< at or above, the curve decides
 
+        /** When a standing queue was first seen while still in slow start,
+            0 while the path reads clean. The ramp doubles until the newest
+            sample shows a queue, holds flat while this clock runs, and ends
+            slow start when the queue outlives the confirmation. Timed rather
+            than counted, because the question it answers is how long the
+            queue persisted, not how many acknowledgements arrived while it
+            did. */
+        uint64_t slowStartQueueSinceMicros;
+
         /** The budget this peer held when congestion was last detected, and
             when that happened. The curve climbs back toward the first as a
             function of time since the second, which is what makes recovery

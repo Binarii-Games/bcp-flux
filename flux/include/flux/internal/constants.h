@@ -129,32 +129,32 @@ namespace bcp::flux::internal
     // trims to CC_LOSS_RETAIN_PERCENT on loss, never below the Config floor.
     static constexpr uint32_t CC_INITIAL_WINDOW_BYTES       = 10u * MAX_WIRE_PACKET_SIZE;
 
-    /** What fraction of itself the budget adds per round trip in slow start,
-        once it is past the opening window, as a percentage.
+    /** How many round trips a standing queue must hold, with the budget held
+        flat, before slow start ends on it.
 
-        Doubling cannot know the ceiling until it passes it, so the last step
-        always overshoots, and the size of that overshoot is the size of the
-        step. Measured on a 100 ms path holding 625 KB: the budget went from
-        517 KB to 1032 KB in one round trip, 407 KB past what the path holds,
-        overflowed the buffer and took 21 percent self-inflicted loss with 18.2
-        MB on the wire to move 10 MB.
+        Slow start doubles for as long as the path shows no standing queue.
+        Doubling cannot know the ceiling until it passes it, and the overshoot
+        is the size of the last step. Measured on a 100 ms path holding 625 KB:
+        the budget went from 517 KB to 1032 KB in one round trip, 407 KB past
+        what the path holds, overflowed the buffer and took 21 percent
+        self-inflicted loss with 18.2 MB on the wire to move 10 MB. A flat
+        reduction of the ramp fixes that by taxing every link, clean or not,
+        so the ramp reacts to the queue instead and pays only where one forms.
 
-        Seventy five rather than a hundred, chosen by measurement rather than
-        taste. Swept against the head to head on three link shapes: at 75 the
-        long path improves from 2.66 s to 2.47 while the short ones do not
-        move, at 65 it costs 0.08 s on the long path and 2 percent on the
-        others, at 50 it costs 0.20 s and 6 percent. Below 75 the slower ramp
-        takes back more than the smaller overshoot saves.
+        A sighting opens on the newest sample and the confirmation holds the
+        budget flat until the smoothed figure agrees or both read clean again.
+        Each half of that came from a measured failure. Growing a quarter per
+        round trip during the check carried the budget into the buffer's drop
+        ceiling before the verdict arrived. Releasing on the newest sample
+        alone let one clean reading per round resume the doubling against a
+        real queue, so the budget climbed past the ceiling in steps and the
+        exit never fired.
 
-        Small windows still double. Below the opening window the overshoot is a
-        few packets and the ramp matters more than the miss.
-
-        This pairs with the staging pool default and neither works alone. With
-        the pool at 512 the pool itself capped in flight below a fat path, so
-        it hid the overshoot and no measurement could see it. Raising the pool
-        without this made the long path markedly worse, 3.60 s, because the
-        overshoot was finally free to happen. */
-    static constexpr uint32_t CC_SLOW_START_GROWTH_PERCENT  = 75;
+        Two round trips, because one sighting can be scheduling jitter or a
+        coalesced acknowledgement, and ending the ramp on it strands the
+        budget far below what the path carries. A queue that outlives two
+        round trips with the budget flat is a queue this sender is building. */
+    static constexpr uint32_t CC_SLOW_START_CONFIRM_ROUNDS  = 2;
 
     /** What the budget keeps on a congestion event. 70 percent is CUBIC's
         figure, and it is deeper than the 85 that came before it. Two reasons it

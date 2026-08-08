@@ -464,6 +464,7 @@ namespace bcp::flux
         p->grantSendPending     = false;   // raised when a session commits
         p->grantSentAtMicros    = 0;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
+        p->slowStartQueueSinceMicros = 0;
         p->rtt.Reset();
         p->wMaxBytes             = 0;
         p->congestionEpochMicros = 0;

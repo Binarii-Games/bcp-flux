@@ -181,9 +181,10 @@ namespace bcp::flux
                 // stops trimming for them at all.
                 if (peer.congestionBudget != minCongestionBudget_)
                 {
-                    peer.congestionBudget      = minCongestionBudget_;
-                    peer.wMaxBytes             = minCongestionBudget_;
-                    peer.congestionEpochMicros = nowMicros;
+                    peer.congestionBudget          = minCongestionBudget_;
+                    peer.wMaxBytes                 = minCongestionBudget_;
+                    peer.congestionEpochMicros     = nowMicros;
+                    peer.slowStartQueueSinceMicros = 0;
                     ++peer.congestionEpoch;
                 }
             }
@@ -250,7 +251,8 @@ namespace bcp::flux
                 static_cast<uint64_t>(peer.congestionBudget) * retain / 100);
             if (trimmed < minCongestionBudget_) trimmed = minCongestionBudget_;
 
-            peer.congestionBudget = trimmed;
+            peer.congestionBudget          = trimmed;
+            peer.slowStartQueueSinceMicros = 0;
 
             // Two different clocks, and only one of them moves for noise. The
             // reaction epoch always advances, because it is what bounds the
@@ -276,49 +278,76 @@ namespace bcp::flux
         if (delta.ackedBytes == 0) return;
 
 
-        // The governor, and the only thing here reading a signal other than
-        // loss. Whatever the curve wants, the window does not grow while a
-        // queue is already standing in front of it: past that point more in
-        // flight buys no throughput at all, and buys latency for everything
-        // sharing the link. Without this the resting place is a full buffer.
-        // Not applied below the opening window. A sender with a handful of
-        // packets on the path cannot be the cause of a standing queue, and
-        // holding it there would be worse than any queue it could build: after
-        // a reduction the budget sits at the floor, and a governor that refuses
-        // to let it leave freezes the peer at two packets for good.
+        // The queue readings the branches below act on. Not taken below the
+        // opening window. A sender with a handful of packets on the path
+        // cannot be the cause of a standing queue, and after a reduction the
+        // budget sits at the floor, so acting on a reading there would freeze
+        // the peer at two packets for good.
         const uint32_t queueMinRtt = peer.rtt.MinRttMicros();
-        if (queueMinRtt != 0
-            && peer.congestionBudget >= internal::CC_INITIAL_WINDOW_BYTES
-            && peer.rtt.QueueMicros() > QueueTargetMicros(queueMinRtt))
-        {
-            // A queue found while still doubling means the bottleneck is here.
-            // Stop and stay, rather than carrying on until the buffer overflows
-            // and finding the same answer the expensive way.
-            if (peer.congestionBudget < peer.slowStartThreshold)
-            {
-                peer.slowStartThreshold    = peer.congestionBudget;
-                peer.wMaxBytes             = peer.congestionBudget;
-                peer.congestionEpochMicros = nowMicros;
-            }
-            return;
-        }
+        const bool     signalLive  = queueMinRtt != 0
+            && peer.congestionBudget >= internal::CC_INITIAL_WINDOW_BYTES;
+        const uint32_t queueTarget = signalLive
+            ? QueueTargetMicros(queueMinRtt) : 0;
+        const bool queueStanding  = signalLive
+            && peer.rtt.QueueMicros() > queueTarget;
+        const bool latestStanding = signalLive
+            && peer.rtt.LatestQueueMicros() > queueTarget;
 
         if (peer.congestionBudget < peer.slowStartThreshold)
         {
-            // Slow start. Small windows double, because their overshoot is a
-            // few packets and the ramp is what matters. Past the opening
-            // window the step is what gets overshot, so it is taken at a
-            // fraction: the acknowledged bytes are what a full doubling would
-            // add, and only part of that is taken.
-            //
+            // Slow start doubles while the path reads clean, because a flat
+            // fraction of a doubling taxes every link to protect the few that
+            // need protecting. The sighting that stops it comes from the
+            // newest sample, which crosses the moment a queue forms, where
+            // the smoothed figure lags a full doubling behind. The ramp then
+            // holds flat while the smoothed figure is given time to agree:
+            // one sample can be jitter or a coalesced acknowledgement, and
+            // ending the ramp on it strands the budget far below what the
+            // path carries. Growing through that check instead of holding
+            // was measured overflowing the buffer before the verdict could
+            // arrive. A queue that outlives the check with the budget flat
+            // is this sender's own, and slow start ends where it stands, one
+            // buffer overflow earlier than a loss would have ended it.
+            if (peer.slowStartQueueSinceMicros == 0)
+            {
+                if (latestStanding)
+                {
+                    peer.slowStartQueueSinceMicros = nowMicros;
+                    return;
+                }
+            }
+            else if (!latestStanding && !queueStanding)
+            {
+                // Both readings clean again: the sighting was noise, the
+                // doubling resumes below. Released only when the smoothed
+                // figure agrees, because the newest sample alone dips once
+                // per round on a real queue, and resuming on each dip climbs
+                // straight past the ceiling in steps.
+                peer.slowStartQueueSinceMicros = 0;
+            }
+            else
+            {
+                const uint64_t held = nowMicros > peer.slowStartQueueSinceMicros
+                    ? nowMicros - peer.slowStartQueueSinceMicros : 0;
+                const uint64_t confirm =
+                    static_cast<uint64_t>(internal::CC_SLOW_START_CONFIRM_ROUNDS)
+                    * peer.rtt.RoundTripOr(flows_.RetryIntervalMicros());
+                if (held >= confirm)
+                {
+                    peer.slowStartThreshold        = peer.congestionBudget;
+                    peer.wMaxBytes                 = peer.congestionBudget;
+                    peer.congestionEpochMicros     = nowMicros;
+                    peer.slowStartQueueSinceMicros = 0;
+                    AssertBudgetInRange(peer);
+                }
+                return;   // flat while confirming, and nothing grows the
+                          // moment slow start ends
+            }
+
             // Saturating, so growth can never wrap the budget, and capped at
             // the ceiling because a budget past what every window can hold is
             // a stored burst rather than a window.
             uint32_t step = delta.ackedBytes;
-            if (peer.congestionBudget >= internal::CC_INITIAL_WINDOW_BYTES)
-                step = static_cast<uint32_t>(
-                    static_cast<uint64_t>(step)
-                    * internal::CC_SLOW_START_GROWTH_PERCENT / 100);
             if (step == 0) step = 1;   // never stall the ramp on rounding
 
             uint32_t grown = peer.congestionBudget + step;
@@ -328,6 +357,14 @@ namespace bcp::flux
             AssertBudgetInRange(peer);
             return;
         }
+
+        // The governor, and the only thing past slow start reading a signal
+        // other than loss. Whatever the curve wants, the window does not grow
+        // while a queue is already standing in front of it: past that point
+        // more in flight buys no throughput at all, and buys latency for
+        // everything sharing the link. Without this the resting place is a
+        // full buffer.
+        if (queueStanding) return;
 
         // Congestion avoidance. The curve is a function of time since the last
         // reduction, so it needs a starting point, and a peer that has never

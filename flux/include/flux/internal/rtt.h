@@ -102,6 +102,18 @@ namespace bcp::flux::internal
             return srttMicros - lowest;
         }
 
+        /** The queue the newest sample saw, against the same floor. The
+            smoothed figure above lags by design, and while the budget is
+            doubling that lag is worth hundreds of kilobytes of overshoot, so
+            the ramp watches this one. A single sample can lie, which is what
+            the confirmation window it feeds exists to absorb. */
+        [[nodiscard]] uint32_t LatestQueueMicros() const noexcept
+        {
+            const uint32_t lowest = MinRttMicros();
+            if (lowest == 0 || latestMicros <= lowest) return 0;
+            return latestMicros - lowest;
+        }
+
         /** The peer answered. Resets the silence whether or not the
             acknowledgement also yielded a usable round trip, because a reply
             Karn's rule refuses is still proof the peer is there. */

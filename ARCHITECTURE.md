@@ -916,13 +916,19 @@ the same news arriving earlier, before anything has had to be thrown away. A
 controller with only the first has one resting place and it is a full buffer,
 because a full buffer is the only thing that produces a loss.
 
-While the budget is below the slow-start threshold it doubles per round trip.
-Above it, growth is a function of time since the last reduction rather than of
-acknowledged bytes, so a long path recovers as fast as a short one, with a
-straight-line estimate underneath so a short path is not punished for running a
-curve designed for long ones. Over both sits a governor: whatever the curve
-wants, the budget does not grow while a standing queue already exceeds a
-fraction of the path's minimum round trip.
+While the budget is below the slow-start threshold it doubles per round trip
+for as long as the path shows no standing queue. The sighting that stops it
+comes from the newest round-trip sample, which crosses the moment a queue
+forms, where the smoothed average lags a full doubling behind. On a sighting
+the ramp holds flat while the smoothed figure is given a couple of round trips
+to agree. A sighting that fades on both readings resumes the doubling, and one
+that holds ends slow start where it stands, one buffer overflow earlier than a
+loss would have ended it. Above the threshold, growth is a function of time
+since the last reduction rather than of acknowledged bytes, so a long path
+recovers as fast as a short one, with a straight-line estimate underneath so a
+short path is not punished for running a curve designed for long ones. Over
+the curve sits a governor: whatever it wants, the budget does not grow while a
+standing queue already exceeds a fraction of the path's minimum round trip.
 
 A loss trims, and how far depends on whether it was congestion. Two witnesses
 answer that. The queue at the moment of the loss, and the size of the bite,
