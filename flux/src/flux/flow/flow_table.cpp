@@ -331,6 +331,15 @@ namespace bcp::flux
             return peer.pacingTokens >= wireSize;
         }
 
+        /** Takes the bytes off the allowance, saturating at zero for the
+            unpaced case where nothing was ever checked against it.
+            @pre Caller holds the peer write lock. */
+        void SpendPacing(Peer& peer, uint16_t wireSize) noexcept
+        {
+            peer.pacingTokens = peer.pacingTokens > wireSize
+                ? peer.pacingTokens - wireSize : 0;
+        }
+
         /** Pure predicate over the already-locked flow and peer, running every check
             a send needs. The window bounds PACKETS per flow (the receiver's dedupe
             guarantee; reliable only), the congestion budget bounds BYTES per peer
@@ -381,8 +390,7 @@ namespace bcp::flux
 
             flow.unresolved += 1;
             peer.bytesInFlight += wireSize;      // congestion spend
-            peer.pacingTokens = peer.pacingTokens > wireSize        // pacing spend
-                ? peer.pacingTokens - wireSize : 0;
+            SpendPacing(peer, wireSize);         // pacing spend
             peer.outstandingToPeer += 1;         // grant spend
             flow.nextSeq = seq + 1;
             if (flow.nextSeq == 0) flow.nextSeq = 1;   // 0 is the never-sent sentinel
@@ -1956,7 +1964,7 @@ namespace bcp::flux
         }
     }
 
-    void FlowTable::RetransmitInflight(OutAssociation& flow, const Peer& peer,
+    void FlowTable::RetransmitInflight(OutAssociation& flow, Peer& peer,
                                        uint64_t now, CongestionDelta& delta,
                                        uint32_t* resendSeqs, uint32_t* resendSlots,
                                        uint32_t& resendCount, bool& assocDead) noexcept
@@ -2023,8 +2031,10 @@ namespace bcp::flux
                 if (entry.sentAtMicros == 0
                     || Elapsed(now, entry.sentAtMicros) < flowStallTimeout_) continue;
                 if (entry.packetSlot != common::collections::SlotPool::INVALID
-                    && resendCount < RESENDS_PER_ASSOC_PER_TICK)
+                    && resendCount < RESENDS_PER_ASSOC_PER_TICK
+                    && PacingAllows(peer, now, entry.wireSize))
                 {
+                    SpendPacing(peer, entry.wireSize);
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
                     entry.sentAtMicros = now;
@@ -2054,11 +2064,23 @@ namespace bcp::flux
             }
             else
             {
-                delta.sawProbe = true;
-
+                // The clock gates collection itself. A packet the clock
+                // refuses keeps its state untouched, still overdue, and the
+                // next tick offers it again, so recovery drains at the rate
+                // the path can carry. Unpaced, a burst of losses came back as
+                // a burst of copies at tick speed, re-overflowed the buffer
+                // the trim had just drained, and each wave of copies then
+                // drowned the wave before it.
+                //
+                // sawProbe is only claimed for a packet that was actually
+                // taken, because its consumer reasons about silence after a
+                // probe went out, and a refused probe never did.
                 if (entry.packetSlot != common::collections::SlotPool::INVALID
-                    && resendCount < RESENDS_PER_ASSOC_PER_TICK)
+                    && resendCount < RESENDS_PER_ASSOC_PER_TICK
+                    && PacingAllows(peer, now, entry.wireSize))
                 {
+                    delta.sawProbe = true;
+                    SpendPacing(peer, entry.wireSize);
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
                     entry.sentAtMicros = now;   // don't re-fire before next deadline
@@ -2076,7 +2098,7 @@ namespace bcp::flux
         }
     }
 
-    void FlowTable::RetransmitPass(uint32_t assocSlot, const Peer& peer,
+    void FlowTable::RetransmitPass(uint32_t assocSlot, Peer& peer,
                                    uint64_t now, CongestionDelta& delta,
                                    uint16_t& outFlowId, uint32_t* resendSeqs,
                                    uint32_t* resendSlots, uint32_t& resendCount,

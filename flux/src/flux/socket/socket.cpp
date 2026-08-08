@@ -3102,16 +3102,18 @@ namespace bcp::flux
             // peer lock, and it drops with the scope, before any send.
             PeerHandle peerHandle = std::move(peer);
             if (peerHandle.Failed()) return;
-            const Peer* readPeer = peerHandle.Read();
+            // Writable from the start, because the retransmit gather spends
+            // the pacing allowance as it collects.
+            Peer* peerState = peerHandle.Write();
             // A packet admitted while the handshake was still running sits in
             // an association with no session to seal it. Retransmits wait for
             // the session rather than burning attempts on a key that does not
             // exist yet.
-            if (!readPeer || !readPeer->IsValid()) return;
+            if (!peerState || !peerState->IsValid()) return;
             flowSlot = flows_.OutAssocAt(peerHandle.GetSlotIndex(), dirIndex);
             if (flowSlot == common::collections::SlotPool::INVALID) return;
 
-            flows_.RetransmitPass(flowSlot, *readPeer, now, ccDelta, flowId, resendSeqs, resendSlots,
+            flows_.RetransmitPass(flowSlot, *peerState, now, ccDelta, flowId, resendSeqs, resendSlots,
                                   resendN, assocDead);
 
             // The target stopped resolving this flow for the whole stall
@@ -3121,26 +3123,22 @@ namespace bcp::flux
             // so the two never nest wrong.
             if (assocDead)
             {
-                if (Peer* dying = peerHandle.Write())
-                {
-                    const bool justFailed = flows_.FailAssoc(flowSlot, flowId, dying);
-                    if (justFailed && events_.Record(EventScope::OUT_FLOW, flowSlot,
-                                       readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
-                                       SocketEvent::OUTGOING_FLOW_LOST, addr, flowId))
-                        flows_.MarkEmitting(EventScope::OUT_FLOW, flowSlot);
-                    return;
-                }
+                const bool justFailed = flows_.FailAssoc(flowSlot, flowId, peerState);
+                if (justFailed && events_.Record(EventScope::OUT_FLOW, flowSlot,
+                                   readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
+                                   SocketEvent::OUTGOING_FLOW_LOST, addr, flowId))
+                    flows_.MarkEmitting(EventScope::OUT_FLOW, flowSlot);
+                return;
             }
 
             const bool hasDelta = ccDelta.resolvedBytes != 0 || ccDelta.sawLoss;
             if (!hasDelta && resendN == 0) return;
 
-            // Congestion feedback applies under this write lock; the resends run
-            // after the scope with nothing held, because a resend takes the
-            // staging read lock and the send path takes staging before the peer.
-            // Doing it under the peer lock would invert that order.
-            Peer* peerState = peerHandle.Write();
-            if (!peerState || !peerState->IsValid()) return;
+            // Congestion feedback applies under the same write borrow. The
+            // resends themselves run after the scope with nothing held,
+            // because a resend takes the staging read lock and the send path
+            // takes staging before the peer. Doing it under the peer lock
+            // would invert that order.
             ApplyCongestion(*peerState, ccDelta, now);
             if (resendN == 0) return;
 

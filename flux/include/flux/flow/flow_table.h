@@ -398,8 +398,13 @@ namespace bcp::flux
             back in outFlowId. exhausted says a reliable packet ran out of
             attempts, which fails the association. Loss feedback accumulates in
             delta, never on the peer.
-            @pre caller holds the peer read lock. */
-        void RetransmitPass(uint32_t assocSlot, const Peer& peer,
+
+            Collection answers to the pacing clock exactly as a fresh send
+            does, which is why the peer arrives writable: the allowance is
+            spent as each entry is taken. An entry the clock refuses is left
+            untouched, still overdue, and the next tick offers it again.
+            @pre caller holds the peer write lock. */
+        void RetransmitPass(uint32_t assocSlot, Peer& peer,
                             uint64_t now, CongestionDelta& delta,
                             uint16_t& outFlowId, uint32_t* resendSeqs, uint32_t* resendSlots,
                             uint32_t& resendCount, bool& assocDead) noexcept;
@@ -620,7 +625,7 @@ namespace bcp::flux
 
         void ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept;
 
-        void RetransmitInflight(OutAssociation& flow, const Peer& peer,
+        void RetransmitInflight(OutAssociation& flow, Peer& peer,
                                 uint64_t now, CongestionDelta& delta,
                                 /*out*/ uint32_t* resendSeqs, uint32_t* resendSlots,
                                 uint32_t& resendCount, /*out*/ bool& assocDead) noexcept;

@@ -930,6 +930,13 @@ short path is not punished for running a curve designed for long ones. Over
 the curve sits a governor: whatever it wants, the budget does not grow while a
 standing queue already exceeds a fraction of the path's minimum round trip.
 
+The budget says how much may be outstanding, not how fast it may leave, so a
+pacing clock meters departures at the budget over the round trip, with a small
+gain and a small burst allowance. Every path that puts a flow packet on the
+wire answers to the same clock, retransmits included. A resend released at
+tick speed rather than path speed re-overflows the very buffer whose loss it
+is answering, and each wave of copies then drowns the wave before it.
+
 A loss trims, and how far depends on whether it was congestion. Two witnesses
 answer that. The queue at the moment of the loss, and the size of the bite,
 because the queue estimate goes blind in exactly one case, a burst overflowing
