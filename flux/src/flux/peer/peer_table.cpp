@@ -466,6 +466,7 @@ namespace bcp::flux
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
         p->slowStartQueueSinceMicros = 0;
         p->rtt.Reset();
+        p->delivery.Reset();
         p->wMaxBytes             = 0;
         p->congestionEpochMicros = 0;
         p->congestionEpoch       = 0;

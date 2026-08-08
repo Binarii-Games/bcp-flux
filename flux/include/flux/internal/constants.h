@@ -183,6 +183,31 @@ namespace bcp::flux::internal
         congestion, corroborated by the queue, costs the full cut. */
     static constexpr uint8_t  CC_NOISE_RETAIN_PERCENT       = 95;
 
+    /** The delivery estimate's memory: how long one bucket spans and how many
+        are kept. Four quarter seconds, so a rate has to be absent for a full
+        second before it is forgotten. Long enough that a burst cannot erase
+        the estimate it is about to be judged against, short enough that a path
+        which genuinely slowed is not judged against what it used to carry. */
+    static constexpr uint32_t DELIVERY_BUCKETS              = 4;
+    static constexpr uint32_t DELIVERY_BUCKET_MICROS        = 250000;
+
+    /** How close to the path's measured capacity a sender must be before a
+        burst of losses may be read as its own buffer overflow.
+
+        An overflow is self-inflicted, so it cannot happen to a sender that is
+        not filling the path, while interference takes packets at any rate.
+        Measured on a link losing two percent in bursts of twenty: forty four
+        of eighty trims were charged as overflow while the sender sat at thirty
+        one percent of capacity, holding it there for the whole transfer.
+
+        Seventy five rather than a hundred because the estimate is a floor. It
+        is the largest rate recently observed, and a sender that has been held
+        below capacity has never observed the whole of it, so demanding the
+        full figure would gate out real overflows on exactly the paths that
+        need the check. A shallow buffer overflows above the path's capacity
+        rather than below it, so the true positives sit well clear of this. */
+    static constexpr uint32_t CC_OVERFLOW_GATE_PERCENT      = 75;
+
     /** CUBIC's aggression, scaled by 100 so the curve stays in integers. The
         window follows C*(t - K)^3 + wMax with t in seconds, where K is how long
         the curve takes to climb back to wMax. 0.4 is the standard value. */

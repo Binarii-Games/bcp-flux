@@ -45,6 +45,11 @@ namespace bcp::flux
     void Socket::ApplyCongestion(Peer& peer, const CongestionDelta& delta,
                                   uint64_t nowMicros) noexcept
     {
+        // Captured before the free below, because the question a loss raises
+        // is how much was on the path when it happened, not how much is left
+        // now that this acknowledgement has cleared some of it.
+        const uint32_t inFlightAtEvent = peer.bytesInFlight;
+
         // Free what resolved, guarded so a bookkeeping drift can never wrap the
         // counter past zero into a huge value.
         peer.bytesInFlight -= delta.resolvedBytes <= peer.bytesInFlight
@@ -66,6 +71,12 @@ namespace bcp::flux
         // An answer of any kind means the peer is there, so the silence that
         // drives the doubling starts again.
         if (delta.ackedBytes != 0) peer.rtt.MarkAcked(nowMicros);
+
+        // What arrived is what the path demonstrably carries, and what did not
+        // is what it costs to use. Folded on every pass rather than only on a
+        // loss, since both have to be built while things are going well to be
+        // worth anything when they are not.
+        peer.delivery.Sample(delta.ackedBytes, delta.lostDeclaredBytes, nowMicros);
 
         // A probe went out and nothing came back with it. Past enough of them
         // the path is gone rather than busy, and a percentage of a number that
@@ -125,15 +136,24 @@ namespace bcp::flux
             // burst overflowing a shallow buffer. The packets that would have
             // carried the deep-queue reading are the ones the overflow
             // dropped, and the survivors met a buffer the pause just drained,
-            // so the estimate reads empty while the budget runs away. Volume
-            // is the physical tell between the two kinds of loss. Interference
-            // takes a small fraction of packets at any send rate, while
-            // overflow takes the whole excess: an acknowledgement declaring
-            // half of what it resolves as lost is not describing radio noise.
+            // so the estimate reads empty while the budget runs away.
+            //
+            // Volume alone cannot finish the job, because a burst of
+            // interference is byte for byte the same event: a run of losses
+            // with the queue reading empty. The two are indistinguishable from
+            // these two signals, so the bite carries a precondition rather
+            // than a tuning. An overflow is self-inflicted, so it can only
+            // happen to a sender near what the path carries, while
+            // interference takes packets at any rate. Measured on a link
+            // losing two percent in bursts of twenty: forty four of eighty
+            // trims were charged as overflow while the sender sat at a third
+            // of capacity, which is a rate that cannot overflow anything, and
+            // the full cut each time held it there for the whole transfer.
             const uint64_t lostBytes = delta.lostDeclaredBytes;
             const bool bigBite =
                 lostBytes * 2 >= lostBytes + delta.ackedBytes
-                && lostBytes >= 3ull * internal::MAX_WIRE_PACKET_SIZE;
+                && lostBytes >= 3ull * internal::MAX_WIRE_PACKET_SIZE
+                && peer.delivery.CouldOverflow(minRtt, inFlightAtEvent);
 
             // A loss during slow start is judged by the same two witnesses as
             // any other. It once ended slow start unconditionally, priced as

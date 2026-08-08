@@ -7,6 +7,7 @@
 
 #include <flux/address.h>
 #include <flux/internal/constants.h>
+#include <flux/internal/delivery.h>
 #include <flux/internal/rtt.h>
 #include <flux/peer/peer_id.h>
 
@@ -211,6 +212,11 @@ namespace bcp::flux
         /** The path to this peer, and the deadline built from it. Every flow
             to this peer shares it, because they all cross the same wire. */
         internal::RttEstimate rtt;
+
+        /** What this path was measured to carry. Read only where a loss is
+            being classified, to ask whether this sender was going fast enough
+            for the loss to have been its own doing. */
+        internal::DeliveryEstimate delivery;
 
         HandshakeState state;
         uint8_t attempts;      ///< handshake attempts so far; retry policy is the caller's
