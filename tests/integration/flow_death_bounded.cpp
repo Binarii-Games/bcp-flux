@@ -29,6 +29,7 @@
 #include <flux/flow/flow_handle.h>
 #include <flux/socket/packet_slot.h>
 #include <flux/wire/packet_builder.h>
+#include <flux/internal/constants.h>
 #include <flux/socket/platform/faulty_socket.h>
 
 #include "flux_net.h"
@@ -50,12 +51,44 @@ namespace
     constexpr uint32_t WARMUP     = 6;        ///< delivered first, so a round trip is measured
     constexpr uint32_t LATENCY_US = 15000;
 
-    /** No death may arrive sooner than this. The bound is a multiple of the
-        measured round trip with eight probes guaranteed inside it, and the
-        round trip here is about thirty milliseconds, so a correct
-        implementation lands far above this. A death below it means the
-        deadline is being treated as proof rather than as a prompt. */
-    constexpr int64_t FLOOR_MS = 100;
+    /** The forced acknowledgement cadence, which is the lower bound on the
+        hold term in the deadline. Config's default, restated because the
+        floor below is computed from it. */
+    constexpr uint32_t ACK_CADENCE_US = 5000;
+
+    /** The spec these bounds encode, written out rather than read from the
+        implementation.
+
+        Deliberately literals and NOT flux::internal::FLOW_DEATH_ROUNDS and
+        RTO_MARGIN_DIVISOR. A floor computed from the constant it is meant to
+        bound moves with that constant and can never catch a change to it:
+        with the constant read from the header, regressing it from sixteen to
+        two dropped the floor to below zero and the test stayed green on a
+        death eight times too early. So the intended figures live here, and
+        changing the implementation to disagree with them fails this test,
+        which is the point. If the policy is meant to change, this changes
+        too, as a decision rather than as a side effect. */
+    constexpr int64_t EXPECTED_DEATH_ROUNDS  = 16;   // FLOW_DEATH_ROUNDS
+    constexpr int64_t EXPECTED_RTO_MARGIN_DIV = 8;   // RTO_MARGIN_DIVISOR
+
+    /** No death may arrive sooner than this.
+
+        One timeout is at least the round trip plus its margin plus the hold,
+        and the deadline is that many of them. Injected jitter is additive, so
+        the measured round trip can never come in below LATENCY_US, which
+        makes every term a floor and the product a floor. A slower host
+        measures a longer round trip and dies later, so this cannot flake
+        upward.
+
+        It also has to clear 200 ms to mean anything, because the deadline is
+        clamped up to Config's retry interval and this test does not override
+        it. Any figure below that is satisfied by the clamp alone. This test
+        shipped with a hand-picked 100 and was therefore unfalsifiable. */
+    constexpr int64_t FLOOR_MS =
+        EXPECTED_DEATH_ROUNDS
+            * (LATENCY_US + LATENCY_US / EXPECTED_RTO_MARGIN_DIV + ACK_CADENCE_US)
+            / 1000
+        - 50;   // one tick of slack against granularity
 
     /** Well past the bound at this round trip, so only a flow that never dies
         at all reaches it. */

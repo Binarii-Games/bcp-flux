@@ -77,6 +77,21 @@ namespace
                 watch.overlaps.fetch_add(1);
 
             watch.senders[i].events.fetch_add(1);
+
+            // The flag is held across a pause, which is what gives the check
+            // above a window it can actually observe. Raised and lowered
+            // across three adjacent atomic operations, two threads would have
+            // to collide inside a few nanoseconds, and with sixteen events in
+            // the whole run the detector would essentially never fire: it
+            // reported zero overlaps just as convincingly with per-peer
+            // dispatch removed entirely.
+            //
+            // Pausing here is safe. The hook runs from Poll with no peer, no
+            // flow and no packet slot lock held, and holding only the lane
+            // claim, so another thread simply takes another lane. It costs a
+            // few milliseconds across a run measured in seconds.
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+
             watch.senders[i].inHandler.store(false);
             return;
         }

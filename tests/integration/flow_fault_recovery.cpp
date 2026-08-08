@@ -112,6 +112,15 @@ namespace
         bool reopened   = false;   ///< the deliberate one happened
         bool ordered    = true;   ///< false the moment a packet arrives out of turn
         bool setupFault = false;  ///< the harness itself failed, not the transport
+
+        /** The injector's own account of the damage it did. Loopback loses
+            nothing, so without these the whole file passes over a clean link
+            and proves only that an undamaged transfer works. Read from both
+            kernels because the damaged return path is load-bearing here: the
+            acknowledgements are attacked as well as the data. */
+        uint64_t forwardDropped = 0;
+        uint64_t returnDropped  = 0;
+        uint64_t corrupted      = 0;
     };
 
     FaultySocket::Profile ProfileFor(const Link& link, uint64_t seed)
@@ -264,6 +273,13 @@ namespace
         for (flux::PacketSlotHandle& handle : sink)
             handle = flux::PacketSlotHandle::Invalid();
 
+        // Before Shutdown, which destroys the kernel these point into.
+        const FaultySocket::Stats forward = clientKernel->GetStats();
+        const FaultySocket::Stats ret     = serverKernel->GetStats();
+        outcome.forwardDropped = forward.dropped;
+        outcome.returnDropped  = ret.dropped;
+        outcome.corrupted      = forward.corrupted + ret.corrupted;
+
         client.Shutdown();
         server.Shutdown();
         return outcome;
@@ -273,6 +289,7 @@ namespace
 int main()
 {
     uint16_t port = 21600;
+    uint64_t totalDamage = 0;
 
     for (const Link& link : LINKS)
     {
@@ -287,12 +304,43 @@ int main()
                     link.corrupt, link.handshakeLoss,
                     outcome.delivered, PACKET_COUNT, outcome.retries,
                     outcome.reopened ? 1 : 0);
+        std::printf("             injector: dropped %llu out / %llu back, corrupted %llu\n",
+                    (unsigned long long)outcome.forwardDropped,
+                    (unsigned long long)outcome.returnDropped,
+                    (unsigned long long)outcome.corrupted);
 
         CHECK(!outcome.setupFault);
         CHECK(outcome.reopened);
         CHECK(outcome.ordered);
         CHECK(outcome.delivered == PACKET_COUNT);
+
+        // The control. Loopback is perfect, so a green run above means
+        // nothing unless the damage this link describes actually happened.
+        // Without this the whole file passes with fault injection switched
+        // off, proving only that an undamaged transfer works.
+        //
+        // Totalled rather than split by direction, because the split is not
+        // guaranteed by the setup: the mildest link injects five percent with
+        // no added latency and its return traffic is small enough that zero
+        // acknowledgements are dropped, reproducibly. Asserting per direction
+        // would be asserting something these links do not promise. The total
+        // still catches the failure this exists for, since an injector that
+        // stopped applying would read zero on every link.
+        const uint64_t damage = outcome.forwardDropped
+                              + outcome.returnDropped + outcome.corrupted;
+        CHECK(damage > 0);
+        totalDamage += damage;
+
+        // Corruption is the one fault with no other symptom: a flipped bit
+        // fails the seal and the packet vanishes, so if this stopped working
+        // the transfer would simply get easier.
+        if (link.corrupt > 0) CHECK(outcome.corrupted > 0);
     }
+
+    // An injector that fired a handful of times across ten links would pass
+    // every per-link check above while exercising almost nothing. Measured
+    // total across these seeds is around three hundred and fifty.
+    CHECK(totalDamage > 100);
 
     return test::report();
 }

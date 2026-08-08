@@ -146,6 +146,15 @@ static void rebind_moves_and_refuses_collision()
     {
         PeerHandle stillOther = table.GetPeer(otherAddr);
         CHECK(!stillOther.Failed() && stillOther.GetSlotIndex() == otherSlot);
+
+        // The refusal has to leave the mover where it was. An implementation
+        // that erased the old index entry before discovering the target was
+        // taken would satisfy the line above and every count, while the peer
+        // that tried to move became reachable by no address at all. That is
+        // the shape a real migration failure takes, and nothing here saw it
+        // until this lookup was added.
+        PeerHandle stillMover = table.GetPeer(newAddr);
+        CHECK(!stillMover.Failed() && stillMover.GetSlotIndex() == slot);
     }
 }
 
@@ -172,13 +181,24 @@ static void tag_index_is_multi_value()
         PeerHandle holders[4];
         uint32_t total = table.GetPeersByTag(shared, holders, 4);
         CHECK(total == 2);
+        // Which peers, not just how many. A bind that indexed the wrong slot
+        // would return two handles and pass the count while the tag resolved
+        // to one peer twice. Order is not part of the contract, so both
+        // arrangements are accepted.
+        CHECK((holders[0].GetSlotIndex() == slotA && holders[1].GetSlotIndex() == slotB)
+           || (holders[0].GetSlotIndex() == slotB && holders[1].GetSlotIndex() == slotA));
     }
 
     CHECK(table.UnbindTag(slotA, shared) == Error::Ok);
     {
         PeerHandle holders[4];
         uint32_t total = table.GetPeersByTag(shared, holders, 4);
-        CHECK(total == 1);   // only slotB still holds it
+        CHECK(total == 1);
+        // The survivor has to be the one that was not unbound. Removing the
+        // wrong holder's entry leaves the count right and the tag pointing at
+        // a peer that gave it up, which on the receive path means a migrating
+        // packet resolves to the wrong session.
+        CHECK(holders[0].GetSlotIndex() == slotB);
     }
 }
 
