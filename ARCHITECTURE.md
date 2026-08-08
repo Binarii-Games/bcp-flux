@@ -425,6 +425,7 @@ because each is one job and neither of those is:
 | `flow/flow_batching.cpp` | the open batch on a sending association: what may join it and what its bytes cost |
 | `flow/assoc_directory.cpp` | flow id to slot index, per peer, per direction |
 | `peer/congestion.cpp` | the budget, loss and delay signals both, which belongs to the peer and not to any one flow |
+| `internal/congestion_curve.h` | the growth arithmetic that policy consults: the queue a path tolerates, CUBIC's window over time, the straight line under it |
 
 The split is by job, not by size. The handshake and the migration receive path
 are both larger than any of these and both stay where they are: each reaches
