@@ -405,7 +405,16 @@ namespace bcp::flux
             peers. Flux owns no thread, so time-based work happens only here.
             The clock is internal and read FRESH at each decision point (via
             Now), so a deadline coming due mid-pass fires this tick, not the
-            next. Safe to call from several threads at once.
+            next.
+
+            Safe to call from any number of threads, and exactly one runs it:
+            while a pass is in flight every other caller returns immediately.
+            The pass takes exclusive peer locks as it walks, so concurrent
+            passes serialize against each other and against the receive path,
+            and past a couple of threads that contention costs more than the
+            extra passes earn. Callers therefore just include Update in their
+            loop, whatever the thread count, and the socket keeps the tick
+            single.
 
             @param nowOverride test seam only; non-zero pins virtual time, the
                    default 0 reads the real clock and is the sole production
@@ -534,6 +543,12 @@ namespace bcp::flux
 
         // Lifecycle / identity.
         std::atomic<bool>              initialized_{false};
+
+        /** Held true while an Update pass runs, so a second caller returns
+            instead of running a concurrent pass. Managed only by Update
+            itself: taken with an acquire exchange, dropped with a release
+            store, never touched on any other path. */
+        std::atomic<bool>              updateGate_{false};
         std::unique_ptr<ISocketKernel> kernel_;
         SocketListener                 listener_;
         SocketSender                   sender_;
@@ -901,9 +916,14 @@ namespace bcp::flux
         // --- Tick / eviction ---
         // Update threads `nowOverride` (0 = real clock) to each sub-step, which
         // reads Now(nowOverride) fresh, never a captured value. Idle eviction is
-        // inline in Update's per-peer pass. One association's tick splits into a
+        // inline in the per-peer pass. One association's tick splits into a
         // lifecycle-retry step and a retransmit step; each reads the clock once
         // at entry, for that flow.
+
+        /** The tick's whole body. Only Update calls it, under the gate that
+            keeps passes from overlapping. */
+        void UpdatePass(uint64_t nowOverride);
+
         void UpdateOutFlow(const Address& addr, PeerHandle peer, uint32_t dirIndex, uint64_t nowOverride);
 
         /** The waiting-ring drain, one peer per call: while the gate passes,

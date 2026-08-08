@@ -300,7 +300,11 @@ the packet path and all of them are safe to call concurrently:
   application.
 - `Update` runs the tick: retry handshakes, flush owed acks, retransmit, drain
   waiting sends, evict idle peers, reclaim jammed receiving flows. All
-  time-based work lives here.
+  time-based work lives here. One pass runs at a time: while one is in flight,
+  another caller returns immediately instead of running a second pass. The
+  pass takes exclusive peer locks as it walks, so concurrent passes would
+  serialize against each other and against the receive path, and a thread that
+  skips one loses nothing it was not already getting.
 - `Flush` puts part-filled batches on the wire, at most `MAX_FLUSH_PER_PEER`
   associations per peer per call, the rest riding the next one.
 - Sending, through `PacketBuilder`.
