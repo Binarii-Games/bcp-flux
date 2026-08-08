@@ -231,6 +231,13 @@ namespace bcp::flux::internal
 
         One millisecond is the same lower bound the timeout already had on its
         own, and the same granularity RFC 9002 gives QUIC. */
+    /** The retransmit deadline's margin as a fraction of the round trip,
+        taken when it exceeds the variance term. Eight matches the spare
+        eighth LossDelayMicros grants for reordering, and it exists for the
+        same reason: a deadline that hugs the average duplicates whatever
+        honestly runs a few percent late. */
+    static constexpr uint32_t RTO_MARGIN_DIVISOR = 8;
+
     static constexpr uint32_t RTO_VARIANCE_MIN_MICROS       = 1000;
 
     /** Largest round trip that can be a measurement rather than a mistake.

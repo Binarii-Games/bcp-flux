@@ -216,6 +216,17 @@ namespace bcp::flux::internal
             uint64_t variance = 4ull * rttvarMicros;
             if (variance < RTO_VARIANCE_MIN_MICROS) variance = RTO_VARIANCE_MIN_MICROS;
 
+            // The margin also scales with the path, because on a steady one
+            // the deviation collapses and the flat floor is microscopic
+            // against a long round trip. A packet's real wait spreads a few
+            // percent around the average from coalescing and its own queue,
+            // so a deadline hugging the average that closely duplicates a
+            // steady trickle of healthy packets: measured 320 spurious
+            // probes, three percent of the link, on one 100 ms transfer. An
+            // eighth mirrors the reordering allowance in LossDelayMicros.
+            const uint64_t sojournSpread = RoundTripOr(fallbackMicros) / RTO_MARGIN_DIVISOR;
+            if (variance < sojournSpread) variance = sojournSpread;
+
             uint64_t hold = ackCadenceMicros;
             if (peerAckDelayMicros > hold) hold = peerAckDelayMicros;
 
