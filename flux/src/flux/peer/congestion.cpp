@@ -223,20 +223,21 @@ namespace bcp::flux
                 lostBytes * 2 >= lostBytes + delta.ackedBytes
                 && lostBytes >= 3ull * internal::MAX_WIRE_PACKET_SIZE;
 
-            // Any loss ends slow start, whatever the witnesses say. Doubling
-            // is a probe for capacity and a loss during it is the probe
-            // finding something: believing a false positive costs one
-            // doubling, while disbelieving a true one lets the doubling run
-            // hundreds of kilobytes past a shallow buffer and shreds every
-            // resend behind it. Noise-classification is for avoidance, where
-            // repeated trims compound, and every loss after this first one is
-            // judged there.
-            const bool inSlowStart = peer.congestionBudget < peer.slowStartThreshold;
-
+            // A loss during slow start is judged by the same two witnesses as
+            // any other. It once ended slow start unconditionally, priced as
+            // one wasted doubling if the loss turned out to be noise. The
+            // measured price on a link with one percent random loss was the
+            // whole transfer: the first loss lands about a hundred packets
+            // in, while the ramp is still small, and anchoring the curve at
+            // that window held the budget to a third of the path for seven
+            // seconds. The overshoot the old rule guarded against is what the
+            // witnesses here already catch, the queue for a deep buffer
+            // filling and the bite for a shallow one overflowing, and the
+            // ramp itself now ends on the delay sighting rather than waiting
+            // for loss to be the messenger.
             const bool congested = minRtt == 0
                                 || peer.rtt.QueueMicros() > QueueTargetMicros(minRtt)
-                                || bigBite
-                                || inSlowStart;
+                                || bigBite;
             const uint32_t retain = congested ? internal::CC_LOSS_RETAIN_PERCENT
                                               : internal::CC_NOISE_RETAIN_PERCENT;
 
