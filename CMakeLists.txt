@@ -238,6 +238,8 @@ target_include_directories(grant_isolation PRIVATE flux/src)
 target_include_directories(event_peer_scope PRIVATE flux/src)
 target_include_directories(lossy_many_to_one PRIVATE flux/src)
 target_include_directories(loss_packet_threshold PRIVATE flux/src)
+target_include_directories(tail_loss_probe PRIVATE flux/src)
+target_include_directories(flow_death_bounded PRIVATE flux/src)
 target_include_directories(grant_reduction PRIVATE flux/src)
 # Six phases of twenty threads, and a sanitized build runs it several times
 # slower, so it gets more room than the ordinary integration budget.
