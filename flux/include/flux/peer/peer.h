@@ -209,6 +209,49 @@ namespace bcp::flux
             event exactly, where a clock could only ever approximate it. */
         uint8_t congestionEpoch;
 
+        /** The starvation verdict, and the bookkeeping that reaches it.
+
+            A sender that answers a standing queue by holding back can be
+            starved by a neighbour that answers the same queue by filling
+            further. The verdict is reached when the budget has sat under
+            CC_STARVED_BUDGET_BYTES with the queue over target continuously
+            for the confirm window, with acknowledgements still arriving.
+            While it holds, the queue level recorded at the verdict replaces
+            the queue target: the budget regrows at ramp speed while the
+            queue stays at or under that level and holds when pushing past
+            it, so the sender competes for queue space that already exists
+            rather than adding more. The verdict lifts when the queue reads
+            under the ordinary target for the exit window, which means the
+            competitor left rather than paused.
+
+            The minimum round trip is frozen alongside the level. The live
+            minimum is remembered through a rotating window, and a queue that
+            stands longer than the window fills every bucket with queued
+            samples, so the reading the bound depends on deflates while the
+            real queue does not. Measured against the live minimum the bound
+            never engaged and the recovery drove the buffer to its drop
+            ceiling. Everything the verdict judges is therefore measured
+            against the minimum as it stood when the verdict was reached.
+
+            An exit does not forget the references. A competitor's probe
+            cycle can fake a departure, and a relapse inside the re-entry
+            window re-engages immediately with the kept bound, because a
+            fresh capture mid-contention would freeze a minimum the standing
+            queue has already corrupted. starvedExitedAtMicros times that
+            window, and a path clean past it forgets the episode.
+
+            starvedSinceMicros nonzero is the verdict itself. The candidate
+            and clear stamps time the entry and exit confirmation windows.
+            starvedEpisodes counts verdicts reached over the peer's
+            lifetime. */
+        uint64_t starvedCandidateSinceMicros;
+        uint64_t starvedSinceMicros;
+        uint64_t starvedClearSinceMicros;
+        uint64_t starvedExitedAtMicros;
+        uint32_t starvedQueueCapMicros;
+        uint32_t starvedMinRttMicros;
+        uint32_t starvedEpisodes;
+
         /** The path to this peer, and the deadline built from it. Every flow
             to this peer shares it, because they all cross the same wire. */
         internal::RttEstimate rtt;

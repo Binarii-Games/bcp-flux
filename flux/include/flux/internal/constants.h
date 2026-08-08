@@ -229,6 +229,67 @@ namespace bcp::flux::internal
         rather than below it, so the true positives sit well clear of this. */
     static constexpr uint32_t CC_OVERFLOW_GATE_PERCENT      = 75;
 
+    /** Ceiling on the budget for a starvation verdict to be considered.
+
+        A sender that answers a standing queue by holding back can be starved
+        by a neighbour that answers the same queue by filling further. The
+        queue keeps the governor engaged, every loss trims, and the budget
+        pins at a handful of packets while the path carries a hundred times
+        that. The budget is what tells this apart from healthy sharing,
+        because the queue cannot: it stands above target in both. Measured on
+        one 50 Mbit link at 40 ms, two of these sharing sat at 145 to 167 KB
+        each, one beside CUBIC never fell below 52 KB, and one starved by BBR
+        was pinned between 4 and 10 KB. Ten packets sits above the starved
+        band and four times under the worst healthy reading. */
+    static constexpr uint32_t CC_STARVED_BUDGET_BYTES       = CC_INITIAL_WINDOW_BYTES;
+
+    /** How long the starved conditions must hold before the verdict is
+        taken, in round trips, with a floor for short paths. Loss trims put
+        the budget at the floor transiently on any busy path, and a verdict
+        taken on a transient would engage against ordinary congestion.
+        Sixteen round trips of continuous starvation is not a transient. */
+    static constexpr uint32_t CC_STARVED_CONFIRM_ROUNDS     = 16;
+    static constexpr uint32_t CC_STARVED_CONFIRM_MIN_MICROS = 250000;
+
+    /** How long the queue must read under the ordinary target, while the
+        verdict holds, before it is lifted. Exit watches the queue rather
+        than the recovered share, because a competitor still present starves
+        the share again at once and the mode would oscillate. The floor is
+        what keeps a BBR competitor's periodic probe drain, a fifth of a
+        second every ten seconds, from reading as a departure. */
+    static constexpr uint32_t CC_STARVED_EXIT_ROUNDS        = 8;
+    static constexpr uint32_t CC_STARVED_EXIT_MIN_MICROS    = 500000;
+
+    /** How long after the verdict lifts a relapse re-engages it immediately,
+        with the references kept from the episode that just ended.
+
+        The exit can be faked: a competitor's probe cycle drains the queue
+        long enough to read as a departure, the verdict lifts, and the sender
+        is starved again within seconds. Measured over five continuous
+        minutes beside BBR, every collapse to zero followed such an exit.
+        Re-entering through the full confirmation window costs a second of
+        starvation each time, and re-freezing the references mid-contention
+        captures a minimum the standing queue has already corrupted, so the
+        relapse path skips the confirmation and keeps the references from the
+        episode that just ended. Only a path that stays clean for this long
+        after an exit forgets them and earns a fresh capture. */
+    static constexpr uint32_t CC_STARVED_REENTRY_WINDOW_MICROS = 30000000;
+
+    /** Slack over the frozen queue level, as a divisor of the queue target,
+        folded into the bound when it is frozen.
+
+        The level at the verdict is the level the competitors maintain, so a
+        bound frozen exactly there sits on its own boundary: every later
+        reading lands within noise of it, and whether the budget may ever
+        grow is decided by measurement luck. Measured with two starved
+        senders beside one BBR, the one whose bound fell 76 microseconds
+        under the standing level was pinned at the floor for seven seconds
+        while the other recovered. Half a target is above that noise and
+        stays a fraction of the queue already standing, and because each
+        sender freezes its own slack once, two of them cannot ratchet each
+        other upward with it. */
+    static constexpr uint32_t CC_STARVED_CAP_SLACK_DIVISOR  = 2;
+
     /** CUBIC's aggression, scaled by 100 so the curve stays in integers. The
         window follows C*(t - K)^3 + wMax with t in seconds, where K is how long
         the curve takes to climb back to wMax. 0.4 is the standard value. */

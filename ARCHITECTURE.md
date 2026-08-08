@@ -935,6 +935,25 @@ short path is not punished for running a curve designed for long ones. Over
 the curve sits a governor: whatever it wants, the budget does not grow while a
 standing queue already exceeds a fraction of the path's minimum round trip.
 
+A sender that answers a standing queue by not growing can be starved by a
+neighbour that answers the same queue by filling it further. Both see the same
+delay, one reads it as a reason to hold and the other as headroom, and the
+holding side ends at a few packets of budget while the filling side takes the
+link. The controller carries a verdict for this. A budget pinned at a handful
+of packets with the queue over target for many consecutive round trips, while
+acknowledgements keep arriving, is starvation rather than congestion. The
+budget is the reading that tells the two apart, because the queue cannot: two
+well behaved senders sharing a link also hold the queue above target, but
+their budgets sit near their shares, so a verdict keyed on the queue would
+fire against a fair neighbour and one keyed on the budget does not. While the
+verdict holds, the queue level found at that moment replaces the target. The
+budget regrows at slow-start speed while the queue stays at or under that
+level and holds when pushing past it, so the recovery competes for queue
+space the neighbour already created and never adds to it. The verdict lifts
+once the queue holds under the ordinary target for long enough that a
+periodic probe drain cannot mimic a departure, which is the sign the
+neighbour actually left.
+
 The budget says how much may be outstanding, not how fast it may leave, so a
 pacing clock meters departures at the budget over the round trip, with a small
 gain and a small burst allowance. Every path that puts a flow packet on the

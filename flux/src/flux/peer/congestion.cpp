@@ -26,12 +26,80 @@
     might still arrive, it is the moment the packet stops existing, so it is the
     only loss signal that flow will ever produce and it is taken.
 
+    Starvation is the third judgement, and it protects the delay response
+    from neighbours that do not share it. A sender holding back for a queue a
+    neighbour keeps refilling ends at a few packets of budget on a link with
+    room for a hundred times that. A budget pinned that low with the queue
+    standing and acknowledgements still arriving is read as starvation rather
+    than congestion, and the answer is to stop treating that queue as this
+    sender's own: the level found at the verdict becomes the bound, the
+    budget regrows at ramp speed underneath it, and nothing pushes above it,
+    so the recovery competes for queue space that already exists rather than
+    adding more.
+
     It lives beside the socket rather than in the flow table because the budget
     is the peer's and not any one flow's. The gate that spends it is CanSend, in
     the flow table, which is where the packet being admitted is. */
 
 namespace bcp::flux
 {
+    namespace
+    {
+        /** One ramp step: the budget grows by what was acknowledged,
+            saturating, capped at the ceiling. Never zero, so rounding can
+            never stall the ramp. Slow start and the starved regrowth both
+            climb this way, and they climb the same way on purpose: a starved
+            peer recovering slower than a new one would never catch the gap
+            it is recovering into. */
+        uint32_t RampStep(uint32_t budget, uint32_t ackedBytes,
+                          uint32_t ceiling) noexcept
+        {
+            uint32_t step = ackedBytes;
+            if (step == 0) step = 1;
+            uint32_t grown = budget + step;
+            if (grown < budget)  grown = UINT32_MAX;
+            if (grown > ceiling) grown = ceiling;
+            return grown;
+        }
+
+        /** The queue as the starvation verdict measures it: against the
+            minimum round trip frozen when the verdict was reached, not the
+            live one. The live minimum is remembered through a rotating
+            window, and a queue that stands longer than the window fills
+            every bucket with queued samples, so the live reading deflates
+            under exactly the queue this mode exists to survive. */
+        uint32_t StarvedQueueMicros(const Peer& peer) noexcept
+        {
+            return peer.rtt.srttMicros > peer.starvedMinRttMicros
+                ? peer.rtt.srttMicros - peer.starvedMinRttMicros : 0;
+        }
+
+        /** The same queue as the newest sample saw it. The smoothed figure
+            lags a full round trip, and a budget doubling per round trip can
+            put hundreds of kilobytes past the bound in the time the lag
+            hides. The ramp and the loss witness watch whichever of the two
+            readings is worse, exactly as slow start watches the newest
+            sample for its sighting. */
+        uint32_t StarvedWorstQueueMicros(const Peer& peer) noexcept
+        {
+            const uint32_t latest = peer.rtt.latestMicros > peer.starvedMinRttMicros
+                ? peer.rtt.latestMicros - peer.starvedMinRttMicros : 0;
+            const uint32_t smoothed = StarvedQueueMicros(peer);
+            return latest > smoothed ? latest : smoothed;
+        }
+
+        /** A confirmation window in round trips, floored in absolute time,
+            because a count of round trips alone is milliseconds on a short
+            path and the things it has to see past are not. */
+        uint64_t ConfirmWindowMicros(uint32_t roundTripMicros, uint32_t rounds,
+                                     uint32_t floorMicros) noexcept
+        {
+            const uint64_t spanned =
+                static_cast<uint64_t>(rounds) * roundTripMicros;
+            return spanned > floorMicros ? spanned : floorMicros;
+        }
+    }
+
     void Socket::AssertBudgetInRange(const Peer& peer) const noexcept
     {
         // A value outside the range is not a tuning problem, it is a
@@ -78,6 +146,74 @@ namespace bcp::flux
         // worth anything when they are not.
         peer.delivery.Sample(delta.ackedBytes, delta.lostDeclaredBytes, nowMicros);
 
+        // The starvation verdict. The readings are taken here, after the
+        // sample fold, so every branch below judges the same picture. Entry
+        // needs all three conditions continuously through the confirm
+        // window: the queue standing, the budget pinned under the threshold,
+        // and the verdict itself taken only on an acknowledgement, because a
+        // starved peer is one being outcompeted on a live path, not one
+        // whose path has died. Losses do not reset the candidate clock. They
+        // are what starvation looks like, not evidence against it.
+        const uint32_t pathMinRtt = peer.rtt.MinRttMicros();
+        const uint32_t queueNow   = peer.rtt.QueueMicros();
+        const bool queueOverTarget = pathMinRtt != 0
+            && queueNow > internal::QueueTargetMicros(pathMinRtt);
+
+        if (peer.starvedSinceMicros == 0)
+        {
+            // An episode that ended longer than the re-entry window ago is
+            // over: the kept references describe a contention that stopped,
+            // and the next verdict earns a fresh capture.
+            if (peer.starvedExitedAtMicros != 0
+                && nowMicros > peer.starvedExitedAtMicros
+                       + internal::CC_STARVED_REENTRY_WINDOW_MICROS)
+            {
+                peer.starvedExitedAtMicros = 0;
+                peer.starvedQueueCapMicros = 0;
+                peer.starvedMinRttMicros   = 0;
+            }
+
+            const bool starvedNow = queueOverTarget
+                && peer.congestionBudget <= internal::CC_STARVED_BUDGET_BYTES;
+            if (!starvedNow)
+                peer.starvedCandidateSinceMicros = 0;
+            else if (delta.ackedBytes != 0 && peer.starvedExitedAtMicros != 0)
+            {
+                // A relapse inside the window: the exit was the competitor
+                // pausing, not leaving. Re-engage at once with the kept
+                // references. Confirming again costs a second of starvation
+                // per cycle, and re-capturing mid-contention would freeze a
+                // minimum the standing queue has already corrupted.
+                peer.starvedSinceMicros          = nowMicros;
+                peer.starvedExitedAtMicros       = 0;
+                peer.starvedClearSinceMicros     = 0;
+                peer.starvedCandidateSinceMicros = 0;
+                ++peer.starvedEpisodes;
+            }
+            else if (peer.starvedCandidateSinceMicros == 0)
+                peer.starvedCandidateSinceMicros = nowMicros;
+            else if (delta.ackedBytes != 0)
+            {
+                const uint64_t held = nowMicros > peer.starvedCandidateSinceMicros
+                    ? nowMicros - peer.starvedCandidateSinceMicros : 0;
+                const uint64_t confirm = ConfirmWindowMicros(
+                    peer.rtt.RoundTripOr(flows_.RetryIntervalMicros()),
+                    internal::CC_STARVED_CONFIRM_ROUNDS,
+                    internal::CC_STARVED_CONFIRM_MIN_MICROS);
+                if (held >= confirm)
+                {
+                    peer.starvedSinceMicros          = nowMicros;
+                    peer.starvedQueueCapMicros       = queueNow
+                        + internal::QueueTargetMicros(pathMinRtt)
+                            / internal::CC_STARVED_CAP_SLACK_DIVISOR;
+                    peer.starvedMinRttMicros         = pathMinRtt;
+                    peer.starvedClearSinceMicros     = 0;
+                    peer.starvedCandidateSinceMicros = 0;
+                    ++peer.starvedEpisodes;
+                }
+            }
+        }
+
         // A probe went out and nothing came back with it. Past enough of them
         // the path is gone rather than busy, and a percentage of a number that
         // describes nothing is not worth taking, so the budget goes to the
@@ -110,6 +246,16 @@ namespace bcp::flux
                     peer.slowStartQueueSinceMicros = 0;
                     ++peer.congestionEpoch;
                 }
+                // A silence this long is a dead path, and the starvation
+                // verdict describes a live one, so whatever it was measuring
+                // no longer exists. Everything is forgotten, the kept
+                // references included.
+                peer.starvedCandidateSinceMicros = 0;
+                peer.starvedSinceMicros          = 0;
+                peer.starvedClearSinceMicros     = 0;
+                peer.starvedExitedAtMicros       = 0;
+                peer.starvedQueueCapMicros       = 0;
+                peer.starvedMinRttMicros         = 0;
             }
         }
 
@@ -177,9 +323,21 @@ namespace bcp::flux
             // to, which is where a shallow buffer overflowing lands.
             const bool lossAboveTolerance =
                 peer.delivery.LossPercent() > internal::CC_LOSS_TOLERANCE_PERCENT;
+            // While the starvation verdict holds, the frozen level replaces
+            // the target as the queue witness. The queue standing over the
+            // target is the very condition the verdict was reached under, so
+            // judged against the target every loss would read as congestion
+            // and the trims would hold the peer exactly where the starver
+            // put it. Against the frozen level the witness still has teeth:
+            // a loss with the queue pushed past it is this sender growing
+            // into space that was never there, and takes the full cut.
+            const bool queueStanding = peer.starvedSinceMicros != 0
+                ? StarvedWorstQueueMicros(peer) > peer.starvedQueueCapMicros
+                : minRtt != 0
+                    && peer.rtt.QueueMicros() > internal::QueueTargetMicros(minRtt);
 
             const bool congested = minRtt == 0
-                                || peer.rtt.QueueMicros() > internal::QueueTargetMicros(minRtt)
+                                || queueStanding
                                 || (bigBite && lossAboveTolerance);
             const uint32_t retain = congested ? internal::CC_LOSS_RETAIN_PERCENT
                                               : internal::CC_NOISE_RETAIN_PERCENT;
@@ -221,6 +379,66 @@ namespace bcp::flux
 
         if (delta.ackedBytes == 0) return;
 
+        // Recovery from starvation, in place of the ordinary branches below.
+        // The exit watches the ordinary target: a queue that holds under it
+        // through the exit window has genuinely drained, which means the
+        // competitor left, and normal manners resume from wherever the
+        // budget stands. A recovered share is deliberately not the exit,
+        // because a competitor still present starves it again at once.
+        if (peer.starvedSinceMicros != 0)
+        {
+            // Exit and bound both read the queue against the frozen
+            // minimum, because the live one deflates under a queue that
+            // outlives its window and would read a still-occupied path as
+            // drained.
+            const uint32_t starvedQueue = StarvedQueueMicros(peer);
+            if (starvedQueue <= internal::QueueTargetMicros(peer.starvedMinRttMicros))
+            {
+                if (peer.starvedClearSinceMicros == 0)
+                    peer.starvedClearSinceMicros = nowMicros;
+                else
+                {
+                    const uint64_t clearHeld = nowMicros > peer.starvedClearSinceMicros
+                        ? nowMicros - peer.starvedClearSinceMicros : 0;
+                    const uint64_t confirm = ConfirmWindowMicros(
+                        peer.rtt.RoundTripOr(flows_.RetryIntervalMicros()),
+                        internal::CC_STARVED_EXIT_ROUNDS,
+                        internal::CC_STARVED_EXIT_MIN_MICROS);
+                    if (clearHeld >= confirm)
+                    {
+                        // The references are kept: if this exit was a
+                        // competitor pausing rather than leaving, the
+                        // relapse re-engages with them inside the re-entry
+                        // window, and only a path clean past it forgets.
+                        peer.starvedSinceMicros        = 0;
+                        peer.starvedExitedAtMicros     = nowMicros;
+                        peer.starvedClearSinceMicros   = 0;
+                        peer.slowStartThreshold        = peer.congestionBudget;
+                        peer.wMaxBytes                 = peer.congestionBudget;
+                        peer.congestionEpochMicros     = nowMicros;
+                        peer.slowStartQueueSinceMicros = 0;
+                        AssertBudgetInRange(peer);
+                        return;
+                    }
+                }
+            }
+            else peer.starvedClearSinceMicros = 0;
+
+            // The frozen level is the bound: at or under it the budget
+            // climbs at ramp speed, over it the budget holds. Speed matters
+            // here. A competitor that drains the queue to probe releases the
+            // path for a fraction of a second, and a recovery slower than
+            // that window never recovers at all. The gate reads the worse of
+            // the smoothed and newest samples, so the climb stops a round
+            // trip sooner than the smoothed figure alone could say.
+            if (StarvedWorstQueueMicros(peer) > peer.starvedQueueCapMicros) return;
+
+            peer.congestionBudget = RampStep(peer.congestionBudget,
+                                             delta.ackedBytes,
+                                             maxCongestionBudget_);
+            AssertBudgetInRange(peer);
+            return;
+        }
 
         // The queue readings the branches below act on. Not taken below the
         // opening window. A sender with a handful of packets on the path
@@ -288,16 +506,9 @@ namespace bcp::flux
                           // moment slow start ends
             }
 
-            // Saturating, so growth can never wrap the budget, and capped at
-            // the ceiling because a budget past what every window can hold is
-            // a stored burst rather than a window.
-            uint32_t step = delta.ackedBytes;
-            if (step == 0) step = 1;   // never stall the ramp on rounding
-
-            uint32_t grown = peer.congestionBudget + step;
-            if (grown < peer.congestionBudget) grown = UINT32_MAX;
-            if (grown > maxCongestionBudget_)  grown = maxCongestionBudget_;
-            peer.congestionBudget = grown;
+            peer.congestionBudget = RampStep(peer.congestionBudget,
+                                             delta.ackedBytes,
+                                             maxCongestionBudget_);
             AssertBudgetInRange(peer);
             return;
         }

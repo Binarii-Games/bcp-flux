@@ -470,6 +470,13 @@ namespace bcp::flux
         p->wMaxBytes             = 0;
         p->congestionEpochMicros = 0;
         p->congestionEpoch       = 0;
+        p->starvedCandidateSinceMicros = 0;
+        p->starvedSinceMicros          = 0;
+        p->starvedClearSinceMicros     = 0;
+        p->starvedExitedAtMicros       = 0;
+        p->starvedQueueCapMicros       = 0;
+        p->starvedMinRttMicros         = 0;
+        p->starvedEpisodes             = 0;
         p->state       = HandshakeState::AWAITING_CHALLENGE;
         p->attempts    = 0;
         p->hasId       = (id != nullptr);
