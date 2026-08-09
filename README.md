@@ -1,10 +1,14 @@
 # Flux
 
-[![ci](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ci.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ci.yml)
+[![linux](https://github.com/Binarii-Games/bcp-flux/actions/workflows/linux.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/linux.yml)
+[![windows](https://github.com/Binarii-Games/bcp-flux/actions/workflows/windows.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/windows.yml)
+[![macos](https://github.com/Binarii-Games/bcp-flux/actions/workflows/macos.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/macos.yml)
+[![android](https://github.com/Binarii-Games/bcp-flux/actions/workflows/android.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/android.yml)
+[![ios](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ios.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ios.yml)
 
 A connectionless, encrypted UDP transport in C++20. There is no connection
 object, nothing allocates on the packet path, and one socket carries reliable
-and unreliable traffic at the same time.
+flows, unreliable flows and whole-buffer transfers at the same time.
 
 Flux builds on `common`, a standalone systems library that knows nothing about
 transports, vendored in `external/common` at a pinned version. Monocypher is
@@ -190,6 +194,77 @@ nothing:
 socket.CloseFlow(flow);
 ```
 
+### Events
+
+State is always readable: ask a flow its lifecycle or a peer its flow count
+and you get the truth. Events cover the other kind of question, the things
+that happen between two polls: a handshake completed, a peer vanished or
+moved, a flow was refused, lost or reopened by the far side, a transfer was
+offered. Subscribe to the ones you want and `Poll` hands them to your hook
+with nothing locked, so the handler can call straight back into the socket.
+
+```cpp
+void OnEvent(void* context, const flux::EventInfo& info)
+{
+    if (info.Has(flux::SocketEvent::PEER_LOST)) { /* info.Peer() names it */ }
+}
+
+config.events.hook       = OnEvent;
+config.events.context    = &myState;
+config.events.subscribed = flux::ToBits(flux::SocketEvent::PEER_LOST)
+                         | flux::ToBits(flux::SocketEvent::OUTGOING_FLOW_LOST);
+```
+
+An event names the entity and carries nothing else. Everything it could carry
+is already readable through the ordinary calls, so the handler reads the
+state and gets the truth even when the moment it describes has passed. The
+full list lives in `socket_events.h` with a doc comment each, and a socket
+with no hook registered works exactly the same.
+
+### Move a whole buffer
+
+A flow carries messages. A transfer carries one run of bytes whose length is
+known up front, and it skips the chunking: hand the socket a pointer and a
+length, keep the memory alive, and get told when it is done. Nothing is
+staged per packet. Data is read straight from your buffer, retransmits
+re-read it, and delivery on the far side writes straight into the receiver's,
+so a gigabyte and a kilobyte cost the same state.
+
+```cpp
+config.flows.transferOutCount = 2;
+config.flows.transferInCount  = 2;
+```
+
+```cpp
+socket.SendTransfer(1, addr, payload.data(), payload.size());
+```
+
+The receiver hears about the offer as an event and answers with memory or
+with a refusal, and answering from inside the handler is legal:
+
+```cpp
+void OnTransfer(void* context, const flux::EventInfo& info)
+{
+    if (!info.Has(flux::SocketEvent::TRANSFER_INCOMING)) return;
+    flux::TransferRequest request = socket.PendingTransfer(info.Flow(), info.Peer());
+    buffer.resize(request.Length());
+    request.Allow(buffer.data());          // or request.Reject()
+}
+```
+
+Completion surfaces on both ends through `PollTransfers`, as a view naming
+the buffer, the length and the outcome:
+
+```cpp
+flux::TransferView done[4];
+for (size_t i = 0, n = socket.PollTransfers(done, 4); i < n; ++i)
+    socket.CompleteTransfer(done[i].Flow(), done[i].Peer());
+```
+
+`TransferProgress` reports how far along a running transfer is, and a
+transfer shares the peer's congestion state with every flow beside it, so
+the two never fight over one link.
+
 ### Authenticated and plaintext sends
 
 `Send` is best-effort: encrypted always, authenticated when the peer is.
@@ -211,6 +286,12 @@ key, so a mover is recognised without any exchange. Rotating it unlinks a
 deliberate address change from everything sent before. Peers are named by
 `blake2b(publicKey)`, so proving the key proves the name and no registry is
 involved.
+
+Congestion control reads delay as well as loss, so its resting state is a
+short queue rather than a full one. When a neighbour keeps the queue full
+anyway, Flux notices it is being starved and stops treating that queue as its
+own. That is what lets it hold its share beside BBR while leaving CUBIC the
+larger half almost without a drop.
 
 Packets are little-endian and capped at 1200 bytes, under the IPv6 minimum MTU
 with margin for tunnels. Every secure packet is sealed with XChaCha20-Poly1305,
@@ -284,27 +365,54 @@ else:
 ./build/simultaneous_handshake    # both send first, the handshake collision resolves itself
 ./build/reliable_flow             # one RELIABLE_ORDERED flow, numbered burst to two peers
 ./build/unreliable_flow           # the same burst on an UNRELIABLE flow
+./build/events                    # told what happened instead of asking every tick
+./build/mac_only                  # readable on the wire, not alterable
+./build/unsecured                 # the cheapest packet Flux sends
+./build/big_message               # a message bigger than a packet, as a run on one flow
+./build/bulk_transfer             # something large, chunked by hand over a bulk flow
+./build/transfer_flow             # the same job handed over as one transfer, no chunking
 ```
 
 ## Benchmarks
 
-What one packet costs, measured on an Apple M3 Max, Release, clang 22. These run
-over loopback, so treat the absolute times as machine-specific. The deltas are
-the useful part.
+Every number below comes from a bench that ships in this repo, and each
+command sits above the table it produced on this machine (Apple M3 Max,
+Release, clang 22). Absolute times are machine-specific, the deltas and the
+shares are the signal. Build Release first:
 
-Send path, Flux against the bare `sendto()` syscall underneath it, median of
-30,000 sends per variant, interleaved so all three see the same machine state:
+```sh
+cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rel
+```
+
+`ctest --test-dir build-rel -L bench` runs the whole set. Benches print
+numbers and always exit 0.
+
+### Send path
+
+Flux against the bare `sendto()` syscall underneath it, median of 30,000
+sends per variant, interleaved so all three see the same machine state:
+
+```sh
+./build-rel/socket_send_bench
+```
 
 | payload | bare `sendto` | + Flux framing | + AEAD seal |
 |---|---|---|---|
 | 64 B | 2792 ns | +125 ns | +583 ns |
 | 1024 B | 2875 ns | +167 ns | +2875 ns |
 
-Framing costs about 5% over the raw syscall. Everything else is the encryption,
-which scales with payload and is the same cost any encrypted transport pays.
+Framing costs about 5% over the raw syscall. Everything else is the
+encryption, which scales with payload and is the same cost any encrypted
+transport pays.
 
-Encryption alone, no sockets involved. XChaCha20-Poly1305 through vendored
-Monocypher:
+### Encryption
+
+XChaCha20-Poly1305 through vendored Monocypher, no sockets involved:
+
+```sh
+./build-rel/crypto_bench
+```
 
 | payload | encrypt | decrypt + verify |
 |---|---|---|
@@ -312,11 +420,86 @@ Monocypher:
 | 256 B | 661 ns | 668 ns |
 | 1200 B | 2254 ns | 2252 ns |
 
-Monocypher is portable C with no SIMD, so encryption tops out around 0.5 GB/s.
-A SIMD implementation would raise that if it ever matters.
+Monocypher is portable C with no SIMD, so encryption tops out around
+0.5 GB/s. A SIMD implementation would raise that if it ever matters.
 
-Run them on a Release build with `ctest --test-dir build -L bench`. They print
-numbers and always exit 0.
+### A transfer across a lossy link
+
+An in-process relay models 50 Mbit with a 40 ms round trip and a 250 KB
+tail-drop queue, one bandwidth-delay product. One 100 MiB transfer crosses it
+per row. Independent loss is what thermal noise looks like, and the burst
+rows lose everything for stretches averaging twenty packets, which is what a
+fade or a handover does and what defeats recovery tuned only for the first
+kind. The floor at the link rate is 16.8 s.
+
+```sh
+./build-rel/link_transfer_bench
+```
+
+| loss | time | rate | of the link |
+|---|---|---|---|
+| clean | 17.5 s | 48.1 Mbit | 96% |
+| 1% independent | 18.5 s | 45.3 Mbit | 91% |
+| 2% independent | 19.1 s | 43.8 Mbit | 88% |
+| 5% independent | 19.9 s | 42.1 Mbit | 84% |
+| 1% bursts of 20 | 18.8 s | 44.7 Mbit | 89% |
+| 2% bursts of 20 | 26.1 s | 32.1 Mbit | 64% |
+| 5% bursts of 20 | 60.4 s | 13.9 Mbit | 28% |
+
+The acknowledgement names every hole in the window, so repair keeps pace with
+a loss rate the congestion controller reads as the link rather than as
+congestion. Burst rows move a few seconds between runs, since where a burst
+lands against the window decides how much serialises behind repair. A first
+argument changes the payload and a second filters the rows, so
+`link_transfer_bench 200 independent` runs the three independent rows at
+200 MiB.
+
+### One gigabyte at line rate
+
+```sh
+./build-rel/link_transfer_bench 1024 clean
+```
+
+| payload | time | rate | of the link |
+|---|---|---|---|
+| 1 GiB | 177.3 s | 48.5 Mbit | 97% |
+
+The floor is 171.8 s. The same payload through msquic BBR on the same link
+model measured 255.7 s at 33.6 Mbit, a third slower on a clean link.
+
+### Sharing one queue with QUIC
+
+Both senders move 100 MiB through ONE shared tail-drop queue, started
+together, which is what makes them interact: whoever keeps more in flight
+occupies more of the queue and pushes the other toward the drop tail. This
+bench needs libmsquic installed (brew, apt and vcpkg all carry it), and the
+build skips it when msquic is absent.
+
+```sh
+./build-rel/link_share_bench bbr
+```
+
+| sender | time | goodput | share while contended |
+|---|---|---|---|
+| Flux transfer | 45.0 s | 18.7 Mbit | 42.5% |
+| QUIC BBR | 45.2 s | 18.6 Mbit | 57.5% |
+
+Jain 0.978, 34 ms standing queue, heavy drops on both sides.
+
+```sh
+./build-rel/link_share_bench cubic
+```
+
+| sender | time | goodput | share while contended |
+|---|---|---|---|
+| Flux transfer | 34.6 s | 24.2 Mbit | 45.8% |
+| QUIC CUBIC | 31.3 s | 26.8 Mbit | 54.2% |
+
+Jain 0.993, and 421 drops in total against the BBR pairing's quarter
+million: beside a loss-sensitive neighbour Flux backs off before the queue
+overflows, and both finish sooner than either does beside BBR. For scale,
+msquic BBR beside msquic CUBIC on this link measured 64/36: BBR takes more
+from CUBIC by force than Flux takes from anyone.
 
 ## License
 
