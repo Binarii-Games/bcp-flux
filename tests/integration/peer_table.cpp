@@ -7,7 +7,7 @@
 //
 // A PeerHandle holds the peer's read lock, and a table mutation waits on that
 // lock, so every handle here is dropped (its scope closed) before the next
-// mutation — never held across one.
+// mutation, never held across one.
 #include <flux/peer/peer_table.h>
 #include <flux/peer/peer_handle.h>
 #include <flux/peer/peer_id.h>

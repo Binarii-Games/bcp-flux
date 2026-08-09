@@ -10,7 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --------------------------------------------------------
-# Warnings — surface everything the compiler can see statically.
+# Warnings: surface everything the compiler can see statically.
 # --------------------------------------------------------
 if(MSVC)
     add_compile_options(/W4)
@@ -31,7 +31,7 @@ if(BCP_WERROR)
 endif()
 
 # --------------------------------------------------------
-# Sanitizers — runtime bug detection the compiler cannot do statically.
+# Sanitizers: runtime bug detection the compiler cannot do statically.
 # --------------------------------------------------------
 # C++ compiles clean and still carries dangling references, off-by-ones into a
 # buffer, reads of uninitialized members, or UB that only bites at a different
@@ -43,7 +43,7 @@ endif()
 #   thread     data races (mutually exclusive with address)
 #
 # Override:  -DBCP_SANITIZE=thread     (for the lock-free code)
-#            -DBCP_SANITIZE=undefined  (UBSan only — see the note below)
+#            -DBCP_SANITIZE=undefined  (UBSan only, see the note below)
 #            -DBCP_SANITIZE=""         (disable)
 #
 # NOTE: some toolchains ship a broken ASan/TSan runtime that aborts in init
@@ -54,8 +54,8 @@ endif()
 set(BCP_SANITIZE "address,undefined" CACHE STRING
     "Comma-separated sanitizers for non-release builds (address,undefined,thread). Empty to disable.")
 
-# Never sanitize a release build — the instrumentation is a dev/test tool with
-# a 2-3x cost, and must not ship.
+# Never sanitize a release build. The instrumentation is a dev/test tool
+# with a 2-3x cost, and must not ship.
 if(BCP_SANITIZE AND NOT CMAKE_BUILD_TYPE MATCHES "^Rel")
     set(_bcp_effective "${BCP_SANITIZE}")
     string(REPLACE "," ";" _bcp_sanitizers "${_bcp_effective}")
@@ -74,7 +74,7 @@ if(BCP_SANITIZE AND NOT CMAKE_BUILD_TYPE MATCHES "^Rel")
         if(NOT _bcp_asan_ok OR NOT _bcp_asan_run STREQUAL "0")
             message(WARNING
                 "AddressSanitizer runtime is broken on this toolchain "
-                "(probe binary failed to run) — falling back to UBSan only. "
+                "(probe binary failed to run). Falling back to UBSan only. "
                 "Install a working toolchain (full Xcode or Homebrew LLVM) "
                 "for ASan coverage; CI should provide it regardless.")
             set(_bcp_effective "undefined")
@@ -127,8 +127,8 @@ target_include_directories(common
 target_link_libraries(common PUBLIC monocypher)
 
 # 16-byte CAS. PRIVATE if only used in common's .cpp; PUBLIC if used in
-# common's public headers (inlined into consumers). x86-only flag — arm64
-# has the capability without asking.
+# common's public headers (inlined into consumers). An x86-only flag,
+# because arm64 has the capability without asking.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i686)")
     target_compile_options(common PRIVATE -mcx16)
 endif()
@@ -141,7 +141,7 @@ if(WIN32)
 endif()
 
 # --------------------------------------------------------
-# flux — the transport
+# flux: the transport
 # --------------------------------------------------------
 add_library(flux STATIC)
 
@@ -165,7 +165,7 @@ if(WIN32)
 endif()
 
 # --------------------------------------------------------
-# Examples — small runnable programs written against the public API only, so
+# Examples: small runnable programs written against the public API only, so
 # they double as a check that the public surface is usable without reaching
 # into internals. Built by default so they cannot rot; -DBCP_EXAMPLES=OFF to
 # skip. One executable per .cpp, grouped by which library it demonstrates:
@@ -182,7 +182,7 @@ if(BCP_EXAMPLES)
 endif()
 
 # --------------------------------------------------------
-# Tests — one plain executable per .cpp, registered with CTest and sanitized
+# Tests: one plain executable per .cpp, registered with CTest and sanitized
 # like everything else. Three categories, split by directory:
 #
 #   unit/         data-structure integrity          label: unit

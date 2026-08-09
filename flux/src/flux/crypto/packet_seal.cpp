@@ -25,8 +25,8 @@ namespace bcp::flux
             for (size_t i = 0; i < internal::WIRE_NONCE_SIZE; ++i)
                 nonceField[i] = static_cast<uint8_t>(counter >> (8 * i));
         }
-        /** The counter has to travel — the receiver cannot know which packet
-            this is otherwise — but travelling in the clear makes it a serial
+        /** The counter has to travel (the receiver cannot know which packet
+            this is otherwise) but travelling in the clear makes it a serial
             number, and a sequence that stops at one address and resumes at the
             next value from another address links a peer across a migration no
             matter how the tag rotates. So the field carries the counter

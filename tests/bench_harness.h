@@ -6,7 +6,7 @@
 //
 // It is a measurement tool, not a pass/fail gate: absolute timings are
 // machine-specific, so the benches always exit 0 and the printed number is the
-// signal. Read it two ways — against the baseline ratio (does the hand-built
+// signal. Read it two ways: against the baseline ratio (does the hand-built
 // structure actually earn its complexity?) and against previous runs on the
 // same machine (did a change add unexpected overhead?). Run them on demand:
 //   ctest -L bench --output-on-failure
@@ -63,8 +63,8 @@ namespace bench
     }
 
     // One operation's latency distribution; sorts the samples in place.
-    // Contended designs differ most in the tail — two structures tied on
-    // throughput can sit orders of magnitude apart at p99.9 — so contended
+    // Contended designs differ most in the tail. Two structures tied on
+    // throughput can sit orders of magnitude apart at p99.9, so contended
     // benches report this alongside the mean.
     inline void latency(const char* label, std::vector<uint32_t>& samplesNs)
     {

@@ -26,8 +26,8 @@ change is held to, see [CONTRIBUTING.md](CONTRIBUTING.md).
 | `flux` | `bcp::flux` | the transport | `common` |
 
 ```
-flux  ──depends on──▶  common  ──depends on──▶  monocypher
-                       (vendored)                (vendored)
+flux  --depends on--->  common  --depends on--->  monocypher
+                        (vendored)                (vendored)
 ```
 
 A library may depend on another library in the set. It may never depend on a
@@ -738,10 +738,10 @@ recent send would give a sample shorter than the path.
 
 ```
 initiator                                  responder
-SendHandshakeInit  ──HS_INIT──▶            Handshake_Challenge   (stateless)
-                   ◀──HS_CHLG──
-Handshake_Respond  ──HS_RES───▶            Handshake_Validate    (verify, then
-                   ◀──HS_FINISH──           register + key + finish)
+SendHandshakeInit  --HS_INIT--->           Handshake_Challenge   (stateless)
+                   <---HS_CHLG--
+Handshake_Respond  --HS_RES---->           Handshake_Validate    (verify, then
+                   <---HS_FINISH--          register + key + finish)
 Handshake_Complete (key, flush parked packets)
 ```
 

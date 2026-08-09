@@ -126,7 +126,7 @@ static void reliable_ordered_flow_delivers_in_order()
 
     flux::PacketSlotHandle sink[64];
 
-    // Establish through the relay (in order — reordering is still off).
+    // Establish through the relay (in order, reordering is still off).
     CHECK(client.Connect(relayAddr) == common::Error::Ok);
     bool established = false;
     for (int i = 0; i < 300 && !established; ++i)

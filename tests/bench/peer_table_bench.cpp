@@ -2,7 +2,7 @@
 // std::unordered_map, which is what most servers use for a concurrent
 // address->entry map. Lookup is the per-packet hot path, so this is the bench
 // that most has to earn the hand-built table's complexity. Measures single-
-// thread ns/op, read-throughput scaling, and — the design's actual claim —
+// thread ns/op, read-throughput scaling, and (the design's actual claim)
 // read latency while a writer churns registrations. The seqlock's promise is
 // that readers store nothing shared and writers do not stall them; the read
 // tail under churn is where that promise is kept or broken.

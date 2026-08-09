@@ -104,7 +104,7 @@ namespace bcp::flux
             packet.
 
             @warning On a secure packet this is the MASKED value, not the send
-                     counter — the field is encrypted so that an observer
+                     counter. The field is encrypted so that an observer
                      cannot follow a peer by its counter sequence. Only
                      Socket::OpenSecurePacket recovers the real counter. */
         uint64_t NonceCounter() const;

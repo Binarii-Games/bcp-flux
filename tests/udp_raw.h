@@ -1,7 +1,7 @@
 #pragma once
 
 // Raw UDP sockets for middlebox tests. Some tests interpose a relay between two
-// Flux sockets to simulate a hostile or lossy network — an address change
+// Flux sockets to simulate a hostile or lossy network: an address change
 // (migration) or packet reordering (flows). Those relays are built from bare OS
 // sockets, and this is that layer: create a bound non-blocking UDP socket, send
 // a datagram, and classify one by its cleartext controller byte the way any
