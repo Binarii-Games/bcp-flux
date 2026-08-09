@@ -231,6 +231,7 @@ register_tests("tests/bench/*.cpp"       bench       600 flux tests)
 # tree, so a test that drives one needs the same view of them the library has.
 
 target_include_directories(flow_fault_recovery PRIVATE flux/src)
+target_include_directories(transfer_fault_recovery PRIVATE flux/src)
 target_include_directories(mac_only_packet PRIVATE flux/src)
 target_include_directories(flow_jam_eviction PRIVATE flux/src)
 target_include_directories(concurrent_flows PRIVATE flux/src)
