@@ -130,6 +130,7 @@ namespace bcp::flux
         // from clean state rather than leaking the previous allocation.
         peers_.Shutdown();
         flows_.Shutdown();
+        transfers_.Shutdown();
         pendingPool_.Shutdown();
         readyLanes_.Shutdown();
         events_.Shutdown();
@@ -304,6 +305,17 @@ namespace bcp::flux
                                              &heldTotal_, recvHoldCeiling_);
             error != common::Error::Ok)
             return error;
+
+        {
+            TransferTable::Params transferParams;
+            transferParams.outCount         = f.transferOutCount;
+            transferParams.inCount          = f.transferInCount;
+            transferParams.maxPeers         = config.maxPeers;
+            transferParams.maxTransferBytes = f.maxTransferBytes;
+            if (common::Error error = transfers_.Init(transferParams);
+                error != common::Error::Ok)
+                return error;
+        }
 
         // Floored at one full wire packet: the budget gates sends, and a floor
         // no packet fits under would refuse a full-size packet forever;
@@ -1368,6 +1380,9 @@ namespace bcp::flux
             case internal::SECURE_CHANNEL_GRANT:          Grant_Update(from, buf, plen);   break;
             case internal::SECURE_CHANNEL_GRANT_ACK:      Grant_Acked(from, buf, plen);    break;
             case internal::SECURE_CHANNEL_FLOW_ACK:       Flow_Ack(from, buf, plen);       break;
+            case internal::SECURE_CHANNEL_TRANSFER:       Transfer_Data(from, buf, plen);  break;
+            case internal::SECURE_CHANNEL_TRANSFER_ACK:   Transfer_Ack(from, buf, plen);   break;
+            case internal::SECURE_CHANNEL_TRANSFER_REJECT: Transfer_Reject(from, buf, plen); break;
             default: break;   // unknown channel: authenticated but unhandled, drop
         }
     }
@@ -2790,6 +2805,7 @@ namespace bcp::flux
                 RecordPeerEvent(*dying, peer.GetSlotIndex(), SocketEvent::PEER_LOST);
                 if (flows_.SendEnabled() || flows_.ReceiveEnabled())
                     flows_.SweepPeer(peer.GetSlotIndex());
+                    transfers_.SweepPeer(peer.GetSlotIndex());
             }
         }
         return peers_.RemovePeer(addr);
@@ -3065,6 +3081,14 @@ namespace bcp::flux
                     // Capacity freed above (and by acks since the last tick)
                     // goes to the packets that have waited longest.
                     DrainWaitingSends(addr);
+                }
+
+                // Transfers run beside the flows on the same tick and the same
+                // peer, sharing its budget and its pacing clock. Its own handle
+                // by value, so nothing is held across the sends inside.
+                if (transfers_.SendEnabled())
+                {
+                    TransferPass(addr, peers_.GetPeer(addr), Now(nowOverride));
                 }
 
                 // A jammed receiving flow pins recv slots for a gap the sender

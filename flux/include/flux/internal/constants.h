@@ -60,6 +60,20 @@ namespace bcp::flux::internal
     static constexpr uint8_t  SECURE_CHANNEL_GRANT           = 0x05;
     static constexpr uint8_t  SECURE_CHANNEL_GRANT_ACK       = 0x06;
 
+    /** A transfer's own channels, which is what keeps the mechanism parallel
+        to flows rather than threaded through them. A transfer carries no flow
+        header, no mode bits and no message framing, so it demuxes here, before
+        any flow decode runs, and the flow path never learns it exists.
+
+        TRANSFER carries both the announcement and the bytes, told apart by a
+        flag in its own header. TRANSFER_ACK reports what has arrived.
+        TRANSFER_REJECT is the receiver declining, which is a refusal of one
+        transfer rather than of the channel it came on, so it is its own op and
+        not a reuse of FLOW_REJECT. */
+    static constexpr uint8_t  SECURE_CHANNEL_TRANSFER        = 0x07;
+    static constexpr uint8_t  SECURE_CHANNEL_TRANSFER_ACK    = 0x08;
+    static constexpr uint8_t  SECURE_CHANNEL_TRANSFER_REJECT = 0x09;
+
     /** Grant payload: the receive slots the sender of this op will hold for the
         peer it is addressed to, and a generation so an op that overtakes an
         older one cannot be undone by it. */
@@ -98,6 +112,7 @@ namespace bcp::flux::internal
     static constexpr uint16_t FLOW_WINDOW                   = 256;
     static constexpr uint16_t FLOW_WINDOW_BULK              = 1024;
 
+
     /** Ceiling for the configurable waiting and reorder rings: the largest
         power of two fitting the uint16_t caps they are stored in. */
     static constexpr uint16_t FLOW_RING_MAX                 = 32768;
@@ -123,6 +138,105 @@ namespace bcp::flux::internal
         part the sender cannot afford to lose, and it is one fixed field rather
         than a list that can be cut short. */
     static constexpr uint8_t  FLOW_ACK_RANGE_COUNT          = 16;
+
+    // --- Transfer ---
+    // A transfer moves one length-announced run of bytes between buffers the
+    // application owns, on its own secure channels, with no flow header and no
+    // message framing. Its packets are all one size, which is what lets a
+    // packet's place in the destination buffer be arithmetic rather than
+    // bookkeeping.
+
+    /** Header inside the seal on every transfer packet, after the channel
+        byte: [transferId(2)][seq(4)][flags(1)]. The id names which transfer on
+        this peer, the sequence places the packet, and the flag says whether
+        this one announces or carries bytes. */
+    static constexpr uint8_t  TRANSFER_WIRE_HEADER_SIZE      = 7;
+
+    /** The announcing packet's payload: [totalLen(8)][stride(2)].
+
+        The stride is sent even though both ends derive the same constant,
+        because the receiver refuses a value it did not expect rather than
+        trusting one. That refusal is load bearing: an announced stride would
+        otherwise be an attacker-chosen multiplier on every offset the receiver
+        computes into the application's buffer.
+
+        The announcing packet carries no bytes of the transfer. Letting it
+        carry a short first chunk would put a special case in the offset
+        arithmetic, and that arithmetic is the one thing standing between a
+        hostile sender and a write past the end of a buffer flux does not
+        own. */
+    static constexpr uint8_t  TRANSFER_ANNOUNCE_SIZE         = 10;
+
+    /** Flag bit in the transfer header saying this packet announces rather
+        than carries. A transfer runs one after another on the same id, so the
+        receiver cannot infer a start from the sequence alone. */
+    static constexpr uint8_t  TRANSFER_FLAG_ANNOUNCE         = 0x01;
+
+    /** Payload one transfer packet carries, and every packet but the last
+        carries exactly this. A packet at sequence s writes at
+        (s - firstDataSeq) * TRANSFER_STRIDE_BYTES.
+
+        The peer tag is subtracted whether or not a given packet carries one. A
+        stride that moved with a per-packet flag would move every offset behind
+        it, so the four bytes are spent on every transfer packet to keep the
+        multiply exact. */
+    static constexpr uint16_t TRANSFER_STRIDE_BYTES          =
+        MAX_WIRE_PACKET_SIZE - WIRE_SECURE_HEAD_SIZE - WIRE_PEER_TAG_SIZE
+        - WIRE_TAG_SIZE - WIRE_SECURE_CHANNEL_SIZE - TRANSFER_WIRE_HEADER_SIZE;
+
+    /** A transfer's in-flight window, and it is this large because it can
+        afford to be. Every reliable flow mode holds a full copy of each
+        unacknowledged packet, so its window costs the packet size times its
+        depth, and a window able to fill a fast long path costs more memory
+        than the path carries. Measured on a 1 Gbit link at 40 ms, which holds
+        about 5 MB in flight: the bulk window tops out near 1.2 MB, so the flow
+        ran out of window rather than out of path and moved 1024 MB in 42.34 s
+        against msquic's 12.65.
+
+        A transfer stages nothing, because a retransmit is re-read from the
+        application's own buffer, so an outstanding packet costs its ring entry
+        alone, and the depth this could afford is far greater than a flow's.
+
+        It is held at a bulk flow's depth anyway, because depth is only worth
+        having if what is put at risk can be repaired. Measured on a link
+        losing two percent in bursts of twenty, moving 20 MB: 33 s at this
+        depth against 68 s at eight times it, with ten times the loss events,
+        because the wider window overflowed the queue faster than the repair
+        logic could recover it. Raising this is the last step of matching the
+        flow path's acknowledgement detail, not the first. */
+    static constexpr uint16_t TRANSFER_WINDOW                = 1024;
+
+    /** Bytes of window state an acknowledgement carries, one bit per sequence
+        from the cursor forward.
+
+        A transfer's receiver writes each packet at its own offset and needs no
+        order, so what the sender wants back is not a cursor but the set of
+        sequences that have landed. Sending the whole window says that exactly:
+        no blind spot beyond a peephole, no cap on how many gaps can be
+        described, and self-healing, because a lost acknowledgement costs
+        nothing when the next one carries the entire state again.
+
+        At a 1024 window it is 128 bytes against a 1163 byte data packet, and
+        acknowledgements go out on a cadence rather than per packet, so the
+        reverse path pays a few percent for perfect information. A cursor with
+        a 64 bit peephole was measured first: packets that had arrived but sat
+        beyond the peephole stayed counted as outstanding, held the window
+        shut, and were only timed when the cursor eventually reached them,
+        which put a 1.37 second round trip into the estimate. */
+    static constexpr uint16_t TRANSFER_ACK_BITMAP_BYTES      = TRANSFER_WINDOW / 8;
+
+    /** Packets a receiving transfer holds while it waits for the application
+        to answer the announcement. The sender does not stop to wait, so what
+        is already on the path has somewhere to land. Past this the rest are
+        dropped and retransmitted, which throttles the sender to the speed the
+        application answers rather than wasting the link. */
+    static constexpr uint16_t TRANSFER_PREATTACH_SLOTS       = 16;
+
+    /** Largest transfer this socket accepts an announcement for when Config
+        leaves maxTransferBytes at zero. Nothing inside flux is sized by it,
+        because the tracking is window sized rather than transfer sized. It
+        bounds what a remote may ask the application to find room for. */
+    static constexpr uint64_t TRANSFER_MAX_BYTES_DEFAULT     = 1ull << 30;   // 1 GiB
 
     // --- Congestion control ---
     // Per peer, in bytes, spent only by flow packets. Grows on acknowledgement,

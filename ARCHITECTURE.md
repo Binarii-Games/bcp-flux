@@ -184,6 +184,37 @@ pooled slot so that the association's own lock covers it: finding a pooled slot
 would mean taking the association lock and then the slot's, which is the
 reverse of the order the send path takes everywhere else.
 
+#### Transfer
+
+A transfer moves one run of bytes whose length is agreed up front, between two
+buffers the application owns. The sender hands `SendTransfer` a pointer and a
+length and keeps the memory alive until the outcome comes back. The receiver
+learns of the offer through the `TRANSFER_INCOMING` event and answers it with
+`Allow` and a buffer of the announced size, or with `Reject`. Packet `s`
+belongs at offset `s * stride` and nowhere else, so the interesting work is
+arithmetic rather than buffering: nothing is staged per packet, a retransmit
+is re-read from the sender's buffer, and delivery writes straight into the
+receiver's. That destination is memory the library does not own, which is why
+every bound a sender could influence is checked rather than trusted.
+
+A transfer and a bulk flow answer different jobs. A flow carries a stream of
+messages that each need framing and delivery as they arrive, and it retains a
+staging copy of every reliable body. A transfer carries one known-length run
+whose only deliverable is the completed buffer, so it can skip the copies and
+the per-message framing entirely.
+
+`OutTransfer` and `InTransfer` are the two halves, in their own pools inside
+`TransferTable`, with their window rings (send stamps, acknowledgement bitmap,
+resend marks, placement bitmap) in table-owned blocks beside them. The
+tracking is window sized rather than transfer sized, so a gigabyte and a
+kilobyte need the same state. The window bounds the sequence span above the
+progress cursor rather than the count in flight, because the rings index by
+`seq & (window - 1)` and a sequence a whole window past the cursor would land
+on a live entry belonging to an older one.
+
+A transfer spends the same per-peer congestion budget the flows do, through
+the same controller, because everything sent to one peer crosses one link.
+
 #### PacketSlot
 
 A packet as it sits in a pool slot: an address, a size, and the raw wire bytes
@@ -200,7 +231,7 @@ stores it, matches it, and surfaces it to the layer above.
 
 ### 3.2 Memory: the pools
 
-Nothing on the packet path allocates. There are eleven pools, each with one
+Nothing on the packet path allocates. There are thirteen pools, each with one
 owner:
 
 | Pool | Owner | Holds |
@@ -214,6 +245,8 @@ owner:
 | out-association, bulk | `FlowTable` | `OutAssociation` slots, deep window |
 | in-association | `FlowTable` | `InAssociation` slots, standard window |
 | in-association, bulk | `FlowTable` | `InAssociation` slots, deep window |
+| out-transfer | `TransferTable` | `OutTransfer` slots, window rings in table-owned blocks beside them |
+| in-transfer | `TransferTable` | `InTransfer` slots, likewise |
 | peer | `PeerTable` | `Peer` slots |
 | certificate | `CertStore` | trusted `Certificate` slots |
 
@@ -416,7 +449,7 @@ packer sets it and has no business reaching into the socket's headers.
 
 ### 3.5b Where the code lives
 
-Four pieces sit in their own files rather than inside `Socket` or `FlowTable`,
+Six pieces sit in their own files rather than inside `Socket` or `FlowTable`,
 because each is one job and neither of those is:
 
 | File | Holds |
@@ -426,6 +459,8 @@ because each is one job and neither of those is:
 | `flow/assoc_directory.cpp` | flow id to slot index, per peer, per direction |
 | `peer/congestion.cpp` | the budget, loss and delay signals both, which belongs to the peer and not to any one flow |
 | `internal/congestion_curve.h` | the growth arithmetic that policy consults: the queue a path tolerates, CUBIC's window over time, the straight line under it |
+| `transfer/transfer_table.cpp` | every transfer this socket runs: the window rings, the placement arithmetic, the overdue scan |
+| `socket/socket_transfer.cpp` | the transfer entry points and the tick's transfer pass, which reach most of the socket's sending machinery but none of the flow tables |
 
 The split is by job, not by size. The handshake and the migration receive path
 are both larger than any of these and both stay where they are: each reaches
@@ -464,7 +499,7 @@ crypto, for traffic that is public anyway and sent often. Unsecured carries no
 tag at all and cannot carry a flow, because a forged packet could otherwise name
 any sequence it liked.
 
-#### Sending: two seals, six origins
+#### Sending: two seals, seven origins
 
 An outbound packet is sealed one of two ways. `SealSecurePacket` encrypts the
 payload and covers it with a tag. `SealMacOnlyPacket` leaves the payload readable
@@ -473,7 +508,7 @@ often. Framing is identical either way, so every offset matches and only the
 seal and the open differ. The receive side mirrors them with `OpenSecurePacket`
 and `OpenMacOnlyPacket`.
 
-Six things originate a send:
+Seven things originate a send:
 
 1. Application, non-flow: `BuildPacket().NoFlow()...Send()` or `.SendSecured()`
 2. Application, on a flow: `BuildPacket().WithFlow(flow)...Send()` or `.SendSecured()`
@@ -483,6 +518,10 @@ Six things originate a send:
 6. The waiting-ring drain: reliable entries go through `SealStagingToWire` like
    a retransmit, unreliable ones are sealed and sent where they sit, because
    nothing retains them and there is no staging copy to seal from
+7. The tick's transfer pass: announcements, data and repairs for every
+   transfer a peer is running, read straight from the application's buffer
+   and framed as secure control, so a retransmit costs a ring entry rather
+   than a retained copy
 
 The builder requires the packet's kind declared before any payload, because the
 kind decides the pool: a reliable flow body is its own retransmit source and
@@ -562,7 +601,8 @@ Everything else runs through `PreProcessIn` (known-peer check for unsecured
 traffic, decryption for secure, then replay and liveness), which routes what it
 admits to one of three sinks:
 
-1. `ProcessSecureControl`: path validation, flow reject, flow ack
+1. `ProcessSecureControl`: path validation, flow reject, flow ack, transfer
+   data, transfer ack, transfer reject
 2. `ProcessFlowIn`: flow data
 3. `QueueReady`: non-flow application data
 
@@ -905,9 +945,45 @@ closing needs. The per-peer directory is split by direction so "my flow 3 to
 you" and "your flow 3 to me" cannot collide: data resolves against the in
 directory, `FLOW_REJECT` against the out.
 
+#### Transfers
+
+`SendTransfer` leases the sending half and sends an announcement carrying the
+length and the stride. Nothing else moves until the receiver answers, because
+data sent at a receiver that has not attached a buffer could only be thrown
+away. A lost announcement retries on the retransmit timeout, so it delays a
+transfer rather than killing it.
+
+On the receiving side the announcement surfaces as `TRANSFER_INCOMING`. The
+application fetches the offer with `PendingTransfer`, then attaches a buffer
+of the announced length with `Allow` or declines with `Reject`. A refusal
+travels back as its own control message and resolves the sender's half with
+`Refused`, and what the refusal releases goes straight back to the budget,
+because a refusal is not congestion.
+
+The receiver places each data packet at `seq * stride` and acknowledges every
+second arrival with its contiguous cursor and a bitmap of the whole window
+above it, so the sender is told outright which packets have landed rather
+than inferring it from a cursor. An acknowledged sequence resolves out of
+order, and the window slides on the cursor.
+
+A hole is resent once as soon as three sequences above it have landed, or one
+has landed and the packet has been out longer than a round trip and an
+eighth, the same two rules the flow path declares loss by. After that first
+repair the retransmit timeout governs each further attempt, which is what
+gives a resend time to arrive. The overdue scan resumes across one pass, so a
+pass walks the window once however many packets it offers. Losses are charged
+to the controller behind a barrier at the highest sequence yet sent: packets
+already on the wire when a loss was charged cannot charge another, which is
+the transfer's version of the epoch stamp a flow packet carries.
+
+Completion surfaces through `PollTransfers` on both ends as a `TransferView`
+naming the buffer, the length and the outcome, and `CompleteTransfer`
+releases the receiving half. Sweeping a peer drops its transfers, so a slot
+recycled to a later peer can never inherit one.
+
 #### Congestion control
 
-The budget is per peer, in bytes, and only flow packets spend it. It starts at
+The budget is per peer, in bytes, and flow and transfer packets spend it. It starts at
 ten full packets and never drops below a configured floor of at least one full
 wire packet, so the gate can always admit a packet once the path drains, nor
 rises above what every flow window on that peer could hold at once, past which

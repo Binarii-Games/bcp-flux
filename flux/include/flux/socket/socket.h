@@ -27,6 +27,8 @@
 #include <common/collections/slot_pool.h>
 
 #include <flux/util/challenge.h>
+#include <flux/transfer/transfer.h>
+#include <flux/transfer/transfer_table.h>
 #include <flux/internal/constants.h>
 #include <flux/internal/replay_window.h>
 #include <flux/crypto/certificate.h>
@@ -237,6 +239,28 @@ namespace bcp::flux
                 uint32_t bulkOutCount      = 0;
                 uint32_t inCount           = 0;    ///< receiving associations, socket-wide
                 uint32_t bulkInCount       = 0;    ///< of which bulk-capable; sized for the deep window
+
+                /** Transfers this socket may have running at once, in each
+                    direction. They live in pools of their own, outside the
+                    association pools, because a transfer shares none of an
+                    association's state. Their in-flight ring is eight times a
+                    bulk one, which they can afford because a transfer stages
+                    no packet bodies: an outstanding packet costs its ring
+                    entry rather than its bytes. Zero refuses transfers
+                    outright, so a socket that never moves buffers pays
+                    nothing for them. */
+                uint32_t transferOutCount  = 0;
+                uint32_t transferInCount   = 0;
+
+                /** Largest transfer this socket will accept an announcement
+                    for. 0 takes internal::TRANSFER_MAX_BYTES_DEFAULT.
+
+                    It sizes nothing inside flux, because a transfer's tracking
+                    is window sized rather than transfer sized. What it bounds
+                    is what a remote may ask the application to find room for,
+                    so a peer cannot announce a length no buffer could serve
+                    and have the handler try. */
+                uint64_t maxTransferBytes  = 0;
                 uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
                 /** DEFENSIVE: what one remote may create. It also bounds how
                     much of the receive pool that remote can pin, because each
@@ -471,6 +495,83 @@ namespace bcp::flux
             InvalidState on a stale handle or one already closing. */
         [[nodiscard]] common::Error CloseFlow(const FlowHandle& flow);
 
+        // --- Transfers ---
+        //
+        // Beside flows, not inside them. A transfer has its own secure
+        // channels, its own header and its own ids, so nothing on the flow
+        // path changes to carry one. The id space is the transfer's own: it
+        // does not collide with flow ids and needs no OpenFlow. What the two
+        // mechanisms do share is the peer's congestion budget and pacing
+        // clock, because they share a link.
+
+        /** Moves one run of bytes to one peer, on the transfer id both ends
+            agree on.
+
+            The buffer is the retransmit source rather than something to copy,
+            so it must stay alive and unmodified until PollTransfers reports it
+            finished. That is the whole reason the window can be deep: nothing
+            is staged, so an outstanding packet costs its ring entry rather
+            than its bytes.
+
+            One transfer at a time per id per peer, since the pair is what
+            names it. AlreadyPending when one is already running there,
+            InvalidState when the socket provisioned no transfer pool,
+            TooLarge past the peer's ceiling, InvalidParam for a null buffer or
+            a zero length. Zero is refused so a zero-length announcement can
+            never be a valid thing to wait for, which is what lets a pending
+            length of zero mean nothing pending. */
+        [[nodiscard]] common::Error SendTransfer(uint16_t transferId,
+                                                 const Address& peer,
+                                                 const void* buffer,
+                                                 uint64_t length);
+
+        /** The announcement waiting on this id from this peer, to answer with
+            Allow or Reject. Both are named by a TRANSFER_INCOMING event.
+
+            Legal from inside an event handler: events dispatch with no peer or
+            association lock held, and the slot the event names is kept alive
+            across the handler for exactly this. A handler must not call Poll,
+            which is true of every handler and not special here.
+
+            An invalid request comes back when nothing is pending. */
+        [[nodiscard]] TransferRequest PendingTransfer(uint16_t transferId,
+                                                      const Address& peer);
+
+        /** Bytes of a transfer that are contiguous from its start, so an
+            application can watch one move without waiting for it. Answers for
+            either direction on this id and peer.
+
+            Contiguous on purpose: packets land at their own offsets and a hole
+            can sit anywhere, so a count of what has arrived would report bytes
+            ready while the middle is still untouched. Zero when nothing is
+            running. */
+        [[nodiscard]] uint64_t TransferProgress(uint16_t transferId,
+                                                const Address& peer) const;
+
+        /** Finished transfers, both directions, oldest first, into the
+            caller's array. Returns how many were written.
+
+            Separate from Poll because the two share nothing: a finished
+            transfer carries no packet, no slot and no message, and it happens
+            once per transfer rather than once per packet. Keeping it out means
+            the message path pays nothing for a feature it does not use.
+
+            An incoming transfer stays held until CompleteTransfer, so its
+            bytes outlive this call. An outgoing one reports a null buffer and
+            means the source is free again. */
+        [[nodiscard]] size_t PollTransfers(TransferView* out, size_t max);
+
+        /** Releases a completed incoming transfer, freeing the id for this
+            peer's next one.
+
+            Deliberately not automatic. Holding it is the backpressure: the
+            peer cannot start another transfer on this id until the application
+            says it is done with the last, so a receiver that hands each buffer
+            to a worker thread throttles the sender instead of racing it.
+            NotFound when nothing is completed and waiting. */
+        [[nodiscard]] common::Error CompleteTransfer(uint16_t transferId,
+                                                     const Address& peer);
+
         /** The flow's own state: OPEN until closed, whatever any one target is
             doing. CLOSED for a stale handle. */
         [[nodiscard]] FlowLifecycle GetFlowState(const FlowHandle& flow);
@@ -586,6 +687,11 @@ namespace bcp::flux
             those. It cannot reach a peer, so it cannot invert the packet-slot
             then peer then flow lock order. */
         FlowTable                      flows_;
+
+        /** Every transfer running on this socket, beside the flows rather than
+            inside them. Like the flow table it can never reach a peer, so it
+            cannot invert the packet-slot then peer then transfer lock order. */
+        TransferTable                  transfers_;
 
         // The recv/ready path. The flow table borrows all three.
         common::collections::SlotPool* recvPool_ = nullptr;   ///< borrowed from the kernel
@@ -836,6 +942,34 @@ namespace bcp::flux
             applied where this socket takes responsibility for a packet. Nothing
             waits in the kernel for a caller that may be slow to ask. */
         void ReceiveIntoPool();
+
+        // --- Transfers, internal ---
+        // The three channel handlers, and the pass that drives outgoing
+        // transfers on the tick. TransferRequest reaches Allow and Reject
+        // through the socket, so it is a friend of it rather than of the
+        // table, which keeps the table unable to reach a peer.
+        friend class TransferRequest;
+
+        void Transfer_Data(const Address& from, const uint8_t* payload, size_t len);
+        void Transfer_Ack(const Address& from, const uint8_t* payload, size_t len);
+        void Transfer_Reject(const Address& from, const uint8_t* payload, size_t len);
+
+        /** One tick's work for every transfer this peer is sending: the
+            announcement if it is still owed, then as many data packets as the
+            window, the congestion budget and the pacing clock allow, then
+            whatever is overdue. Gathers under the peer lock and sends after
+            it, like every other send path here. */
+        void TransferPass(const Address& to, PeerHandle peerHandle, uint64_t now);
+
+        /** Tells a peer what has arrived, so it can stop holding what has
+            landed and resend what has not. */
+        void SendTransferAck(const Address& to, const PeerSendMaterials& materials,
+                             uint16_t transferId, uint32_t recvNext,
+                             const uint8_t* bitmap);
+
+        [[nodiscard]] common::Error AllowTransfer(uint16_t transferId,
+                                                  const Address& peer, void* buffer);
+        common::Error RejectTransfer(uint16_t transferId, const Address& peer);
 
         void SendSecureControl(const Address& to, const PeerSendMaterials& materials,
                                uint8_t channel, const uint8_t* payload, size_t payloadLen);

@@ -89,6 +89,17 @@ namespace bcp::flux
             already kept and because what an application does about it is about
             the peer. */
         PEER_FLOW_JAMMED       = (1u << 9),
+
+        /** A peer announced a transfer on one of its flows and is waiting to
+            be told where to put it. The announcement carries the length, which
+            is held on the association rather than here: ask for it with
+            Socket::PendingTransfer, using the flow and peer this event names.
+
+            The handler answers with Allow or Reject on the request it gets
+            back, and either is legal from inside the handler. A handler that
+            answers with neither leaves the transfer pending until the flow
+            stall timeout takes it. */
+        TRANSFER_INCOMING      = (1u << 10),
     };
 
     constexpr uint32_t ToBits(SocketEvent e) noexcept { return static_cast<uint32_t>(e); }
