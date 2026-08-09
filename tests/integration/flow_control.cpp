@@ -126,7 +126,7 @@ static void reliable_ordered_flow_delivers_in_order()
 
     flux::PacketSlotHandle sink[64];
 
-    // Establish through the relay (in order — reordering is still off).
+    // Establish through the relay (in order, reordering is still off).
     CHECK(client.Connect(relayAddr) == common::Error::Ok);
     bool established = false;
     for (int i = 0; i < 300 && !established; ++i)
@@ -134,7 +134,9 @@ static void reliable_ordered_flow_delivers_in_order()
         relay.Pump();
         client.Poll(sink, 64);
         server.Poll(sink, 64);
+        client.Flush();
         client.Update();
+        server.Flush();
         server.Update();
         established = Established(client, relayAddr) && Established(server, relayAddr);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -164,15 +166,17 @@ static void reliable_ordered_flow_delivers_in_order()
         {
             relay.Pump();
             flux::PacketSlotHandle handles[64];
-            uint32_t count = server.Poll(handles, 64);
-            for (uint32_t h = 0; h < count; ++h)
+            flux::PollCursor cursor = server.Poll(handles, 64);
+            while (cursor.Next())
             {
-                flux::PacketSlotReader reader{std::move(handles[h])};
+                flux::PacketSlotReader& reader = cursor.Message();
                 uint32_t seq = 0;
                 if (reader.TakeU32(seq)) delivered.push_back(seq);
             }
             client.Poll(sink, 64);   // drain acks back to the sender
+            client.Flush();
             client.Update();
+            server.Flush();
             server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -219,7 +223,9 @@ static bool RunSwappedBurst(flux::FlowMode mode, uint16_t clientPort, uint16_t s
         relay.Pump();
         client.Poll(sink, 64);
         server.Poll(sink, 64);
+        client.Flush();
         client.Update();
+        server.Flush();
         server.Update();
         established = Established(client, relayAddr) && Established(server, relayAddr);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -238,15 +244,17 @@ static bool RunSwappedBurst(flux::FlowMode mode, uint16_t clientPort, uint16_t s
     {
         relay.Pump();
         flux::PacketSlotHandle handles[64];
-        uint32_t count = server.Poll(handles, 64);
-        for (uint32_t h = 0; h < count; ++h)
+        flux::PollCursor cursor = server.Poll(handles, 64);
+        while (cursor.Next())
         {
-            flux::PacketSlotReader reader{std::move(handles[h])};
+            flux::PacketSlotReader& reader = cursor.Message();
             uint32_t seq = 0;
             if (reader.TakeU32(seq)) delivered.push_back(seq);
         }
         client.Poll(sink, 64);
+        client.Flush();
         client.Update();
+        server.Flush();
         server.Update();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

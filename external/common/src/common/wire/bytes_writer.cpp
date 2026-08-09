@@ -13,7 +13,7 @@ namespace bcp::common
         
         ++p;
         --r;
-        IncrLenght(1);
+        AddWritten(1);
         
         return true;
     }
@@ -28,7 +28,7 @@ namespace bcp::common
         
         p+=2;
         r-=2;
-        IncrLenght(2);
+        AddWritten(2);
         
         return true;
     }
@@ -45,7 +45,7 @@ namespace bcp::common
 
         p+= 4;
         r-= 4;
-        IncrLenght(4);
+        AddWritten(4);
 
         return true;
     }
@@ -66,7 +66,7 @@ namespace bcp::common
         
         p+=8;
         r-=8;
-        IncrLenght(8);
+        AddWritten(8);
 
         return true;
     }
@@ -79,13 +79,13 @@ namespace bcp::common
         std::memcpy(p, data, len);
         p+=len;
         r-=len;
-        IncrLenght(len);
+        AddWritten(len);
 
         return true;
     }
 
-    void BytesWriter::IncrLenght(size_t len) noexcept
+    void BytesWriter::AddWritten(size_t len) noexcept
     {
-        *l += static_cast<uint16_t>(len);
+        *written += static_cast<uint16_t>(len);
     }
 }

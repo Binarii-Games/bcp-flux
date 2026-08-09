@@ -27,13 +27,19 @@
 #include <common/collections/slot_pool.h>
 
 #include <flux/util/challenge.h>
+#include <flux/transfer/transfer.h>
+#include <flux/transfer/transfer_table.h>
 #include <flux/internal/constants.h>
 #include <flux/internal/replay_window.h>
 #include <flux/crypto/certificate.h>
 #include <flux/crypto/cert_store.h>
 #include <flux/crypto/identity.h>
 #include <flux/socket/i_socket_kernel.h>
+#include <flux/crypto/packet_seal.h>
 #include <flux/socket/packet_slot.h>
+#include <flux/peer/peer_recv_state.h>
+#include <flux/socket/ready_lanes.h>
+#include <flux/socket/socket_events.h>
 #include <flux/socket/socket_listener.h>
 #include <flux/socket/socket_sender.h>
 #include <flux/peer/peer.h>
@@ -55,6 +61,17 @@ namespace bcp::flux
         CTRL_HAS_FLOW = (1u << 1),
         CTRL_UNSECURE = (1u << 2),   ///< plaintext opt-out: no tag, no nonce, no integrity
         CTRL_TAGGED   = (1u << 3),   ///< secure header carries a migration peer tag
+        /** Authenticated but not encrypted. Same framing as an encrypted
+            packet, so the offsets are identical; only the transform differs.
+            The payload is readable by anyone and alterable by nobody. */
+        CTRL_MACONLY  = (1u << 4),
+        /** The content is a list of messages, each behind a two-byte length,
+            rather than one message filling it. Set only from the second message
+            on, so a packet carrying one is byte-identical to an unbatched one
+            and costs nothing. Every message in the list belongs to the same
+            flow with the same security, which is why they share this
+            controller instead of each carrying one. */
+        CTRL_BATCH    = internal::WIRE_CTRL_BATCH,
     };
 
     constexpr Controls operator|(Controls a, Controls b) noexcept
@@ -84,16 +101,20 @@ namespace bcp::flux
         HS_FINISH = 0x03,
     };
 
-    /** The session materials one send needs, gathered once under the peer's
-        write lock and carried by value to the seal. Trivially copyable; the
-        caller Wipes `key` after the send. */
-    struct PeerSendMaterials
+    /** The lane a thread last drained, handed back to Poll so it returns to the
+        same one.
+
+        Nothing is registered and nothing is owed: Poll takes whichever lane is
+        free, preferring this. A thread that keeps passing back what Poll gave it
+        stays on one lane, which is what keeps its peers' state in one cache, and
+        a lane whose usual thread stops calling is simply taken by another rather
+        than filling up untouched.
+
+        Default-constructed names lane zero, which is the only lane when Config
+        leaves pollLanes at one, so a single-threaded caller never mentions it. */
+    struct ThreadIdentity
     {
-        common::crypto::SessionKey key;
-        common::crypto::SessionKey headerKey;   ///< masks the wire counter field
-        uint64_t                   counter = 0;   ///< a fresh ++sendCounter per send
-        uint8_t                    lane    = 0;
-        PeerTag                    tag{};
+        uint32_t lane = 0;
     };
 
     class Socket
@@ -130,6 +151,44 @@ namespace bcp::flux
             uint32_t    pendingPacketCount = 1024;   ///< pending pool, shared by all peers
             uint32_t    recvSlotCount      = internal::SOCK_KERNEL_ZLOCKPCKT_COUNT;
             uint32_t    sendSlotCount      = internal::SOCK_KERNEL_SENDSLOT_COUNT;
+
+            /** Receive slots that buffering may never take, so an arriving
+                packet always has somewhere to land. Without it a pool filled
+                with packets waiting behind a gap leaves nothing to receive
+                into, and the socket goes deaf to every peer rather than
+                throttling one.
+
+                Zero derives it from recvSlotCount, a sixteenth with a floor of
+                64. Set it directly when the default does not suit: a socket
+                fielding thousands of peers wants far more headroom per tick
+                than one fielding ten, and only the embedder knows which it is.
+                A reserve at or above recvSlotCount simply never buffers, which
+                costs reordering and never reception. */
+            uint32_t    recvReserveSlots   = 0;
+
+            /** Packets one Update takes off the socket before returning.
+                Emptying the OS buffer is the point of receiving on the tick, so
+                this is a budget rather than anything a caller asks for, and a
+                socket under load wants it high enough that the kernel never
+                becomes the queue.
+
+                Zero drains as much as the receive pool could hold, which is the
+                natural ceiling: nothing more can be taken while every slot is
+                occupied. Set it lower to bound the work one tick does, higher
+                to keep draining as slots free during the same pass. */
+            uint32_t    recvBatch          = 0;
+
+            /** How many threads will drain delivered packets. One means Poll
+                behaves exactly as it always has and the identity argument can be
+                left off.
+
+                Above one it must be a power of two, and Init refuses anything
+                else rather than rounding, because a rounded-up count leaves a
+                lane no thread was told to drain. Every lane needs its own
+                thread: an undrained one fills until the receive pool is dry and
+                then the socket stops hearing anyone. Each lane is sized for the
+                whole receive pool, so this multiplies queue memory. */
+            uint32_t    pollLanes          = 1;
 
             /** Long-term identity (see Identity::Generate), copied by Init; the
                 caller may Wipe its own copy after. Null = anonymous (fresh
@@ -172,19 +231,80 @@ namespace bcp::flux
                     state it spawns is sized by outCount below. */
                 uint32_t flowCount         = 64;
                 uint32_t outCount          = 0;    ///< sending associations, socket-wide
+                /** Sending associations for RELIABLE_ORDERED_BULK, which draw
+                    from a pool of their own because their in-flight ring is
+                    four times as deep (24 KB a slot against 6). Zero refuses
+                    the mode, so a socket that never sends bulk pays nothing
+                    for it. */
+                uint32_t bulkOutCount      = 0;
                 uint32_t inCount           = 0;    ///< receiving associations, socket-wide
-                uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
-                uint32_t maxInPerPeer      = 8;    ///< DEFENSIVE: what one remote may create
+                uint32_t bulkInCount       = 0;    ///< of which bulk-capable; sized for the deep window
 
-                /** How far ahead of a gap ordered delivery buffers; past it a
-                    packet is dropped and a resend fills it later. Power of two,
-                    or 0. */
-                uint32_t reorderCount      = 64;
-                /** Retained reliable bodies, held send-until-ack for retransmit.
-                    Socket-wide ceiling on unacked reliable traffic; running dry
-                    is backpressure. Sized apart from send slots so a busy flow
-                    can never starve handshakes, acks, or unreliable traffic. */
-                uint32_t stagingCount      = 512;
+                /** Transfers this socket may have running at once, in each
+                    direction. They live in pools of their own, outside the
+                    association pools, because a transfer shares none of an
+                    association's state. Their in-flight ring is eight times a
+                    bulk one, which they can afford because a transfer stages
+                    no packet bodies: an outstanding packet costs its ring
+                    entry rather than its bytes. Zero refuses transfers
+                    outright, so a socket that never moves buffers pays
+                    nothing for them. */
+                uint32_t transferOutCount  = 0;
+                uint32_t transferInCount   = 0;
+
+                /** Largest transfer this socket will accept an announcement
+                    for. 0 takes internal::TRANSFER_MAX_BYTES_DEFAULT.
+
+                    It sizes nothing inside flux, because a transfer's tracking
+                    is window sized rather than transfer sized. What it bounds
+                    is what a remote may ask the application to find room for,
+                    so a peer cannot announce a length no buffer could serve
+                    and have the handler try. */
+                uint64_t maxTransferBytes  = 0;
+                uint32_t maxOutPerPeer     = 8;    ///< sending associations per peer
+                /** DEFENSIVE: what one remote may create. It also bounds how
+                    much of the receive pool that remote can pin, because each
+                    receiving association can hold a full window of packets
+                    behind a gap it never fills. maxInPerPeer times the window
+                    is the worst case for one peer, and at the defaults that is
+                    the whole pool, so a socket exposed to untrusted remotes
+                    wants this low, recvSlotCount high, or both. */
+                uint32_t maxInPerPeer      = 8;
+
+                /** Receive slots one peer may occupy at once, told to that peer
+                    over the secure channel once a session exists. Counts
+                    packets held behind a gap plus packets delivered and not yet
+                    polled, since both pin a slot.
+
+                    A throughput ceiling as much as a memory one: a peer can
+                    never receive more than this many packets per round trip, so
+                    a small value caps every remote permanently. Zero means no
+                    limit, which is the behaviour before grants existed. */
+                uint32_t recvGrant         = 0;
+
+                /** Retained reliable bodies, kept as retransmit sources. Held
+                    from send until the receiver reports a delivery cursor past
+                    them, which is later than the acknowledgement: a packet can
+                    be acknowledged while merely buffered, and a buffer can be
+                    dropped. Running dry is backpressure rather than loss. Sized apart from send
+                    slots so a busy flow can never starve handshakes, acks, or
+                    unreliable traffic.
+
+                    A body is retained from send until the receiver's cursor
+                    passes it, so a flow whose receiver has stalled holds on to
+                    everything in its window. Few enough of those and the pool
+                    is gone, and then every reliable send on the socket fails,
+                    including the ones to peers that are perfectly healthy.
+
+                    It is also a ceiling on throughput, and a quiet one. Every
+                    reliable packet in flight holds a slot, so the pool caps
+                    what can be on the path however large the congestion budget
+                    grows. At 512 that was about 520 KB, below what a 50 Mbit
+                    link at 100 ms holds, so the pool was the limit rather than
+                    the controller and no measurement said so. 2048 clears any
+                    path this transport is likely to meet. Lower it deliberately
+                    if memory is tighter than throughput. */
+                uint32_t stagingCount      = 2048;
                 /** In-flight byte budget never drops below this on a loss run:
                     throttled, never strangled. 0 takes CC_MIN_BUDGET_DEFAULT;
                     floored at one full wire packet either way, so the gate can
@@ -215,21 +335,23 @@ namespace bcp::flux
                 /** Paces handshake retries and is the retransmit fallback
                     before a peer has a round-trip sample. */
                 uint32_t retryIntervalMicros = 200000;
-                uint8_t  maxAttempts         = 8;        ///< give-up bound on open/close
             } timers;
 
             /** Idle-peer eviction and the unsecured-inbound gate. See each
                 field. */
             struct Liveness
             {
-                /** 0 disables the eviction sweep (default). When set, a peer
-                    from whom nothing has been RECEIVED for this long is evicted
-                    on the Update tick (at most MAX_EVICT_PER_UPDATE per call),
-                    full teardown. Received-only: our own sends prove nothing
-                    about the remote. A fresh peer gets one timeout to complete
-                    its handshake; forgeable handshake chatter does not refresh
-                    the clock. Init rejects values at/above half the stamp wrap
-                    (~24 d). */
+                /** A peer from whom nothing has been RECEIVED for this long is
+                    evicted on the Update tick (at most MAX_EVICT_PER_UPDATE per
+                    call), full teardown. Eviction is mandatory, so 0 takes
+                    internal::PEER_IDLE_TIMEOUT_DEFAULT rather than switching it
+                    off: a live peer refreshes the clock on every packet, only a
+                    silent one ages out, and reclaiming a dead entry is what lets
+                    a restarted process reconnect. Received-only, our own sends
+                    prove nothing about the remote. A fresh peer gets one timeout
+                    to complete its handshake; forgeable handshake chatter does
+                    not refresh the clock. Init rejects values at/above half the
+                    stamp wrap (~24 d). */
                 uint64_t idleTimeoutMicros   = 0;
                 /** How stale lastSeenAt may grow before the receive path pays a
                     write to refresh it; bounds stamp writes to one per grain per
@@ -243,7 +365,28 @@ namespace bcp::flux
                     dropped. Known source stays forgeable (no tag, no AEAD); the
                     gate is hygiene, not authentication. */
                 bool     acceptUnsecureFromUnknown = false;
+                /** A receiving ordered flow holding a gap whose cursor has not
+                    advanced for this long is jammed: it is pinning recv slots
+                    for a gap the sender is not filling, so the tick reclaims it.
+                    0 takes internal::FLOW_STALL_TIMEOUT_DEFAULT. There is no
+                    "off": a jammed flow is pure waste, and holding it only lets
+                    a misbehaving peer keep recv slots hostage. */
+                uint32_t flowStallTimeoutMicros = 0;
             } liveness;
+
+            /** Being told what happened instead of asking every tick.
+                Leaving `hook` null costs nothing: no storage is allocated and
+                nothing is ever recorded. */
+            struct Events
+            {
+                EventHook hook       = nullptr;
+                void*     context    = nullptr;   ///< handed back untouched
+
+                /** Which events `hook` is called for, as the OR of SocketEvent
+                    values. Anything outside it is never recorded, so an empty
+                    set disables the hook as surely as a null pointer does. */
+                uint32_t  subscribed = 0;
+            } events;
         };
 
         Socket() = default;
@@ -256,8 +399,11 @@ namespace bcp::flux
 
         [[nodiscard]] common::Error Init(const Config& config);
 
-        /** Idempotent teardown: closes the kernel, releases pools, drops peers.
-            The destructor calls it; calling it twice is a no-op. */
+        /** Idempotent teardown: closes the kernel, releases the pools, drops the
+            peers. The destructor calls it; calling it twice is a no-op. After it
+            the socket may be Init'd again from scratch. No other thread may be in
+            Poll or Update while it runs, since it frees the pools those paths
+            read, the same rule that has always applied to the destructor. */
         void Shutdown() noexcept;
 
         /** Adds a certificate to the trust store; safe at any time, including
@@ -270,19 +416,48 @@ namespace bcp::flux
 
         /** Pass 1 processes the kernel batch (decrypt, dispatch, commit); pass
             2 drains the ready queue into `outPackets`. Packets never leave the
-            recv pool. Safe to call concurrently. */
-        uint32_t Poll(PacketSlotHandle* outPackets, size_t max);
+            recv pool. Safe to call concurrently.
+
+            The cursor walks the messages those packets carried, so a caller
+            reads one loop and never handles a batch itself. It borrows
+            `outPackets`, which therefore has to outlive it. */
+        PollCursor Poll(PacketSlotHandle* outPackets, size_t max,
+                        ThreadIdentity identity = {});
+
 
         /** The tick: flush owed acks, retransmit, retry open/close, evict idle
             peers. Flux owns no thread, so time-based work happens only here.
             The clock is internal and read FRESH at each decision point (via
             Now), so a deadline coming due mid-pass fires this tick, not the
-            next. Safe to call from several threads at once.
+            next.
+
+            Safe to call from any number of threads, and exactly one runs it:
+            while a pass is in flight every other caller returns immediately.
+            The pass takes exclusive peer locks as it walks, so concurrent
+            passes serialize against each other and against the receive path,
+            and past a couple of threads that contention costs more than the
+            extra passes earn. Callers therefore just include Update in their
+            loop, whatever the thread count, and the socket keeps the tick
+            single.
 
             @param nowOverride test seam only; non-zero pins virtual time, the
                    default 0 reads the real clock and is the sole production
                    behaviour. */
         void Update(uint64_t nowOverride = 0);
+
+        /** Puts every flow's part-filled batch on the wire.
+
+            A flow send is packed into a batch rather than sent, so several
+            small messages share one datagram, one seal and one staging slot.
+            Nothing leaves until a batch fills or this is called, which makes
+            the moment bytes go out something the caller chooses rather than
+            something a timer decides. Drive it beside Update and Poll: send
+            what the tick produced, then Flush.
+
+            There is deliberately no automatic flush. One that fired sometimes
+            would make send timing unpredictable and would hide a forgotten
+            call rather than surfacing it. */
+        void Flush();
 
         /** Soonest future deadline across all flows, absolute monotonic micros,
             or 0 when nothing is pending. Best-effort, for a blocking app to wait
@@ -309,10 +484,9 @@ namespace bcp::flux
             first packet that arrives and refuses only when it is at its caps,
             which fails that one target rather than the flow.
 
-            The in-flight window is internal::FLOW_WINDOW, the same for every
-            flow and every socket, so nothing about it is declared here or on the
-            wire. The id is the app's to choose and must be free on this
-            socket. */
+            The in-flight window comes from the mode (see WindowFor), so
+            nothing about it is declared here or on the wire. The id is the
+            app's to choose and must be free on this socket. */
         [[nodiscard]] FlowHandle OpenFlow(uint16_t flowId, FlowMode mode);
 
         /** Closes the flow and every target it was talking to, releasing their
@@ -320,6 +494,83 @@ namespace bcp::flux
             recycled, so the id becomes free and the handle goes stale.
             InvalidState on a stale handle or one already closing. */
         [[nodiscard]] common::Error CloseFlow(const FlowHandle& flow);
+
+        // --- Transfers ---
+        //
+        // Beside flows, not inside them. A transfer has its own secure
+        // channels, its own header and its own ids, so nothing on the flow
+        // path changes to carry one. The id space is the transfer's own: it
+        // does not collide with flow ids and needs no OpenFlow. What the two
+        // mechanisms do share is the peer's congestion budget and pacing
+        // clock, because they share a link.
+
+        /** Moves one run of bytes to one peer, on the transfer id both ends
+            agree on.
+
+            The buffer is the retransmit source rather than something to copy,
+            so it must stay alive and unmodified until PollTransfers reports it
+            finished. That is the whole reason the window can be deep: nothing
+            is staged, so an outstanding packet costs its ring entry rather
+            than its bytes.
+
+            One transfer at a time per id per peer, since the pair is what
+            names it. AlreadyPending when one is already running there,
+            InvalidState when the socket provisioned no transfer pool,
+            TooLarge past the peer's ceiling, InvalidParam for a null buffer or
+            a zero length. Zero is refused so a zero-length announcement can
+            never be a valid thing to wait for, which is what lets a pending
+            length of zero mean nothing pending. */
+        [[nodiscard]] common::Error SendTransfer(uint16_t transferId,
+                                                 const Address& peer,
+                                                 const void* buffer,
+                                                 uint64_t length);
+
+        /** The announcement waiting on this id from this peer, to answer with
+            Allow or Reject. Both are named by a TRANSFER_INCOMING event.
+
+            Legal from inside an event handler: events dispatch with no peer or
+            association lock held, and the slot the event names is kept alive
+            across the handler for exactly this. A handler must not call Poll,
+            which is true of every handler and not special here.
+
+            An invalid request comes back when nothing is pending. */
+        [[nodiscard]] TransferRequest PendingTransfer(uint16_t transferId,
+                                                      const Address& peer);
+
+        /** Bytes of a transfer that are contiguous from its start, so an
+            application can watch one move without waiting for it. Answers for
+            either direction on this id and peer.
+
+            Contiguous on purpose: packets land at their own offsets and a hole
+            can sit anywhere, so a count of what has arrived would report bytes
+            ready while the middle is still untouched. Zero when nothing is
+            running. */
+        [[nodiscard]] uint64_t TransferProgress(uint16_t transferId,
+                                                const Address& peer) const;
+
+        /** Finished transfers, both directions, oldest first, into the
+            caller's array. Returns how many were written.
+
+            Separate from Poll because the two share nothing: a finished
+            transfer carries no packet, no slot and no message, and it happens
+            once per transfer rather than once per packet. Keeping it out means
+            the message path pays nothing for a feature it does not use.
+
+            An incoming transfer stays held until CompleteTransfer, so its
+            bytes outlive this call. An outgoing one reports a null buffer and
+            means the source is free again. */
+        [[nodiscard]] size_t PollTransfers(TransferView* out, size_t max);
+
+        /** Releases a completed incoming transfer, freeing the id for this
+            peer's next one.
+
+            Deliberately not automatic. Holding it is the backpressure: the
+            peer cannot start another transfer on this id until the application
+            says it is done with the last, so a receiver that hands each buffer
+            to a worker thread throttles the sender instead of racing it.
+            NotFound when nothing is completed and waiting. */
+        [[nodiscard]] common::Error CompleteTransfer(uint16_t transferId,
+                                                     const Address& peer);
 
         /** The flow's own state: OPEN until closed, whatever any one target is
             doing. CLOSED for a stale handle. */
@@ -331,6 +582,37 @@ namespace bcp::flux
             association exists yet, which is also what a target never sent to
             reads. */
         [[nodiscard]] FlowLifecycle GetFlowState(const FlowHandle& flow, const Address& peer);
+
+        /** How many receiving flows currently exist for this peer, the
+            associations built from its incoming traffic. Zero when the peer is
+            unknown. Read-only introspection: a jammed flow the tick has
+            reclaimed no longer counts. */
+        [[nodiscard]] uint32_t ReceivingFlowCount(const Address& peer);
+
+        /** Changes how much of this socket's receive pool one peer may occupy,
+            and tells that peer.
+
+            Raising it lets the peer keep more in flight, lowering it throttles
+            it. A reduction takes effect here immediately, so a peer already
+            past the new figure simply stops being buffered for until it drains
+            back under it. Nothing already accepted is discarded.
+
+            The peer is told over the secure channel and retold until it
+            acknowledges, so the announcement survives a lost packet. Until it
+            arrives the peer keeps sending to its old figure and is trimmed by
+            this side, which costs it retransmits and nothing else.
+
+            Zero means no limit, which is the same as never having set one.
+
+            @return NotFound if this socket has no such peer. The value is
+                    remembered for a peer that exists but has not finished its
+                    handshake, and goes out when it does. */
+        common::Error SetRecvGrant(const Address& peer, uint32_t slots);
+
+        /** The grant currently in force for one peer, or zero when it has no
+            limit. Zero is also what an unknown peer reports. */
+        [[nodiscard]] uint32_t RecvGrantFor(const Address& peer);
+
 
         /** Advances this side's migration tag for every established peer, so
             packets after a deliberate local address change wear unlinkable
@@ -362,6 +644,12 @@ namespace bcp::flux
 
         // Lifecycle / identity.
         std::atomic<bool>              initialized_{false};
+
+        /** Held true while an Update pass runs, so a second caller returns
+            instead of running a concurrent pass. Managed only by Update
+            itself: taken with an acquire exchange, dropped with a release
+            store, never touched on any other path. */
+        std::atomic<bool>              updateGate_{false};
         std::unique_ptr<ISocketKernel> kernel_;
         SocketListener                 listener_;
         SocketSender                   sender_;
@@ -373,6 +661,20 @@ namespace bcp::flux
 
         // Peers, replay, and the pending-behind-handshake pool.
         PeerTable                      peers_;
+        /** One per peer slot, sized with the peer pool. Holds what that peer
+            pins of the receive pool and what it was granted. Written on the
+            receive path, which holds no peer lock, so both fields are atomic
+            and every access is relaxed. See peer_recv_state.h for why that is
+            sufficient. */
+        std::unique_ptr<PeerRecvState[]> peerRecvStates_;
+        uint32_t recvGrant_ = 0;   ///< Config::flows::recvGrant, what every peer is told
+
+        /** Recv slots pinned by hold-back across every peer. Read to keep the
+            reserve free, moved at the same four points as the per-peer count,
+            and relaxed for the same reason: nothing is published through it. */
+        std::atomic<uint32_t> heldTotal_{0};
+        uint32_t recvHoldCeiling_ = 0;   ///< recvSlotCount less the reserve
+        uint32_t recvBatch_ = 0;         ///< packets one tick takes off the socket
         std::unique_ptr<uint64_t[]>    replayState_;   ///< (1 + replayWords_) u64 per peer slot
         uint32_t                       replayWords_ = 0;
         common::collections::SlotPool  pendingPool_;
@@ -386,18 +688,50 @@ namespace bcp::flux
             then peer then flow lock order. */
         FlowTable                      flows_;
 
+        /** Every transfer running on this socket, beside the flows rather than
+            inside them. Like the flow table it can never reach a peer, so it
+            cannot invert the packet-slot then peer then transfer lock order. */
+        TransferTable                  transfers_;
+
         // The recv/ready path. The flow table borrows all three.
         common::collections::SlotPool* recvPool_ = nullptr;   ///< borrowed from the kernel
         common::collections::SlotPool* sendPool_ = nullptr;   ///< borrowed from the kernel
-        common::collections::FifoQueue<uint32_t> readyQueue_;   ///< recv-slot indices awaiting Poll
+        ReadyLanes readyLanes_;   ///< recv-slot indices awaiting Poll, split per draining thread
+
+        /** What happened, held until someone polls for it. Inert unless a hook
+            was registered at Init, and drained by Poll. */
+        EventTable events_;
+
+        /** Handed to EventTable::Dispatch so a slot kept alive only to carry an
+            event can be let go once it has been delivered. */
+        static void OnEventDelivered(void* context, EventScope scope, uint32_t slot) noexcept;
+
+        /** The one way a peer-scoped event is recorded: note it, and mark the
+            peer as owing a delivery so its slot is not returned before then.
+
+            @pre The caller holds this peer's write lock and lends the Peer in,
+                 which is what keeps the mark from needing a second
+                 acquisition. */
+        void RecordPeerEvent(Peer& peer, uint32_t peerSlot, SocketEvent what) noexcept;
 
         // Fixed-at-Init scalars.
         uint32_t                       minCongestionBudget_ = internal::CC_MIN_BUDGET_DEFAULT;
+
+        /** Largest the congestion budget may be, from what every flow window on
+            one peer could hold in flight at once. Above that the number cannot
+            bind anything, it only stores a burst for the moment a real limit
+            lifts. Computed at Init from the per-peer association cap. */
+        uint32_t                       maxCongestionBudget_ = UINT32_MAX;
+
+        /** The idle timeout in raw microseconds, kept beside the stamp form
+            because the acknowledgement clock runs on the monotonic clock, not
+            on SeenStamp grains. */
+        uint64_t                       idleTimeoutMicros_ = 0;
         /** Paces handshake retries. Kept here rather than read from the flow
             table because a handshake happens whether or not flows are
             configured, and the table is empty when they are not. */
         uint32_t                       handshakeRetryMicros_ = 0;
-        uint32_t                       evictAfterStamp_ = 0;   ///< idleTimeout + grain, SeenStamp units; 0 = off
+        uint32_t                       evictAfterStamp_ = 0;   ///< idleTimeout + grain, in SeenStamp units; never zero once Init succeeds
         uint32_t                       seenGrainStamp_  = 0;
         bool                           acceptUnsecureFromUnknown_ = false;
 
@@ -410,25 +744,7 @@ namespace bcp::flux
         void BuildBackendSocket(BackendType type) noexcept;
         [[nodiscard]] bool GenerateKeypair() noexcept;
 
-        // --- Crypto / seal ---
-        // The ONE seal and the ONE open. Every outbound secure packet (data,
-        // retransmit, control) seals here; every inbound one opens here.
-        static void SealSecurePacket(PacketSlot& dst, const uint8_t* plaintext,
-                                     size_t headerSize, size_t bodyLen,
-                                     const PeerSendMaterials& materials, bool tagged) noexcept;
 
-        /** Opens a secure packet in place and reports the sender's counter in
-            `outCounter`. The counter is masked on the wire, so it cannot be
-            read off the header; this is the only place it is recovered, and the
-            header is left exactly as it arrived either way — which is what lets
-            the migration path try one candidate key after another against the
-            same packet. `outCounter` is meaningful only when this returns
-            true. */
-        [[nodiscard]] static bool OpenSecurePacket(PacketSlot& packet,
-                                                   const common::crypto::SessionKey& key,
-                                                   const common::crypto::SessionKey& headerKey,
-                                                   uint8_t senderLane,
-                                                   uint64_t& outCounter) noexcept;
         /** Copies a peer's send materials and bumps its counter, the one place
             ++sendCounter happens for a send. Non-static because it derives the
             lane from this socket's own public key.
@@ -458,6 +774,10 @@ namespace bcp::flux
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireKernelWriter();
         [[nodiscard]] common::Result<PacketSlotWriter> AcquireFlowWriter(const FlowHandle& flow);
 
+        /** The flow's mode, for the builder's framing gate. False when the
+            handle is stale or the flow is not open. */
+        [[nodiscard]] bool FlowModeOf(const FlowHandle& flow, FlowMode& outMode) noexcept;
+
         /** The outbound gate (called by SocketSender for every packet). Internal
             packets pass through; established peers seal and fly; unknown or
             mid-handshake peers park. Thin: validate -> gather -> stamp ->
@@ -466,12 +786,74 @@ namespace bcp::flux
         PacketSlotHandle PreProcessOut(PacketSlotHandle pHandle, common::Error& status,
                                        bool requireAuth = false);
 
+        /** Offers a flow packet's payload to that flow's open batch.
+
+            @return false when the batch cannot take it and the caller should
+                    send the packet the ordinary way: not a flow packet, the
+                    peer still handshaking (the ordinary path parks it), or no
+                    association yet (the ordinary path creates one). True means
+                    the message is accounted for and `status` says how it went.
+
+            Locks in the standard order, packet then peer then flow, and holds
+            no peer lock across a send. */
+        [[nodiscard]] bool OfferToBatch(PacketSlotHandle& pHandle, bool requireAuth,
+                                        common::Error& status);
+
+        /** Empties one flow's batch before something that cannot join it goes
+            out, so send order and wire order stay the same.
+
+            @return false when the batch still holds messages, because another
+                    flush has it or the gate refused it. The caller must not go
+                    around it then, since anything sent would take the lower
+                    sequence and arrive first. */
+        [[nodiscard]] bool FlushFlowOf(const Address& to, uint16_t flowId);
+
+        /** A batch taken off its flow and sealed, waiting for the kernel.
+
+            Its flow refuses every later append and every later flush until
+            FinishBatch is called for it, so whoever holds one owes that call on
+            every path out. `packet` reads null when there was nothing to take,
+            and the debt does not exist in that case. */
+        /** Associations one peer can have a batch flushed for in a single
+            pass. The rest ride the next one, which costs a loop of latency and
+            cannot lose anything, since an unflushed batch stays where it is. */
+        static constexpr uint32_t MAX_FLUSH_PER_PEER = 32;
+
+        struct SealedBatch
+        {
+            PacketSlotHandle packet;
+            uint32_t         assocSlot = 0;
+            uint16_t         size      = 0;
+        };
+
+        /** Takes one association's open batch under the peer borrow and seals
+            it with nothing held. Gather under the lock, seal after release.
+
+            A failure after the batch is taken is settled here, so the returned
+            SealedBatch either carries a packet the caller owes FinishBatch for
+            or carries nothing at all. */
+        [[nodiscard]] SealedBatch SealOneBatch(const Address& to, uint32_t assocSlot,
+                                               common::Error& status);
+
+        /** Hands sealed batches to the kernel together and settles each one.
+
+            The kernel reports how many of them reached the wire, counting from
+            the first, so the rest stay with their flows for a later flush
+            rather than discarding messages the caller was told were accepted.
+
+            @return how many reached the wire, always counting from the
+                    first. */
+        uint32_t SendSealed(SealedBatch* sealed, uint32_t count);
+
+        /** Seals one association's batch and sends it on its own. */
+        common::Error FlushOneBatch(const Address& to, uint32_t assocSlot);
+
         /** Retransmit: re-seal a retained body from its staging slot under a
             fresh nonce (same seq) to the peer's CURRENT address. Locks staging
             then flow (the global order) and validates the ring still owns the
             slot at `expectedSeq` before sending. Materials, including `to`, come
             from the caller. */
-        void ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
+        bool ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
                            uint32_t expectedSeq, const PeerSendMaterials& materials);
 
         /** Seals a retained plaintext into a fresh wire slot bound for `to` and
@@ -481,13 +863,114 @@ namespace bcp::flux
 
             @pre Caller holds the source slot's lock and keeps its lease (the
                  in-flight ring owns it). */
-        void SealStagingToWire(const Address& to, const PacketSlot& staging,
+        bool SealStagingToWire(const Address& to, const PacketSlot& staging,
                                const PeerSendMaterials& materials);
 
         /** Builds and sends one secure-channel control packet, wire-identical to
             application data (only the encrypted channel byte differs). Materials
             from the caller's peer-lock scope; the counter must be a sendCounter
             bump so data and control never share a nonce. */
+        /** Tells one peer how much of this socket's receive pool it may hold.
+
+            Sent when a session commits and again whenever the value changes, so
+            session start and every later change are the same path. Carries a
+            generation, because an op that overtakes an older one must not be
+            undone by it.
+
+            Materials and both values are gathered by the caller under the peer
+            lock and passed by value, so nothing is held across the send. */
+        void SendGrant(const Address& to, const PeerSendMaterials& materials,
+                       uint32_t grant, uint32_t generation);
+
+        /** Applies a peer's advertised grant, ignoring one older than the last
+            applied, and acknowledges it either way.
+
+            The acknowledgement is unconditional on purpose. Acking only a value
+            that was new would wedge the sender's retry: its resend carries a
+            generation this side has already applied, so it would be ignored in
+            silence and resent forever. */
+        void Grant_Update(const Address& from, const uint8_t* payload, size_t len);
+
+        /** Clears a peer's pending flag once it names the generation currently
+            outstanding. An ack for anything else is stale and ignored. */
+        void Grant_Acked(const Address& from, const uint8_t* payload, size_t len);
+
+        /** Sends this socket's grant to one peer, if that peer still owes an
+            acknowledgement. Called from the tick, so a lost announcement is
+            retried until it lands. Takes the handle by value: the gather
+            happens under it and the send after it is released. */
+        void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
+
+        /** Starts a freshly registered slot on this socket's configured grant.
+
+            A recycled slot carries its previous occupant's counts, so this
+            wipes them before the new peer is charged for anything. Nothing is
+            announced: a peer with no session cannot be told, and CommitSession
+            raises the flag once there is a channel to say it on. */
+        void SeedPeerRecvState(uint32_t slot) noexcept;
+
+        /** Changes what one peer may occupy and arranges for it to be told.
+
+            Changing a grant is four steps that have to happen together: the
+            value, a fresh generation so the peer takes this over whatever it
+            last applied, the pending flag, and a cleared send stamp so the tick
+            carries it at once rather than an interval later. Every caller goes
+            through here, because three of the four done right is a peer that
+            never learns its limit moved.
+
+            The caller holds `peer` write-locked and `slot` is its slot. */
+        void ApplyGrant(uint32_t slot, Peer& peer, uint32_t value) noexcept;
+
+        /** Cuts a peer's grant once it has had buffer reclaimed too often.
+
+            A peer whose gaps get filled never reaches this. One that repeatedly
+            fills buffer and leaves it to time out is holding what it is not
+            using, and the answer is to let it hold less. Halving rather than
+            closing, so a peer that recovers can still work.
+
+            The strikes reset with the cut, so a peer is judged on what it does
+            next rather than on a total it can never work off. Takes the handle
+            by value: the decision is made under it and the announcement goes out
+            on the tick afterwards. */
+        void CutGrantIfAbusive(PeerHandle peerHandle);
+
+        /** Empties the OS receive buffer into the recv pool, consuming handshake
+            and control traffic and queueing application packets for Poll.
+
+            Driven by Update rather than by Poll, so the socket is drained on the
+            tick and the receive rules, the per-peer grant among them, are
+            applied where this socket takes responsibility for a packet. Nothing
+            waits in the kernel for a caller that may be slow to ask. */
+        void ReceiveIntoPool();
+
+        // --- Transfers, internal ---
+        // The three channel handlers, and the pass that drives outgoing
+        // transfers on the tick. TransferRequest reaches Allow and Reject
+        // through the socket, so it is a friend of it rather than of the
+        // table, which keeps the table unable to reach a peer.
+        friend class TransferRequest;
+
+        void Transfer_Data(const Address& from, const uint8_t* payload, size_t len);
+        void Transfer_Ack(const Address& from, const uint8_t* payload, size_t len);
+        void Transfer_Reject(const Address& from, const uint8_t* payload, size_t len);
+
+        /** One tick's work for every transfer this peer is sending: the
+            announcement if it is still owed, then as many data packets as the
+            window, the congestion budget and the pacing clock allow, then
+            whatever is overdue. Gathers under the peer lock and sends after
+            it, like every other send path here. */
+        void TransferPass(const Address& to, PeerHandle peerHandle, uint64_t now);
+
+        /** Tells a peer what has arrived, so it can stop holding what has
+            landed and resend what has not. */
+        void SendTransferAck(const Address& to, const PeerSendMaterials& materials,
+                             uint16_t transferId, uint32_t recvNext,
+                             const uint8_t* bitmap);
+
+        [[nodiscard]] common::Error AllowTransfer(uint16_t transferId,
+                                                  const Address& peer, void* buffer);
+        common::Error RejectTransfer(uint16_t transferId, const Address& peer);
+
         void SendSecureControl(const Address& to, const PeerSendMaterials& materials,
                                uint8_t channel, const uint8_t* payload, size_t payloadLen);
 
@@ -531,10 +1014,20 @@ namespace bcp::flux
         /** The key-derive, MAC, and peer-commit block shared by Validate's
             establish branch and Complete. */
         void CommitSession(Peer& peer, const common::crypto::PublicKey& theirPk,
+                           const common::crypto::SecretKey& myEphSk,
+                           const common::crypto::PublicKey& theirEphPk,
                            const uint8_t* transcript, size_t transcriptLen) noexcept;
+
+        /** Combines the ephemeral exchange with the long-lived one. The caller
+            wipes its ephemeral secret as soon as this returns, which is what
+            makes the session unrecoverable once the handshake is over. */
         void DeriveSessionInto(common::crypto::SessionKey& out,
                                const common::crypto::PublicKey& theirPk,
+                               const common::crypto::SecretKey& myEphSk,
+                               const common::crypto::PublicKey& theirEphPk,
                                const uint8_t* transcript, size_t transcriptLen) noexcept;
+
+
         /** The kernel_->Write + CTRL_INTERNAL|CTRL_UNSECURE + opcode preamble,
             one writer factory for the handshake senders. */
         [[nodiscard]] common::Result<PacketSlotWriter> BuildInternal(SocketOpCode op);
@@ -550,12 +1043,21 @@ namespace bcp::flux
             smooth the round-trip, grow on acks and trim on loss. */
         void ApplyCongestion(Peer& peer, const CongestionDelta& delta, uint64_t nowMicros) noexcept;
 
+        /** Debug guard on the congestion budget, asked on every path that
+            leaves ApplyCongestion. */
+        void AssertBudgetInRange(const Peer& peer) const noexcept;
+
         // --- Tick / eviction ---
         // Update threads `nowOverride` (0 = real clock) to each sub-step, which
         // reads Now(nowOverride) fresh, never a captured value. Idle eviction is
-        // inline in Update's per-peer pass. One association's tick splits into a
+        // inline in the per-peer pass. One association's tick splits into a
         // lifecycle-retry step and a retransmit step; each reads the clock once
         // at entry, for that flow.
+
+        /** The tick's whole body. Only Update calls it, under the gate that
+            keeps passes from overlapping. */
+        void UpdatePass(uint64_t nowOverride);
+
         void UpdateOutFlow(const Address& addr, PeerHandle peer, uint32_t dirIndex, uint64_t nowOverride);
 
         /** The waiting-ring drain, one peer per call: while the gate passes,

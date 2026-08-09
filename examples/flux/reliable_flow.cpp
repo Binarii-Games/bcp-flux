@@ -57,18 +57,19 @@ static void Tick(flux::Socket& socket, const char* name, std::atomic<uint32_t>& 
 
     while (delivered < BURST)
     {
+        socket.Flush();
         socket.Update();
 
-        const uint32_t count = socket.Poll(inbox, 16);
-        for (uint32_t i = 0; i < count; ++i)
+        flux::PollCursor cursor = socket.Poll(inbox, 16);
+        while (cursor.Next())
         {
             // A flow packet carries its flow id and sequence number in the wire
             // header, so the id is on the slot before anything is decoded.
-            const uint16_t flowId = inbox[i].Read()->FlowId();
+            const uint16_t flowId = cursor.Packet().Read()->FlowId();
 
-            // A reader takes the handle and gives a cursor over the payload;
+            // The cursor hands back a reader over the current message.
             // TakeU32 mirrors the PutU32 that sent it.
-            flux::PacketSlotReader reader{std::move(inbox[i])};
+            flux::PacketSlotReader& reader = cursor.Message();
             uint32_t seq = 0;
             reader.TakeU32(seq);
 
@@ -125,6 +126,7 @@ int main()
     flux::PacketSlotHandle sink[8];
     while (deliveredB < BURST || deliveredC < BURST)
     {
+        a.Flush();
         a.Update();
         a.Poll(sink, 8);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

@@ -1,10 +1,11 @@
 // Address migration, end to end over real UDP. A connection must survive its
-// peer's address changing — no re-handshake, same keys — without letting an
-// attacker hijack it by replaying a captured packet from a spoofed address.
+// peer's address changing, with no re-handshake and the same keys, and it has
+// to do that without letting an attacker hijack it by replaying a captured
+// packet from a spoofed address.
 //
 // The setup is a two-port UDP relay standing between client and server. The
-// client always talks to the relay's port A and always sees the server there;
-// the relay chooses whether the server sees the client arrive from port A or
+// client always talks to the relay's port A and always sees the server there.
+// The relay chooses whether the server sees the client arrive from port A or
 // port B. Flipping that is exactly a client address change (WiFi->cellular, NAT
 // rebind, IP rotation) from the server's vantage, which is the only thing
 // migration has to survive.
@@ -35,7 +36,7 @@ using RawSocket = udp_raw::Socket;
 using udp_raw::IsHandshake;
 using udp_raw::IsSecure;
 
-// The relay. The client always reaches the server via port A; the server sees
+// The relay. The client always reaches the server via port A. The server sees
 // the client on A, or on B once `forwardViaB` is set. Replies always go back to
 // the client from A, so the client's own view never changes.
 struct Relay
@@ -88,18 +89,16 @@ struct Relay
 // socket has delivered.
 static common::Error SendOp(flux::Socket& socket, const flux::Address& to, uint8_t op)
 {
-    auto stage = socket.BuildPacket().NoFlow();
-    stage.PutU8(op);
-    return stage.Send(to);
+    return socket.BuildPacket().NoFlow().PutU8(op).Send(to);
 }
 static int CollectOp(flux::Socket& socket, uint8_t op)
 {
     flux::PacketSlotHandle handles[64];
-    uint32_t count = socket.Poll(handles, 64);
+    flux::PollCursor cursor = socket.Poll(handles, 64);
     int seen = 0;
-    for (uint32_t i = 0; i < count; ++i)
+    while (cursor.Next())
     {
-        flux::PacketSlotReader reader{std::move(handles[i])};
+        flux::PacketSlotReader& reader = cursor.Message();
         uint8_t got = 0;
         if (reader.TakeU8(got) && got == op) ++seen;
     }
@@ -113,10 +112,14 @@ struct World
     Relay        relay;
     uint16_t     portA, portB, clientPort, serverPort;
 
-    bool Boot(uint16_t base)
+    bool Boot(uint16_t base, bcp::flux::EventHook serverHook = nullptr)
     {
         portA = base; portB = base + 1; clientPort = base + 2; serverPort = base + 3;
-        if (server.Init({ .type = BACKEND, .port = serverPort, .maxPeers = 8, .pendingPacketCount = 8 }) != common::Error::Ok) return false;
+        flux::Socket::Config serverConfig{ .type = BACKEND, .port = serverPort,
+                                           .maxPeers = 8, .pendingPacketCount = 8 };
+        serverConfig.events.hook       = serverHook;
+        serverConfig.events.subscribed = flux::ToBits(flux::SocketEvent::PEER_MIGRATED);
+        if (server.Init(serverConfig) != common::Error::Ok) return false;
         if (client.Init({ .type = BACKEND, .port = clientPort, .maxPeers = 8, .pendingPacketCount = 8 }) != common::Error::Ok) return false;
         if (!relay.Init(portA, portB, clientPort, serverPort)) return false;
         if (SendOp(client, Loopback(portA), 0x01) != common::Error::Ok) return false;
@@ -126,7 +129,9 @@ struct World
             relay.Pump();
             CollectOp(server, 0x01);
             CollectOp(client, 0x00);
+            client.Flush();
             client.Update();
+            server.Flush();
             server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (Established(client, Loopback(portA)) && Established(server, Loopback(portA))) break;
@@ -140,7 +145,9 @@ struct World
             relay.Pump();
             CollectOp(client, 0xFF);   // drain, count nothing
             CollectOp(server, 0xFF);
+            client.Flush();
             client.Update();
+            server.Flush();
             server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -148,12 +155,25 @@ struct World
     void Close() { relay.Close(); }
 };
 
+// Counts PEER_MIGRATED on the server. The rebind is the only thing that raises
+// it, and this file already owns the relay that makes a peer appear to move, so
+// the event is checked where the move is rather than in a second copy of all
+// this.
+static uint32_t g_migrated = 0;
+
+static void OnServerEvent(void* context, const bcp::flux::EventInfo& info)
+{
+    (void)context;
+    if (info.Has(bcp::flux::SocketEvent::PEER_MIGRATED)) ++g_migrated;
+}
+
 // A move mid-session: the server recognizes the peer at its new address, rebinds
-// to it, and keeps the same keys — no handshake anywhere.
+// to it, and keeps the same keys, with no handshake anywhere.
 static void move_survives_with_same_keys()
 {
+    g_migrated = 0;
     World world;
-    CHECK(world.Boot(9700));
+    CHECK(world.Boot(9700, OnServerEvent));
 
     world.relay.forwardViaB = true;    // the client's apparent address changes
     world.relay.watching    = true;
@@ -167,13 +187,19 @@ static void move_survives_with_same_keys()
             world.relay.Pump();
             delivered += CollectOp(world.server, 0x20);
             CollectOp(world.client, 0xFF);
+            world.client.Flush();
             world.client.Update();
+            world.server.Flush();
             world.server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 
     CHECK(delivered >= 1);                                        // data crossed the move
+
+    // The rebind is what raises it, so this fires exactly when the peer is
+    // re-filed under the address it moved to.
+    CHECK(g_migrated >= 1);
     CHECK(Established(world.server, Loopback(world.portB)));      // rebound to the new address
     CHECK(!Established(world.server, Loopback(world.portA)));     // old address released
     CHECK(world.relay.handshakesToClient == 0);                  // no re-handshake: same session
@@ -216,7 +242,9 @@ static void spoofed_replay_never_redirects()
             world.relay.Pump();
             atClient += CollectOp(world.client, 0x31);
             CollectOp(world.server, 0xFF);
+            world.client.Flush();
             world.client.Update();
+            world.server.Flush();
             world.server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -260,7 +288,9 @@ static void rotated_tag_is_recognized_after_move()
             world.relay.Pump();
             delivered += CollectOp(world.server, 0x60);
             CollectOp(world.client, 0xFF);
+            world.client.Flush();
             world.client.Update();
+            world.server.Flush();
             world.server.Update();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }

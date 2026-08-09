@@ -15,6 +15,7 @@
 #elif defined(__APPLE__)
     #include <stdlib.h>       // arc4random_buf, on macOS and iOS alike
 #else
+    #include <cerrno>
     #include <sys/random.h>   // getrandom
 #endif
 
@@ -95,7 +96,14 @@ namespace bcp::common::crypto
         while (done < len)
         {
             ssize_t n = getrandom(out + done, len - done, 0);
-            if (n < 0) return false;
+            if (n < 0)
+            {
+                // A signal arrived while the call was blocked waiting on the
+                // pool. Nothing failed, so resume rather than spend a retry
+                // budget on it. Every other errno is permanent here.
+                if (errno == EINTR) continue;
+                return false;
+            }
             done += static_cast<size_t>(n);
         }
         return true;

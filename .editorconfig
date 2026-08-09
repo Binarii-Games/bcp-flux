@@ -1,5 +1,5 @@
 # Whitespace only. Brace style varies by directory here and the surrounding
-# file wins, so there is deliberately no formatter config — see CONTRIBUTING.
+# file wins, so there is deliberately no formatter config. See CONTRIBUTING.
 
 root = true
 

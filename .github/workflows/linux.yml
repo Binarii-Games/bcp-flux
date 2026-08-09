@@ -1,0 +1,42 @@
+name: linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gcc:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: ubuntu-latest
+      aslr: true
+      cmake: -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+  clang:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: ubuntu-latest
+      aslr: true
+      cmake: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+  tsan:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: ubuntu-latest
+      aslr: true
+      cmake: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBCP_SANITIZE=thread
+  # Container jobs run UBSan only: ASan needs an ASLR sysctl the container is
+  # not privileged to make.
+  debian-12:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: ubuntu-latest
+      container: debian:12
+      setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y g++ cmake make git libubsan1
+      cmake: -DBCP_SANITIZE=undefined
+  rocky-9:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: ubuntu-latest
+      container: rockylinux:9
+      setup: dnf install -y gcc-c++ cmake make git libubsan
+      cmake: -DBCP_SANITIZE=undefined

@@ -10,7 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --------------------------------------------------------
-# Warnings — surface everything the compiler can see statically.
+# Warnings: surface everything the compiler can see statically.
 # --------------------------------------------------------
 if(MSVC)
     add_compile_options(/W4)
@@ -31,7 +31,7 @@ if(BCP_WERROR)
 endif()
 
 # --------------------------------------------------------
-# Sanitizers — runtime bug detection the compiler cannot do statically.
+# Sanitizers: runtime bug detection the compiler cannot do statically.
 # --------------------------------------------------------
 # C++ compiles clean and still carries dangling references, off-by-ones into a
 # buffer, reads of uninitialized members, or UB that only bites at a different
@@ -43,7 +43,7 @@ endif()
 #   thread     data races (mutually exclusive with address)
 #
 # Override:  -DBCP_SANITIZE=thread     (for the lock-free code)
-#            -DBCP_SANITIZE=undefined  (UBSan only — see the note below)
+#            -DBCP_SANITIZE=undefined  (UBSan only, see the note below)
 #            -DBCP_SANITIZE=""         (disable)
 #
 # NOTE: some toolchains ship a broken ASan/TSan runtime that aborts in init
@@ -54,8 +54,8 @@ endif()
 set(BCP_SANITIZE "address,undefined" CACHE STRING
     "Comma-separated sanitizers for non-release builds (address,undefined,thread). Empty to disable.")
 
-# Never sanitize a release build — the instrumentation is a dev/test tool with
-# a 2-3x cost, and must not ship.
+# Never sanitize a release build. The instrumentation is a dev/test tool
+# with a 2-3x cost, and must not ship.
 if(BCP_SANITIZE AND NOT CMAKE_BUILD_TYPE MATCHES "^Rel")
     set(_bcp_effective "${BCP_SANITIZE}")
     string(REPLACE "," ";" _bcp_sanitizers "${_bcp_effective}")
@@ -74,7 +74,7 @@ if(BCP_SANITIZE AND NOT CMAKE_BUILD_TYPE MATCHES "^Rel")
         if(NOT _bcp_asan_ok OR NOT _bcp_asan_run STREQUAL "0")
             message(WARNING
                 "AddressSanitizer runtime is broken on this toolchain "
-                "(probe binary failed to run) — falling back to UBSan only. "
+                "(probe binary failed to run). Falling back to UBSan only. "
                 "Install a working toolchain (full Xcode or Homebrew LLVM) "
                 "for ASan coverage; CI should provide it regardless.")
             set(_bcp_effective "undefined")
@@ -127,8 +127,8 @@ target_include_directories(common
 target_link_libraries(common PUBLIC monocypher)
 
 # 16-byte CAS. PRIVATE if only used in common's .cpp; PUBLIC if used in
-# common's public headers (inlined into consumers). x86-only flag — arm64
-# has the capability without asking.
+# common's public headers (inlined into consumers). An x86-only flag,
+# because arm64 has the capability without asking.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i686)")
     target_compile_options(common PRIVATE -mcx16)
 endif()
@@ -141,7 +141,7 @@ if(WIN32)
 endif()
 
 # --------------------------------------------------------
-# flux — the transport
+# flux: the transport
 # --------------------------------------------------------
 add_library(flux STATIC)
 
@@ -165,7 +165,7 @@ if(WIN32)
 endif()
 
 # --------------------------------------------------------
-# Examples — small runnable programs written against the public API only, so
+# Examples: small runnable programs written against the public API only, so
 # they double as a check that the public surface is usable without reaching
 # into internals. Built by default so they cannot rot; -DBCP_EXAMPLES=OFF to
 # skip. One executable per .cpp, grouped by which library it demonstrates:
@@ -182,15 +182,24 @@ if(BCP_EXAMPLES)
 endif()
 
 # --------------------------------------------------------
-# Tests — one plain executable per .cpp, registered with CTest and sanitized
+# Tests: one plain executable per .cpp, registered with CTest and sanitized
 # like everything else. Three categories, split by directory:
 #
 #   unit/         data-structure integrity          label: unit
 #   integration/  full processes and edge cases      label: integration
+#   acceptance/   properties a finished feature owes  label: acceptance
 #   bench/        performance against a baseline      label: bench
 #
-# Fast CI runs unit + integration on every commit:  ctest -LE bench
+# Fast CI runs unit + integration on every commit:
+#   ctest -LE "bench|acceptance"
 # The benches are heavier and run on demand or nightly:  ctest -L bench
+#
+# Acceptance tests state what a feature must do once it is finished, so they are
+# written before the feature and fail until it lands. That is the point of them,
+# and it is why they stay out of the per-commit gate: a red acceptance suite
+# means the feature is not built yet, not that the tree is broken. Run them
+# directly with  ctest -L acceptance  and fold them into the gate once the
+# feature they describe is done.
 #
 # Each library owns its tests: flux's are in tests/, the vendored common's
 # travel with it in external/common/tests/ and link common alone, which is what
@@ -215,11 +224,41 @@ endfunction()
 
 register_tests("tests/unit/*.cpp"        unit        240 flux tests)
 register_tests("tests/integration/*.cpp" integration 240 flux tests)
+register_tests("tests/acceptance/*.cpp"  acceptance  240 flux tests)
 register_tests("tests/bench/*.cpp"       bench       600 flux tests)
 
 # The fault-injecting kernel sits beside the platform kernels in flux's private
-# tree, so the test that drives one needs the same view of them the library has.
+# tree, so a test that drives one needs the same view of them the library has.
+
 target_include_directories(flow_fault_recovery PRIVATE flux/src)
+target_include_directories(mac_only_packet PRIVATE flux/src)
+target_include_directories(flow_jam_eviction PRIVATE flux/src)
+target_include_directories(concurrent_flows PRIVATE flux/src)
+target_include_directories(grant_isolation PRIVATE flux/src)
+target_include_directories(event_peer_scope PRIVATE flux/src)
+target_include_directories(lossy_many_to_one PRIVATE flux/src)
+target_include_directories(loss_packet_threshold PRIVATE flux/src)
+target_include_directories(tail_loss_probe PRIVATE flux/src)
+target_include_directories(flow_death_bounded PRIVATE flux/src)
+target_include_directories(grant_reduction PRIVATE flux/src)
+# Six phases of twenty threads, and a sanitized build runs it several times
+# slower, so it gets more room than the ordinary integration budget.
+set_tests_properties(concurrent_flows PROPERTIES TIMEOUT 600)
+
+# The sharing bench meets msquic head to head, so it exists only where msquic
+# does. Brew, apt and vcpkg all ship libmsquic, and absence just skips it.
+find_path(MSQUIC_INCLUDE_DIR msquic.h
+    HINTS /opt/homebrew/opt/libmsquic/include /usr/local/opt/libmsquic/include)
+find_library(MSQUIC_LIBRARY msquic
+    HINTS /opt/homebrew/opt/libmsquic/lib /usr/local/opt/libmsquic/lib)
+if(MSQUIC_INCLUDE_DIR AND MSQUIC_LIBRARY)
+    add_executable(link_share_bench tests/bench/msquic/link_share_bench.cpp)
+    target_link_libraries(link_share_bench PRIVATE flux ${MSQUIC_LIBRARY})
+    target_include_directories(link_share_bench PRIVATE tests ${MSQUIC_INCLUDE_DIR})
+    target_compile_definitions(link_share_bench PRIVATE QUIC_API_ENABLE_PREVIEW_FEATURES)
+    add_test(NAME link_share_bench COMMAND link_share_bench bbr)
+    set_tests_properties(link_share_bench PROPERTIES LABELS bench TIMEOUT 600)
+endif()
 
 register_tests("external/common/tests/unit/*.cpp"  unit  240 common external/common/tests)
 register_tests("external/common/tests/bench/*.cpp" bench 600 common external/common/tests)

@@ -4,23 +4,19 @@
 #include <flux/util/challenge.h>
 #include <flux/util/siphash.h>
 
+#include <common/crypto/crypto.h>
+
 #include <chrono>
 #include <cstring>
-#include <random>
 
 namespace bcp::flux {
 
     common::Error ChallengeGenerator::Init() {
-        // std::random_device pulls from the OS CSPRNG when available on
-        // Windows/Linux/macOS. mt19937_64 seeded from it fills the 128-bit key.
-        std::random_device rd;
-        std::mt19937_64 gen(static_cast<uint64_t>(rd()) ^ (static_cast<uint64_t>(rd()) << 32));
-
-        // Fill the 16-byte key in two 64-bit chunks.
-        uint64_t a = gen();
-        uint64_t b = gen();
-        std::memcpy(secret_ + 0, &a, 8);
-        std::memcpy(secret_ + 8, &b, 8);
+        // Straight from the platform CSPRNG, so all 16 bytes are independent.
+        // Drawing them from a seeded generator instead would cap the key at
+        // the entropy of its seed however wide the key is.
+        if (!common::crypto::RandomBytes(secret_, sizeof(secret_)))
+            return common::Error::RandomFailed;
 
         initialized_ = true;
         return common::Error::Ok;

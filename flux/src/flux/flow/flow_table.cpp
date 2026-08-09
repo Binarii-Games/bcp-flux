@@ -1,8 +1,12 @@
+#include <cassert>
+
 #include <flux/flow/flow_table.h>
 
 #include <common/platform.h>
 #include <flux/internal/constants.h>
 #include <flux/peer/peer.h>
+#include <flux/socket/packet_slot.h>
+#include <flux/wire/batch.h>
 
 #include <cstring>
 #include <new>
@@ -44,19 +48,30 @@ namespace bcp::flux
             assoc->flowEpoch  = flowEpoch;
             assoc->epoch      = assoc->epoch + 1;
             assoc->life       = FlowLifecycle::OPEN;
+            assoc->emitting   = false;
 
             assoc->nextSeq      = 1;
             assoc->unresolved   = 0;
-            assoc->srttMicros   = 0;
-            assoc->rttvarMicros = 0;
+            assoc->lastResolvedMicros = common::MonotonicMicros();
+            assoc->ackBase      = 1;
             assoc->inflightCap  = inflightCap;
             assoc->waitingCap   = waitingCap;
             assoc->waitingHead  = 0;
             assoc->waitingCount = 0;
 
+            // No batch is open on a fresh association. A recycled slot carries
+            // the previous tenant's bytes, and a non-zero used here would make
+            // this flow append into a stranger's half-built packet.
+            assoc->openBatchUsed      = 0;
+            assoc->openBatchHeader    = 0;
+            assoc->openBatchCount     = 0;
+            assoc->openBatchFirstLen  = 0;
+            assoc->openBatchInFlight  = false;
+
             InFlightEntry* inFlight = assoc->InFlight();
             for (uint32_t i = 0; i < inflightCap; ++i)
-                inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID, 0, 0 };
+                inFlight[i] = InFlightEntry{ 0, 0, common::collections::SlotPool::INVALID,
+                                             0, 0, 0, false, false, false };
             WaitingEntry* waiting = assoc->Waiting();
             for (uint32_t i = 0; i < waitingCap; ++i)
                 waiting[i] = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };
@@ -74,15 +89,20 @@ namespace bcp::flux
             assoc->flowId     = flowId;
             assoc->mode       = mode;
             assoc->flowEpoch  = flowEpoch;
-            assoc->life       = FlowLifecycle::OPEN;
-            assoc->epoch      = assoc->epoch + 1;
+            assoc->life          = FlowLifecycle::OPEN;
+            assoc->emitting      = false;
+            assoc->ackImmediate  = false;
+            assoc->epoch         = assoc->epoch + 1;
 
-            assoc->recvNext       = 1;
-            assoc->recvHighest    = 0;
-            assoc->newSinceFlush  = 0;
-            assoc->ackArmedMicros = 0;
-            assoc->windowBits     = windowBits;
-            assoc->reorderCap     = reorderCap;
+            assoc->recvNext           = 1;
+            assoc->heldCount          = 0;
+            assoc->recvHighest        = 0;
+            assoc->newSinceFlush      = 0;
+            assoc->ackArmedMicros     = 0;
+            assoc->newestArrivalMicros = 0;
+            assoc->lastProgressMicros = common::MonotonicMicros();
+            assoc->windowBits         = windowBits;
+            assoc->reorderCap         = reorderCap;
 
             std::memset(assoc->Seen(), 0, windowBits / 8);
             HoldbackEntry* holdback = assoc->Holdback();
@@ -121,11 +141,22 @@ namespace bcp::flux
             const uint32_t bits = flow->windowBits;
             if (seq > flow->recvHighest)
             {
-                const uint32_t oldFloor = flow->recvHighest >= bits
-                    ? flow->recvHighest - bits + 1 : 1;
-                const uint32_t newFloor = seq >= bits ? seq - bits + 1 : 1;
-                for (uint32_t s = oldFloor; s < newFloor; ++s)
-                    SeenClear(flow->Seen(), s, bits);
+                if (seq - flow->recvHighest >= bits)
+                {
+                    // The window slid clear past everything it held, so every
+                    // slot is stale. Clearing them one at a time would run for
+                    // the whole jump, which a wire sequence makes unbounded.
+                    // Wipe the window instead.
+                    std::memset(flow->Seen(), 0, bits / 8);
+                }
+                else
+                {
+                    const uint32_t oldFloor = flow->recvHighest >= bits
+                        ? flow->recvHighest - bits + 1 : 1;
+                    const uint32_t newFloor = seq >= bits ? seq - bits + 1 : 1;
+                    for (uint32_t s = oldFloor; s < newFloor; ++s)
+                        SeenClear(flow->Seen(), s, bits);
+                }
                 flow->recvHighest = seq;
             }
             SeenSet(flow->Seen(), seq, bits);
@@ -135,17 +166,47 @@ namespace bcp::flux
         bool AlreadySeen(const InAssociation* flow, uint32_t seq)
         {
             const uint32_t bits = flow->windowBits;
+            // Above everything seen so far is new by definition, and the bitmap
+            // cannot say otherwise: it is indexed seq & (bits - 1), so a
+            // sequence one window ahead lands on the bit an old one set and
+            // would read as a duplicate. CommitSeen is what retires those stale
+            // bits as the window slides, and it runs only once a packet is
+            // accepted, so treating this as seen would keep the window from
+            // ever moving again.
+            if (seq > flow->recvHighest) return false;
             const uint32_t floor = flow->recvHighest >= bits
                 ? flow->recvHighest - bits + 1 : 1;
             if (seq < floor) return true;                       // below window
             return SeenTest(flow->Seen(), seq, bits);
         }
 
-        void ArmAck(InAssociation* flow)
+        /** One acknowledgement is owed, and the deadline starts now unless it
+            was already running. */
+        void ArmAck(InAssociation* flow, uint64_t now)
         {
-            if (flow->newSinceFlush == 0)
-                flow->ackArmedMicros = common::MonotonicMicros();   // arm the deadline
+            if (flow->newSinceFlush == 0) flow->ackArmedMicros = now;
             if (flow->newSinceFlush < UINT32_MAX) ++flow->newSinceFlush;
+        }
+
+        /** The same, for an arrival. `committed` says the packet entered the
+            flow (delivered or held), and only then does the arrival stamp move:
+            the reply's hold time is measured from this stamp, and it must name
+            an arrival the reply actually reports. A duplicate or a refused
+            packet commits nothing and the reply says nothing about it.
+
+            Any committed arrival moves the stamp, not only one that advances
+            recvHighest. A resend filling a gap sits below recvHighest, and
+            leaving the stamp on the packet above the gap made the immediate
+            ack it triggers report the whole life of the gap as time this side
+            spent holding the reply. The sender subtracts what is reported, so
+            that fiction came straight out of its round trip and forged samples
+            below the physical path. */
+        void ArmAckForArrival(InAssociation* flow, uint32_t seq, bool committed)
+        {
+            (void)seq;
+            const uint64_t now = common::MonotonicMicros();
+            ArmAck(flow, now);
+            if (committed) flow->newestArrivalMicros = now;
         }
 
         /** Coalesces the set bits into inclusive [first,last] seq ranges, newest
@@ -182,32 +243,16 @@ namespace bcp::flux
             return false;
         }
 
-        /** RTT smoothing (Jacobson/Karels), microseconds. */
-        void SampleRtt(OutAssociation* flow, uint64_t sampleMicros)
-        {
-            const uint32_t sample = sampleMicros > UINT32_MAX
-                ? UINT32_MAX : static_cast<uint32_t>(sampleMicros);
-            if (flow->srttMicros == 0)
-            {
-                flow->srttMicros   = sample;
-                flow->rttvarMicros = sample / 2;
-                return;
-            }
-            const uint32_t diff = flow->srttMicros > sample
-                ? flow->srttMicros - sample : sample - flow->srttMicros;
-            flow->rttvarMicros = (flow->rttvarMicros * 3 + diff) / 4;
-            flow->srttMicros   = (flow->srttMicros * 7 + sample) / 8;
-        }
+        /** Age of a timestamp, floored at zero.
 
-        /** The retransmit timeout: RTT-derived once sampled, else the Config
-            fallback, clamped to a 1 ms floor. */
-        uint64_t RetransmitTimeout(const OutAssociation* flow, uint32_t fallbackMicros)
+            Both clocks are unsigned and a reader takes its `now` before it
+            takes the lock the timestamp is written under, so a writer that
+            lands in between leaves `then` in the future. Subtracting straight
+            would wrap to nearly 2^64 and read as older than any timeout, which
+            turns a flow that is making progress into one that looks stalled. */
+        uint64_t Elapsed(uint64_t now, uint64_t then) noexcept
         {
-            uint64_t rto = flow->srttMicros == 0
-                ? fallbackMicros
-                : static_cast<uint64_t>(flow->srttMicros) + 4ull * flow->rttvarMicros;
-            if (rto < 1000) rto = 1000;
-            return rto;
+            return now > then ? now - then : 0;
         }
 
         // --- The send gate, as decision then mutation ---
@@ -227,6 +272,74 @@ namespace bcp::flux
         // ownership of packetSlot (staging for reliable, kernel send for
         // unreliable) moves with it. See SendAdmission.
 
+        /** Tops the peer's pacing allowance up for the time that has passed, and
+            caps it at a small burst so an idle peer cannot bank a flood.
+
+            The rate is the congestion budget over the smoothed round trip, with
+            a little gain so the window still has room to grow. Before the first
+            round-trip sample there is no rate to work from, so the allowance is
+            left alone and the gate below does not pace at all.
+
+            @pre Caller holds the peer write lock. */
+        void RefillPacing(Peer& peer, uint64_t now) noexcept
+        {
+            if (peer.rtt.srttMicros == 0) return;
+
+            if (peer.pacingRefilledAt == 0 || now < peer.pacingRefilledAt)
+            {
+                peer.pacingRefilledAt = now;
+                return;
+            }
+
+            const uint64_t elapsed = now - peer.pacingRefilledAt;
+            if (elapsed == 0) return;
+
+            // budget per round trip, scaled by how much of one has passed. In
+            // 64 bits throughout: budget times elapsed overflows 32 in under a
+            // millisecond on a fast path.
+            const uint64_t gained =
+                static_cast<uint64_t>(peer.congestionBudget)
+                * internal::CC_PACING_GAIN_PERCENT * elapsed
+                / (100ull * peer.rtt.srttMicros);
+            if (gained == 0) return;   // keep the remainder for the next look
+
+            const uint64_t topped = static_cast<uint64_t>(peer.pacingTokens) + gained;
+            peer.pacingTokens = topped > internal::CC_PACING_BURST_BYTES
+                ? internal::CC_PACING_BURST_BYTES : static_cast<uint32_t>(topped);
+            peer.pacingRefilledAt = now;
+        }
+
+        /** Whether the clock allows this many bytes out right now.
+
+            Deliberately not part of CanSend. CanSend answers whether there is
+            ROOM, and the drain's peek asks it under a read lock where nothing
+            can be refilled or spent. This answers whether it is TIME, and is
+            only asked where the peer is write-locked, so the allowance is
+            topped up in the same breath. Folding the two together would let a
+            peer whose allowance reached zero stop nominating candidates, and it
+            would then never reach the write lock that refills it.
+
+            An untimed path is unpaced: with no round-trip sample there is no
+            rate to pace at, and the initial window is what bounds the opening
+            burst.
+
+            @pre Caller holds the peer write lock. */
+        bool PacingAllows(Peer& peer, uint64_t now, uint16_t wireSize) noexcept
+        {
+            if (peer.rtt.srttMicros == 0) return true;
+            RefillPacing(peer, now);
+            return peer.pacingTokens >= wireSize;
+        }
+
+        /** Takes the bytes off the allowance, saturating at zero for the
+            unpaced case where nothing was ever checked against it.
+            @pre Caller holds the peer write lock. */
+        void SpendPacing(Peer& peer, uint16_t wireSize) noexcept
+        {
+            peer.pacingTokens = peer.pacingTokens > wireSize
+                ? peer.pacingTokens - wireSize : 0;
+        }
+
         /** Pure predicate over the already-locked flow and peer, running every check
             a send needs. The window bounds PACKETS per flow (the receiver's dedupe
             guarantee; reliable only), the congestion budget bounds BYTES per peer
@@ -241,6 +354,12 @@ namespace bcp::flux
             if (windowed && flow.unresolved >= flow.inflightCap)
                 return false;
             if (static_cast<uint64_t>(peer.bytesInFlight) + wireSize > peer.congestionBudget)
+                return false;
+            // What the far side said it will hold. A separate question from
+            // what the path will carry, so a separate test: merging them would
+            // let a small grant read as a congested path and shrink a budget
+            // the network never objected to.
+            if (peer.theirGrant != 0 && peer.outstandingToPeer >= peer.theirGrant)
                 return false;
             const InFlightEntry& entry = flow.InFlight()[flow.nextSeq & (flow.inflightCap - 1)];
             return entry.seq == 0;
@@ -264,9 +383,15 @@ namespace bcp::flux
             entry.packetSlot   = stagingSlot;   // INVALID for an unreliable flow
             entry.wireSize     = wireSize;
             entry.retries      = 0;
+            entry.congestionEpoch = peer.congestionEpoch;
+            entry.acked        = false;
+            entry.lostByAck    = false;
+            entry.freeResend   = false;
 
             flow.unresolved += 1;
             peer.bytesInFlight += wireSize;      // congestion spend
+            SpendPacing(peer, wireSize);         // pacing spend
+            peer.outstandingToPeer += 1;         // grant spend
             flow.nextSeq = seq + 1;
             if (flow.nextSeq == 0) flow.nextSeq = 1;   // 0 is the never-sent sentinel
 
@@ -277,6 +402,16 @@ namespace bcp::flux
             seqField[1] = static_cast<uint8_t>(seq >> 8);
             seqField[2] = static_cast<uint8_t>(seq >> 16);
             seqField[3] = static_cast<uint8_t>(seq >> 24);
+
+            // The generation goes on beside it, from the association rather
+            // than from the handle the packet was built with. The two belong
+            // together: a generation names one run of sequence numbers, and
+            // the run is the association's. A handle is fixed at open and
+            // outlives any number of associations, so a byte taken from it
+            // would still claim the first generation after the fourth restart.
+            uint8_t* dataField = seqField + internal::WIRE_FLOW_SEQ_SIZE;
+            *dataField = static_cast<uint8_t>(
+                (*dataField & ~(FLOW_EPOCH_MASK << 3)) | (flow.flowEpoch << 3));
         }
 
         /** Appends to the waiting FIFO. Ownership of packetSlot passes to the ring.
@@ -299,14 +434,20 @@ namespace bcp::flux
     common::Error FlowTable::Init(const Params& params,
                                   common::collections::SlotPool* recvPool,
                                   common::collections::SlotPool* sendPool,
-                                  common::collections::FifoQueue<uint32_t>* readyQueue) noexcept
+                                  ReadyLanes* readyLanes,
+                                  PeerRecvState* peerRecvStates,
+                                  std::atomic<uint32_t>* heldTotal,
+                                  uint32_t holdCeiling) noexcept
     {
         if (params.outCount == 0 && params.inCount == 0)
             return common::Error::Ok;   // flows disabled entirely
 
         recvPool_   = recvPool;
         sendPool_   = sendPool;
-        readyQueue_ = readyQueue;
+        readyLanes_ = readyLanes;
+        peerRecvStates_ = peerRecvStates;
+        heldTotal_      = heldTotal;
+        holdCeiling_    = holdCeiling;
 
         // Fixed, not configured: nothing carries the window on the wire, so two
         // sockets that disagreed could never find out. See internal::FLOW_WINDOW.
@@ -338,10 +479,17 @@ namespace bcp::flux
             const uint16_t waitStrideCap = outReliableWaitCap_ > outUnreliableWaitCap_
                 ? outReliableWaitCap_ : outUnreliableWaitCap_;
 
+            // Two strides, because the in-flight ring is inline and the bulk
+            // window is four times as deep. One pool would make every
+            // association pay the deeper ring whether it asked for it or not.
             const uint32_t stride = static_cast<uint32_t>(
                 OutAssociation::StrideFor(outInflightCap_, waitStrideCap));
-            if (!outAssocPool_.Init(params.outCount, stride))
+            const uint32_t bulkStride = static_cast<uint32_t>(
+                OutAssociation::StrideFor(internal::FLOW_WINDOW_BULK, waitStrideCap));
+            if (!outAssocPool_.Init(params.outCount, stride,
+                                    params.bulkOutCount, bulkStride))
                 return common::Error::NotInitialized;
+            bulkEnabled_ = params.bulkOutCount > 0;
             if (!initDir(outAssocDir_, params.maxOutPerPeer))
                 return common::Error::NotInitialized;
             maxOutAssocPerPeer_ = params.maxOutPerPeer;
@@ -383,14 +531,18 @@ namespace bcp::flux
         {
             if (params.maxInPerPeer == 0)
                 return common::Error::InvalidParam;
-            inWindowBits_ = static_cast<uint16_t>(window);
 
-            inReorderCap_ = static_cast<uint16_t>(
-                params.reorderCount > 0 ? RoundUpPow2(params.reorderCount, 1, internal::FLOW_RING_MAX) : 0);
-
-            const uint32_t stride = static_cast<uint32_t>(
-                InAssociation::StrideFor(inWindowBits_, inReorderCap_));
-            if (!inAssocPool_.Init(params.inCount, stride))
+            // The reorder hold-back is as deep as the window (ReorderCapFor), so
+            // a bulk slot now dwarfs a standard one on the hold-back ring, not
+            // just the bitmap. Two strides, like the sending pool, keep an
+            // ordered-256 flow from carrying the bulk ring. The remote picks the
+            // mode, so a slot is cut for bulk only when the acquire asks for it.
+            const uint32_t inStandardStride = static_cast<uint32_t>(
+                InAssociation::StrideFor(internal::FLOW_WINDOW, internal::FLOW_WINDOW));
+            const uint32_t inBulkStride = static_cast<uint32_t>(
+                InAssociation::StrideFor(internal::FLOW_WINDOW_BULK, internal::FLOW_WINDOW_BULK));
+            if (!inAssocPool_.Init(params.inCount, inStandardStride,
+                                   params.bulkInCount, inBulkStride))
                 return common::Error::NotInitialized;
             if (!initDir(inAssocDir_, params.maxInPerPeer))
                 return common::Error::NotInitialized;
@@ -399,8 +551,30 @@ namespace bcp::flux
 
         ackDelayMicros_      = params.ackDelayMicros;
         retryIntervalMicros_ = params.retryIntervalMicros;
-        maxAttempts_         = params.maxAttempts;
+        flowStallTimeout_    = params.flowStallTimeoutMicros > 0
+            ? params.flowStallTimeoutMicros : internal::FLOW_STALL_TIMEOUT_DEFAULT;
         return common::Error::Ok;
+    }
+
+    void FlowTable::Shutdown() noexcept
+    {
+        // Free what this table owns.
+        flowPool_.Shutdown();
+        outAssocPool_.Shutdown();
+        inAssocPool_.Shutdown();
+        stagingPool_.Shutdown();
+        outAssocDir_.reset();
+        inAssocDir_.reset();
+        lastEpochById_.reset();
+
+        // Forget what it borrows, so a stale pointer cannot outlive the kernel
+        // that owns the recv and send pools. Nulling the directories also makes
+        // SendEnabled and ReceiveEnabled report the table disabled.
+        recvPool_   = nullptr;
+        sendPool_   = nullptr;
+        readyLanes_ = nullptr;
+        maxOutAssocPerPeer_ = 0;
+        maxInAssocPerPeer_  = 0;
     }
 
     bool FlowTable::SendEnabled() const noexcept
@@ -423,149 +597,9 @@ namespace bcp::flux
         return retryIntervalMicros_;
     }
 
-    // --- Directory helpers ---
-
-    FlowDirEntry* FlowTable::OutDirFor(uint32_t peerSlot) noexcept
+    uint32_t FlowTable::AckDelayMicros() const noexcept
     {
-        return outAssocDir_.get() + static_cast<size_t>(peerSlot) * maxOutAssocPerPeer_;
-    }
-
-    FlowDirEntry* FlowTable::InDirFor(uint32_t peerSlot) noexcept
-    {
-        return inAssocDir_.get() + static_cast<size_t>(peerSlot) * maxInAssocPerPeer_;
-    }
-
-    /** The directory scan every flow lookup shares.
-
-        @return The entry's flow slot, or INVALID when the id is not published in
-        this segment. */
-    uint32_t FlowTable::FindFlowSlot(const FlowDirEntry* dir, uint32_t width,
-                                     uint16_t flowId) noexcept
-    {
-        for (uint32_t i = 0; i < width; ++i)
-        {
-            if (dir[i].flowSlot == common::collections::SlotPool::INVALID) continue;
-            if (dir[i].flowId == flowId) return dir[i].flowSlot;
-        }
-        return common::collections::SlotPool::INVALID;
-    }
-
-    /** One scan that both rejects a duplicate id and finds the first free entry,
-        publishing the already-leased slot on success.
-
-        @return INVALID when the id is already published (duplicate); `width` when
-        there is no free entry (directory full); otherwise the index written.
-        @pre Caller holds the peer write lock, the directory's guard. */
-    uint32_t FlowTable::InsertFlowSlot(FlowDirEntry* dir, uint32_t width,
-                                       uint16_t flowId, uint32_t flowSlot) noexcept
-    {
-        uint32_t freeAt = width;
-        for (uint32_t i = 0; i < width; ++i)
-        {
-            if (dir[i].flowSlot == common::collections::SlotPool::INVALID)
-            {
-                if (freeAt == width) freeAt = i;
-                continue;
-            }
-            if (dir[i].flowId == flowId)
-                return common::collections::SlotPool::INVALID;   // duplicate
-        }
-        if (freeAt == width)
-            return width;   // directory full
-        dir[freeAt] = FlowDirEntry{ flowId, 0, flowSlot };
-        return freeAt;
-    }
-
-    /** Find-and-clear: unpublish the entry that points at `flowSlot`. The slot is
-        unique in the segment, so matching on it alone hits a single entry. */
-    void FlowTable::EraseFlowSlot(FlowDirEntry* dir, uint32_t width,
-                                  uint32_t flowSlot) noexcept
-    {
-        for (uint32_t i = 0; i < width; ++i)
-        {
-            if (dir[i].flowSlot == flowSlot)
-            {
-                dir[i] = FlowDirEntry{ internal::INVALID_FLOW_ID, 0,
-                                       common::collections::SlotPool::INVALID };
-                return;
-            }
-        }
-    }
-
-    uint32_t FlowTable::FindFlowById(uint16_t flowId) noexcept
-    {
-        // A free slot carries INVALID_FLOW_ID, written at Init and restored on
-        // close. Zero is a legal flow id, so the sentinel cannot be the pool's
-        // zeroing.
-        if (flowId == internal::INVALID_FLOW_ID)
-            return common::collections::SlotPool::INVALID;
-
-        for (uint32_t slot = 0; slot < flowPool_.GetCapacity(); ++slot)
-        {
-            const Flow* flow = reinterpret_cast<const Flow*>(flowPool_.ReadLock(slot));
-            const bool match = flow->flowId == flowId;
-            flowPool_.UnlockRead(slot);
-            if (match) return slot;
-        }
-        return common::collections::SlotPool::INVALID;
-    }
-
-    void FlowTable::LinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept
-    {
-        Flow* flow = reinterpret_cast<Flow*>(flowPool_.WriteLock(flowSlot));
-        OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
-            outAssocPool_.WriteLock(assocSlot));
-
-        assoc->flowSlot   = flowSlot;
-        assoc->nextInFlow = flow->firstAssoc;
-        flow->firstAssoc  = assocSlot;
-
-        outAssocPool_.UnlockWrite(assocSlot);
-        flowPool_.UnlockWrite(flowSlot);
-    }
-
-    void FlowTable::UnlinkAssociation(uint32_t flowSlot, uint32_t assocSlot) noexcept
-    {
-        if (flowSlot >= flowPool_.GetCapacity())
-            return;
-
-        Flow* flow = reinterpret_cast<Flow*>(flowPool_.WriteLock(flowSlot));
-
-        uint32_t prev = common::collections::SlotPool::INVALID;
-        uint32_t scan = flow->firstAssoc;
-        while (scan != common::collections::SlotPool::INVALID && scan != assocSlot)
-        {
-            const OutAssociation* node = reinterpret_cast<const OutAssociation*>(
-                outAssocPool_.ReadLock(scan));
-            const uint32_t next = node->nextInFlow;
-            outAssocPool_.UnlockRead(scan);
-            prev = scan;
-            scan = next;
-        }
-
-        if (scan == assocSlot)
-        {
-            OutAssociation* node = reinterpret_cast<OutAssociation*>(
-                outAssocPool_.WriteLock(assocSlot));
-            const uint32_t next = node->nextInFlow;
-            node->nextInFlow = common::collections::SlotPool::INVALID;
-            node->flowSlot   = common::collections::SlotPool::INVALID;
-            outAssocPool_.UnlockWrite(assocSlot);
-
-            if (prev == common::collections::SlotPool::INVALID)
-            {
-                flow->firstAssoc = next;
-            }
-            else
-            {
-                OutAssociation* before = reinterpret_cast<OutAssociation*>(
-                    outAssocPool_.WriteLock(prev));
-                before->nextInFlow = next;
-                outAssocPool_.UnlockWrite(prev);
-            }
-        }
-
-        flowPool_.UnlockWrite(flowSlot);
+        return ackDelayMicros_;
     }
 
     // --- Flow lifecycle ---
@@ -574,9 +608,14 @@ namespace bcp::flux
     {
         if (flowId == internal::INVALID_FLOW_ID)
             return FlowHandle{common::Error::InvalidParam};
-        if (mode != FlowMode::RELIABLE_ORDERED &&
-            mode != FlowMode::RELIABLE_UNORDERED &&
-            mode != FlowMode::UNRELIABLE)
+        if (static_cast<uint8_t>(mode) >= FLOW_MODE_COUNT)
+            return FlowHandle{common::Error::InvalidParam};
+
+        // Refused here rather than at the first send. A bulk flow draws from a
+        // pool the embedder has to ask for, and a socket that did not ask has
+        // no way to serve one, so saying so at the open is the only place the
+        // caller can act on it.
+        if (mode == FlowMode::RELIABLE_ORDERED_BULK && !bulkEnabled_)
             return FlowHandle{common::Error::InvalidParam};
 
         // The id is how a remote names the flow, so two sharing one would be
@@ -591,8 +630,11 @@ namespace bcp::flux
         const uint8_t flowEpoch = static_cast<uint8_t>(
             (lastEpochById_[flowId] + 1u) & FLOW_EPOCH_MASK);
 
+        // Encoded as a whole message, so the stored byte carries only what is
+        // fixed for the flow's lifetime. The framing bits vary per packet and
+        // the builder lays them over this.
         uint8_t flowData = 0;
-        if (!EncodeFlowData(mode, flowEpoch, flowData))
+        if (!EncodeFlowData(mode, flowEpoch, FlowPart::Whole, flowData))
         {
             flowPool_.Release(flowSlot);
             return FlowHandle{common::Error::InvalidParam};
@@ -767,16 +809,113 @@ namespace bcp::flux
                 continue;
             const InAssociation* flow = reinterpret_cast<const InAssociation*>(
                 inAssocPool_.ReadLock(dir[i].flowSlot));
-            if (flow->newSinceFlush > 0 &&
-                now - flow->ackArmedMicros >= ackDelayMicros_)
+            // Three reasons to answer, and the delay is only the last of them.
+            //
+            // A PACKET ARRIVED OUT OF ORDER. The sender is waiting to learn
+            // which sequence is missing, so holding the reply back adds the
+            // delay to recovery. Raised by the arrival rather than by the gap
+            // still being open, or a gap lasting a hundred packets would send a
+            // reply on every tick for the whole of it.
+            //
+            // ENOUGH OWED. On a link with data flowing, waiting is pure delay.
+            // The packets are already here and the sender is timing the pause.
+            //
+            // THE DELAY EXPIRED. The backstop, for a link that has gone quiet,
+            // which is the case the batching was for in the first place.
+            if (flow->newSinceFlush > 0
+                && (flow->ackImmediate
+                    || flow->newSinceFlush >= internal::ACK_EVERY_PACKETS
+                    || Elapsed(now, flow->ackArmedMicros) >= ackDelayMicros_))
                 ackDue = true;
             inAssocPool_.UnlockRead(dir[i].flowSlot);
         }
         return ackDue;
     }
 
-    uint64_t FlowTable::NextDeadline(uint32_t peerSlot) noexcept
+    bool FlowTable::InAssocJammed(const InAssociation* flow, uint64_t now) const noexcept
     {
+        // Only an ordered flow holds a gap. recvHighest >= recvNext means the
+        // cursor sits behind packets already seen, so the hold-back is pinning
+        // recv slots. If the cursor has not moved for the timeout, the sender is
+        // not filling the gap and never will.
+        return flow->reorderCap > 0
+            && flow->recvHighest >= flow->recvNext
+            && Elapsed(now, flow->lastProgressMicros) > flowStallTimeout_;
+    }
+
+    bool FlowTable::AnyJammed(uint32_t peerSlot, uint64_t now) noexcept
+    {
+        bool jammed = false;
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        for (uint32_t i = 0; i < maxInAssocPerPeer_ && !jammed; ++i)
+        {
+            if (dir[i].flowSlot == common::collections::SlotPool::INVALID)
+                continue;
+            const InAssociation* flow = reinterpret_cast<const InAssociation*>(
+                inAssocPool_.ReadLock(dir[i].flowSlot));
+            jammed = InAssocJammed(flow, now);
+            inAssocPool_.UnlockRead(dir[i].flowSlot);
+        }
+        return jammed;
+    }
+
+    uint32_t FlowTable::ReclaimJammedInFlows(uint32_t peerSlot, uint64_t now) noexcept
+    {
+        // Runs under the peer's write lock, exactly like the peer-teardown
+        // sweep, so the flow locks nest correctly (peer -> flow). The condition
+        // is re-checked under the write lock, because a racing DeliverIn may
+        // have advanced the cursor since the read scan flagged this peer.
+        //
+        // Only the buffered packets go. The association stays, because its
+        // cursor, epoch and identity are what let the sender resend into the
+        // same gap. Rebuilding it would start the receiver at sequence one
+        // against a sender already far past that, and every packet after would
+        // land outside the window with no way for either side to notice.
+        uint32_t reclaimed = 0;
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        for (uint32_t i = 0; i < maxInAssocPerPeer_; ++i)
+        {
+            const uint32_t flowSlot = dir[i].flowSlot;
+            if (flowSlot == common::collections::SlotPool::INVALID)
+                continue;
+            InAssociation* assoc = reinterpret_cast<InAssociation*>(
+                inAssocPool_.WriteLock(flowSlot));
+            if (InAssocJammed(assoc, now))
+            {
+                if (DropInHoldback(assoc) > 0)
+                {
+                    ++reclaimed;
+                    peerRecvStates_[peerSlot].stallReclaims.fetch_add(
+                        1, std::memory_order_relaxed);
+                    peerRecvStates_[peerSlot].lastStallMicros.store(
+                        now, std::memory_order_relaxed);
+                }
+                // Tell the sender where the cursor actually is. It has been
+                // holding copies on the strength of acks this side just took
+                // back, and this is the only signal that they are owed again.
+                ArmAck(assoc, now);
+                // Restart the clock so the next sweep measures the new stall
+                // rather than re-firing on this one.
+                assoc->lastProgressMicros = now;
+            }
+            inAssocPool_.UnlockWrite(flowSlot);
+        }
+        return reclaimed;
+    }
+
+    uint32_t FlowTable::InAssocCountForPeer(uint32_t peerSlot) noexcept
+    {
+        uint32_t count = 0;
+        FlowDirEntry* dir = InDirFor(peerSlot);
+        for (uint32_t i = 0; i < maxInAssocPerPeer_; ++i)
+            if (dir[i].flowSlot != common::collections::SlotPool::INVALID)
+                ++count;
+        return count;
+    }
+
+    uint64_t FlowTable::NextDeadline(uint32_t peerSlot, const Peer& peer) noexcept
+    {
+        const uint64_t now = common::MonotonicMicros();
         uint64_t soonest = UINT64_MAX;   // nothing armed
         auto consider = [&](uint64_t deadline) {
             if (deadline < soonest) soonest = deadline;
@@ -808,15 +947,40 @@ namespace bcp::flux
                 {
                     // Earliest RTO across in-flight entries; a full scan
                     // is bounded by the ring cap.
-                    const uint64_t rto = RetransmitTimeout(flow, retryIntervalMicros_);
+                    // The same cap the retransmit scan applies, so the
+                    // deadline this reports is the one that will actually
+                    // fire.
+                    const uint64_t rtoBase = peer.rtt.RetransmitTimeout(
+                        retryIntervalMicros_, ackDelayMicros_);
+                    uint64_t bound = internal::FLOW_DEATH_ROUNDS * rtoBase;
+                    if (bound < retryIntervalMicros_) bound = retryIntervalMicros_;
+                    uint64_t probeCap = bound / internal::FLOW_DEATH_MIN_PROBES;
+                    if (probeCap < rtoBase) probeCap = rtoBase;
+                    uint64_t rto = peer.rtt.RetransmitTimeout(
+                        retryIntervalMicros_, ackDelayMicros_, now);
+                    if (rto > probeCap) rto = probeCap;
                     const uint32_t cap = flow->inflightCap;
                     const InFlightEntry* ring = flow->InFlight();
+                    // `found` is tracked apart from the value, because zero is
+                    // a stored send time meaning "overdue, go now" as well as
+                    // the empty answer. Folding the two makes the result depend
+                    // on ring order: a zero seen last erases a real deadline,
+                    // and a zero seen first is overwritten by a later one. An
+                    // entry carrying it is due immediately, which is exactly
+                    // when a caller sizing a blocking wait must not sleep.
                     uint64_t oldest = 0;
+                    bool     found  = false;
                     for (uint32_t k = 0; k < cap; ++k)
-                        if (ring[k].seq != 0 &&
-                            (oldest == 0 || ring[k].sentAtMicros < oldest))
+                    {
+                        if (ring[k].seq == 0 || ring[k].acked) continue;
+                        if (ring[k].sentAtMicros == 0) { oldest = 0; found = true; break; }
+                        if (!found || ring[k].sentAtMicros < oldest)
+                        {
                             oldest = ring[k].sentAtMicros;
-                    if (oldest != 0) consider(oldest + rto);
+                            found  = true;
+                        }
+                    }
+                    if (found) consider(oldest == 0 ? now : oldest + rto);
                 }
                 outAssocPool_.UnlockRead(dir[i].flowSlot);
             }
@@ -828,7 +992,8 @@ namespace bcp::flux
     size_t FlowTable::BuildPeerAckBody(uint32_t peerSlot, uint8_t* out, size_t cap) noexcept
     {
         // One packet carries every association of this peer that owes acks.
-        // Each entry: [flowId(2)][epoch(1)][rangeCount(1)][first,last]*count.
+        // Each entry:
+        // [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][ackDelay(2)][first,last]*count.
         // The epoch is what stops an ack outliving the generation it describes:
         // an id closed and reopened numbers from one again, and without it the
         // sender would resolve the new generation's packets against sequences
@@ -836,6 +1001,11 @@ namespace bcp::flux
         // lock (nested inside the peer read lock, which holds the sweep out);
         // owed counters reset here.
         size_t bodyLen = 0;
+
+        // One reading for the whole body. The entries go out in the same
+        // datagram, so splitting hairs between them would report a difference
+        // that the wire then removes again.
+        const uint64_t now = common::MonotonicMicros();
 
         FlowDirEntry* dir = InDirFor(peerSlot);
         for (uint32_t i = 0; i < maxInAssocPerPeer_; ++i)
@@ -847,17 +1017,41 @@ namespace bcp::flux
                 inAssocPool_.WriteLock(flowSlot));
             if (flow->life == FlowLifecycle::OPEN && flow->newSinceFlush > 0)
             {
+                flow->ackImmediate = false;   // this reply is the answer it asked for
                 AckRange ranges[internal::FLOW_ACK_RANGE_COUNT];
                 const uint8_t rc = BuildAckRanges(flow, ranges,
                                                   internal::FLOW_ACK_RANGE_COUNT);
-                const size_t need = 4 + static_cast<size_t>(rc) * 8;
-                if (rc > 0 && bodyLen + need <= cap)
+                const size_t need = internal::WIRE_ACK_ENTRY_HEAD_SIZE
+                                  + static_cast<size_t>(rc) * 8;
+                // Written even with no ranges. The cursor is the half that
+                // cannot be inferred, and a flow that has just given up its
+                // buffered packets has nothing to list and everything to say.
+                if (bodyLen + need <= cap)
                 {
-                    const uint16_t flowId = flow->flowId;
+                    const uint16_t flowId   = flow->flowId;
+                    const uint32_t recvNext = flow->recvNext;
+
+                    // How long the newest reported sequence has been sitting
+                    // here. Saturating rather than wrapping: past the ceiling
+                    // the sender subtracts less than it should and reads the
+                    // path as slower, which is the harmless direction. Zero
+                    // when nothing has been committed, since then there is no
+                    // arrival to have held.
+                    const uint64_t held = flow->newestArrivalMicros == 0
+                        ? 0 : Elapsed(now, flow->newestArrivalMicros);
+                    const uint16_t ackDelay = held > UINT16_MAX
+                        ? UINT16_MAX : static_cast<uint16_t>(held);
+
                     out[bodyLen++] = static_cast<uint8_t>(flowId);
                     out[bodyLen++] = static_cast<uint8_t>(flowId >> 8);
                     out[bodyLen++] = flow->flowEpoch;
                     out[bodyLen++] = rc;
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext);
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext >> 8);
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext >> 16);
+                    out[bodyLen++] = static_cast<uint8_t>(recvNext >> 24);
+                    out[bodyLen++] = static_cast<uint8_t>(ackDelay);
+                    out[bodyLen++] = static_cast<uint8_t>(ackDelay >> 8);
                     for (uint8_t r = 0; r < rc; ++r)
                     {
                         const uint32_t first = ranges[r].first, last = ranges[r].last;
@@ -876,13 +1070,16 @@ namespace bcp::flux
                 // else the body is full: this flow's acks ride the next flush
             }
             inAssocPool_.UnlockWrite(flowSlot);
-            if (bodyLen + 3 + 8 > cap) break;   // no room for another entry
+            if (bodyLen + internal::WIRE_ACK_ENTRY_HEAD_SIZE + 8 > cap)
+                break;   // no room for another entry
         }
 
         return bodyLen;
     }
 
-    void FlowTable::ApplyAckRanges(uint32_t peerSlot, uint16_t flowId, uint8_t flowEpoch,
+    void FlowTable::ApplyAckRanges(uint32_t peerSlot, const Peer& peer,
+                                   uint16_t flowId, uint8_t flowEpoch,
+                                   uint32_t remoteRecvNext, uint16_t remoteAckDelayMicros,
                                    const AckRange* ranges, uint8_t count, uint64_t now,
                                    CongestionDelta& delta) noexcept
     {
@@ -899,11 +1096,160 @@ namespace bcp::flux
         {
             const uint32_t cap = flow->inflightCap;
             InFlightEntry* ring = flow->InFlight();
+
+            // The highest sequence this ack proves arrived. Taken from what our
+            // own ring resolved rather than from the numbers the peer sent, so
+            // a peer naming a sequence we never sent cannot make us declare our
+            // own packets lost.
+            uint32_t largestAcked = 0;
+            bool     anyAcked     = false;
+
+            // The newest sequence this ack resolves for the FIRST time, kept
+            // apart from largestAcked because the two answer different
+            // questions. Loss detection wants the highest the peer has proven
+            // it holds, whether or not we already knew. A round-trip sample
+            // wants one that was outstanding until this moment, since an entry
+            // acknowledged by an earlier reply would be measured from a send
+            // that finished long ago.
+            uint32_t sampleSeq    = 0;
+            uint64_t sampleSentAt  = 0;
+            bool     sampleResent  = false;
+            bool     haveSample    = false;
+
             for (uint32_t i = 0; i < cap; ++i)
-                if (ring[i].seq != 0 && SeqInRanges(ring[i].seq, ranges, count))
-                    ResolveOutEntry(flow, ring[i], true, now, delta);
+            {
+                if (ring[i].seq == 0) continue;
+                // Below the cursor is proof of delivery whatever the ranges
+                // say. The list is capped and built from the top, so the runs
+                // it drops are the oldest ones, which is exactly the stretch
+                // the send window is waiting on.
+                if (ring[i].seq < remoteRecvNext || SeqInRanges(ring[i].seq, ranges, count))
+                {
+                    if (!anyAcked || static_cast<int32_t>(ring[i].seq - largestAcked) > 0)
+                    {
+                        largestAcked = ring[i].seq;
+                        anyAcked     = true;
+                    }
+                    if (!ring[i].acked
+                        && (!haveSample
+                            || static_cast<int32_t>(ring[i].seq - sampleSeq) > 0))
+                    {
+                        sampleSeq     = ring[i].seq;
+                        sampleSentAt  = ring[i].sentAtMicros;
+                        // Retransmitted in EITHER way. retries counts only the
+                        // charged attempts, because the give-up count asks
+                        // whether the peer is silent and an ack-driven resend
+                        // is proof it is not. Sampling asks a different
+                        // question, which transmission this ack answers, and a
+                        // free resend is exactly as ambiguous as a charged one.
+                        // Reusing the give-up counter here once let resends be
+                        // sampled from their resend time, which read 31 ms on a
+                        // path that is physically 40, and a minimum only ever
+                        // falls: the phantom queue that made parked the budget
+                        // at its initial window for entire transfers.
+                        sampleResent  = ring[i].retries != 0 || ring[i].lostByAck;
+                        haveSample    = true;
+                    }
+                    ResolveOutEntry(flow, ring[i], true, delta);
+                }
+            }
+
+            // One sample per acknowledgement, from the newest sequence it just
+            // resolved, which is also the one the receiver reported its hold
+            // time against. Two entries are refused.
+            //
+            // One that has been retransmitted, because the reply cannot say
+            // which transmission it answers. Measuring from the most recent
+            // send gives a sample shorter than the path, which pulls the
+            // timeout in and resends packets that were never lost.
+            //
+            // One whose send time is zero, which is not a time. It is the
+            // marker three paths use for "overdue, go again on the next tick",
+            // and subtracting it yields the machine's uptime. That reached the
+            // smoothed round trip once and measured 54 hours, which put the
+            // retransmit timeout beyond any clock and the pacing rate at zero,
+            // so the flow stopped sending and stopped timing out while every
+            // thread kept running.
+            if (haveSample && !sampleResent && sampleSentAt != 0
+                && now >= sampleSentAt)
+            {
+                uint64_t sample = now - sampleSentAt;
+                // Subtract only while it leaves something behind. A hold time
+                // at or past the whole round trip comes from a peer whose
+                // clock or whose arithmetic we cannot use, and the
+                // uncorrected figure is still an honest upper bound.
+                if (remoteAckDelayMicros < sample) sample -= remoteAckDelayMicros;
+
+                // Past the ceiling this is not a slow path, it is a subtraction
+                // from something that was never a timestamp. Dropping it costs
+                // one sample out of many. Keeping it costs every decision built
+                // on the smoothed value from here on, since a minimum only ever
+                // falls and a timeout built from a poisoned average stops
+                // firing at all. The assert is the point: a clamp that silently
+                // corrected this would hide the next one.
+                // Reported, not folded. The estimate lives on the peer, an
+                // association may never reach for one, so the measurement
+                // travels up in the delta and the socket folds it under the
+                // peer's lock.
+                delta.rttSampleMicros = sample > UINT32_MAX
+                    ? UINT32_MAX : static_cast<uint32_t>(sample);
+                delta.ackDelayMicros  = remoteAckDelayMicros;
+            }
+
+            if (anyAcked)
+            {
+                flow->lastResolvedMicros = now;
+                DeclareLostBelow(*flow, largestAcked, now,
+                                 peer.rtt.LossDelayMicros(retryIntervalMicros_), delta);
+            }
+            ReleaseAckedRun(*flow, remoteRecvNext);
         }
         outAssocPool_.UnlockWrite(flowSlot);
+    }
+
+    void FlowTable::MarkEmitting(EventScope scope, uint32_t assocSlot) noexcept
+    {
+        if (scope == EventScope::OUT_FLOW)
+        {
+            if (assocSlot >= outAssocPool_.GetCapacity()) return;
+            OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
+                outAssocPool_.WriteLock(assocSlot));
+            assoc->emitting = true;
+            outAssocPool_.UnlockWrite(assocSlot);
+            return;
+        }
+        if (assocSlot >= inAssocPool_.GetCapacity()) return;
+        InAssociation* assoc = reinterpret_cast<InAssociation*>(
+            inAssocPool_.WriteLock(assocSlot));
+        assoc->emitting = true;
+        inAssocPool_.UnlockWrite(assocSlot);
+    }
+
+    void FlowTable::ClearEmitting(EventScope scope, uint32_t assocSlot) noexcept
+    {
+        // Teardown may have run while the event was waiting, in which case it
+        // left the lease alone for exactly this moment. CLOSED under the write
+        // lock is what says so, and the release happens after the lock drops
+        // because the pool must not be handed a slot someone still holds.
+        bool release = false;
+        if (scope == EventScope::OUT_FLOW)
+        {
+            if (assocSlot >= outAssocPool_.GetCapacity()) return;
+            OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
+                outAssocPool_.WriteLock(assocSlot));
+            assoc->emitting = false;
+            release = assoc->life == FlowLifecycle::CLOSED;
+            outAssocPool_.UnlockWrite(assocSlot);
+            if (release) outAssocPool_.Release(assocSlot);
+            return;
+        }
+        if (assocSlot >= inAssocPool_.GetCapacity()) return;
+        InAssociation* assoc = reinterpret_cast<InAssociation*>(
+            inAssocPool_.WriteLock(assocSlot));
+        assoc->emitting = false;
+        release = assoc->life == FlowLifecycle::CLOSED;
+        inAssocPool_.UnlockWrite(assocSlot);
+        if (release) inAssocPool_.Release(assocSlot);
     }
 
     bool FlowTable::OutAssocEpochIs(uint32_t assocSlot, uint8_t flowEpoch) noexcept
@@ -929,16 +1275,40 @@ namespace bcp::flux
         FlowMode mode{};
         uint8_t  flowEpoch = 0;
         {
-            const Flow* flow = reinterpret_cast<const Flow*>(flowPool_.ReadLock(flowSlot));
+            // A generation is minted here, where the sequence space restarts,
+            // and not only where the application opens the flow. Those are
+            // different events, and treating them as one loses data silently.
+            //
+            // An association is freed when its peer goes away, while the flow
+            // stays open. The next send builds a fresh one numbering from one
+            // again. The far side is a different socket and evicted nothing, so
+            // it still holds its association with the cursor far ahead, reads
+            // the same generation as current, and discards every restarted
+            // sequence as a duplicate it already has. Worse, its acknowledgement
+            // carries that old cursor and resolves the whole restarted run,
+            // so this side frees its retained copies and reports success for
+            // data that was never delivered.
+            //
+            // The write lock is what serialises this against OpenFlow, which
+            // is the only other writer of the byte.
+            Flow* flow = reinterpret_cast<Flow*>(flowPool_.WriteLock(flowSlot));
             const bool open = flow->life == FlowLifecycle::OPEN;
-            mode      = flow->mode;
-            flowEpoch = FlowDataEpoch(flow->flowData);
-            flowPool_.UnlockRead(flowSlot);
+            mode = flow->mode;
+            if (open)
+            {
+                flowEpoch = static_cast<uint8_t>(
+                    (FlowDataEpoch(flow->flowData) + 1u) & FLOW_EPOCH_MASK);
+                flow->flowData = static_cast<uint8_t>(
+                    (flow->flowData & ~(FLOW_EPOCH_MASK << 3))
+                    | (flowEpoch << 3));
+            }
+            flowPool_.UnlockWrite(flowSlot);
             if (!open)
                 return common::collections::SlotPool::INVALID;
         }
 
-        const uint32_t assocSlot = outAssocPool_.Acquire();
+        const uint32_t assocSlot = outAssocPool_.Acquire(
+            mode == FlowMode::RELIABLE_ORDERED_BULK);
         if (assocSlot == common::collections::SlotPool::INVALID)
             return common::collections::SlotPool::INVALID;
 
@@ -949,7 +1319,7 @@ namespace bcp::flux
             OutAssociation* assoc = reinterpret_cast<OutAssociation*>(
                 outAssocPool_.WriteLock(assocSlot));
             ResetOutAssoc(assoc, peerSlot, peer.addr, &peer.id, flowId, mode, flowEpoch,
-                          outInflightCap_,
+                          WindowFor(mode),
                           mode == FlowMode::UNRELIABLE ? outUnreliableWaitCap_
                                                        : outReliableWaitCap_);
             assoc->flowSlot   = common::collections::SlotPool::INVALID;
@@ -977,7 +1347,7 @@ namespace bcp::flux
         @pre Caller holds the peer write lock; the peer is lent in. */
     SendAdmission FlowTable::AdmitOut(Peer& peer, uint32_t peerSlot, PacketSlot& packet,
                                       uint32_t packetSlot, uint16_t wireSize,
-                                      bool flying) noexcept
+                                      bool flying, uint64_t now) noexcept
     {
         // The peer is lent, already write-locked: no re-lookup. Take only the
         // flow lock (peer->flow), decide, and mutate.
@@ -1005,7 +1375,12 @@ namespace bcp::flux
         else
         {
             const bool unreliable = assoc->mode == FlowMode::UNRELIABLE;
-            if (assoc->waitingCount == 0 && CanSend(*assoc, peer, wireSize, !unreliable))
+            // Room and time are separate questions. Refused on time, a packet
+            // waits on the ring exactly as one refused on room does, and the
+            // tick releases it when the clock has caught up.
+            if (assoc->waitingCount == 0
+                && CanSend(*assoc, peer, wireSize, !unreliable)
+                && PacingAllows(peer, now, wireSize))
             {
                 StampFlowPacket(*assoc, peer, packet,
                                 unreliable ? common::collections::SlotPool::INVALID
@@ -1050,9 +1425,13 @@ namespace bcp::flux
                                      const BcpId& peerId, uint16_t flowId,
                                      uint8_t flowData) noexcept
     {
+        // The part is a property of this packet, not of the association, so it
+        // is decoded only to be validated: framing on a mode that cannot frame
+        // is refused here rather than reaching the delivery path.
         FlowMode mode{};
         uint8_t  flowEpoch = 0;
-        if (!DecodeFlowData(flowData, mode, flowEpoch))
+        FlowPart part{};
+        if (!DecodeFlowData(flowData, mode, flowEpoch, part))
             return FlowAdmit::Rejected;
 
         FlowDirEntry* dir = InDirFor(peerSlot);
@@ -1061,7 +1440,34 @@ namespace bcp::flux
         {
             InAssociation* assoc = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(existing));
-            const FlowEpochOrder order = CompareFlowEpoch(assoc->flowEpoch, flowEpoch);
+            FlowEpochOrder order = CompareFlowEpoch(assoc->flowEpoch, flowEpoch);
+
+            // A way out of falling too far behind. The comparison walks forward
+            // from what this side holds and calls a long walk a straggler,
+            // because the field wraps and a late packet from a generation that
+            // is gone must not pull the association back onto a sequence space
+            // nothing will ever send on again.
+            //
+            // But three missed generations is a cliff with nothing beyond it.
+            // Past that every arrival reads as a straggler and is dropped with
+            // no delivery, no acknowledgement and no rejection, so the sender
+            // resolves nothing, its association dies, the application reopens,
+            // and the distance grows by one more. The only exit is the field
+            // coming round again, which lands on a generation this side still
+            // holds and is worse than the stall.
+            //
+            // Silence is what separates the two cases. A straggler arrives
+            // while the association is otherwise busy, so the cursor has moved
+            // recently. An association that has delivered nothing for the whole
+            // stall timeout has no live generation left to protect, so the
+            // arriving one is believed. Being wrong costs one reset onto a dead
+            // sequence space, which goes silent and is reset again by the next
+            // real generation. Being right ends a stall that has no other end.
+            if (order == FlowEpochOrder::Stale
+                && Elapsed(common::MonotonicMicros(), assoc->lastProgressMicros)
+                       > flowStallTimeout_)
+                order = FlowEpochOrder::Newer;
+
             if (order == FlowEpochOrder::Newer)
             {
                 // The sender closed this id and opened it again, so it numbers
@@ -1069,20 +1475,39 @@ namespace bcp::flux
                 // ever be completed. Drain first: the reset only stamps the
                 // hold-back entries free, and the slots they name are ours to
                 // release.
+                //
+                // The mode has to be the one this slot was cut for. A slot's
+                // stride is fixed by the sub-pool it came from at first
+                // registration, and the reset writes a seen bitmap and a
+                // hold-back ring sized from the mode it is handed. A remote
+                // that registers an id as standard and reopens it as bulk
+                // would have us lay 8 KB of ring into a 2 KB slot, off the end
+                // and into whatever the pool put next. Two bytes on the wire,
+                // chosen by the sender, so this is refused rather than
+                // reasoned about: the remote is told, and it may open a
+                // different id for the other mode.
+                if (inAssocPool_.IsBulk(existing)
+                        != (mode == FlowMode::RELIABLE_ORDERED_BULK))
+                {
+                    inAssocPool_.UnlockWrite(existing);
+                    return FlowAdmit::Rejected;
+                }
+
                 DrainInHoldback(assoc);
                 ResetInAssoc(assoc, peerSlot, from, &peerId, flowId, mode,
-                             flowEpoch, inWindowBits_, inReorderCap_);
+                             flowEpoch, WindowFor(mode), ReorderCapFor(mode));
             }
             inAssocPool_.UnlockWrite(existing);
 
-            return order == FlowEpochOrder::Stale ? FlowAdmit::Stale
-                                                  : FlowAdmit::Existing;
+            if (order == FlowEpochOrder::Stale)  return FlowAdmit::Stale;
+            if (order == FlowEpochOrder::Newer)  return FlowAdmit::Reopened;
+            return FlowAdmit::Existing;
         }
 
         // This is the one path where a REMOTE makes this socket allocate, so
         // it is caps-only: a dry pool or a full directory refuses, and the
         // sender is told rather than left retransmitting into silence.
-        const uint32_t flowSlot = inAssocPool_.Acquire();
+        const uint32_t flowSlot = inAssocPool_.Acquire(mode == FlowMode::RELIABLE_ORDERED_BULK);
         if (flowSlot == common::collections::SlotPool::INVALID)
             return FlowAdmit::Rejected;
 
@@ -1091,7 +1516,7 @@ namespace bcp::flux
             InAssociation* flow = reinterpret_cast<InAssociation*>(
                 inAssocPool_.WriteLock(flowSlot));
             ResetInAssoc(flow, peerSlot, from, &peerId, flowId, mode,
-                         flowEpoch, inWindowBits_, inReorderCap_);
+                         flowEpoch, WindowFor(mode), ReorderCapFor(mode));
             inAssocPool_.UnlockWrite(flowSlot);
         }
         if (InsertFlowSlot(dir, maxInAssocPerPeer_, flowId, flowSlot)
@@ -1106,15 +1531,31 @@ namespace bcp::flux
 
     FlowAdmit FlowTable::AdmitIn(uint32_t peerSlot, const Address& from, const BcpId& peerId,
                                  uint16_t flowId, uint8_t flowData,
-                                 uint32_t& outAssoc) noexcept
+                                 uint32_t& outAssoc, uint32_t& outEpoch) noexcept
     {
         outAssoc = common::collections::SlotPool::INVALID;
+        outEpoch = 0;
 
         // First packet of a flow registers it: the flow data byte carries
         // everything registration needs.
         const FlowAdmit admit = AdmitInFlow(peerSlot, from, peerId, flowId, flowData);
-        if (admit == FlowAdmit::Registered || admit == FlowAdmit::Existing)
-            outAssoc = FindFlowSlot(InDirFor(peerSlot), maxInAssocPerPeer_, flowId);
+        if (admit != FlowAdmit::Registered && admit != FlowAdmit::Existing
+            && admit != FlowAdmit::Reopened)
+            return admit;
+
+        outAssoc = FindFlowSlot(InDirFor(peerSlot), maxInAssocPerPeer_, flowId);
+        if (outAssoc == common::collections::SlotPool::INVALID)
+            return admit;
+
+        // The caller drops the peer lock before delivering, and the slot can be
+        // freed and handed to another peer in that gap. Its generation goes
+        // with the index so delivery can tell it is still the association this
+        // lookup found. Flow ids are each remote's own choice, so two peers
+        // sharing one is ordinary and the id alone proves nothing.
+        const InAssociation* flow = reinterpret_cast<const InAssociation*>(
+            inAssocPool_.ReadLock(outAssoc));
+        if (flow) outEpoch = flow->epoch;
+        inAssocPool_.UnlockRead(outAssoc);
         return admit;
     }
 
@@ -1145,18 +1586,34 @@ namespace bcp::flux
 
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(flowSlot));
-        const uint32_t drained = DrainOutInflight(flow);
+        uint32_t drainedPackets = 0;
+        const uint32_t drained = DrainOutInflight(flow, &drainedPackets);
         DrainOutWaiting(flow);
         flow->life = FlowLifecycle::CLOSED;
+        // An unread event about this association is sitting in the slot's event
+        // entry. Releasing now would let a later occupant land on that entry and
+        // write over it, so the lease is held and ClearEmitting releases it once
+        // the event has been delivered.
+        const bool emitting = flow->emitting;
         outAssocPool_.UnlockWrite(flowSlot);
 
         if (refundTo)
+        {
             refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
                 ? drained : refundTo->bytesInFlight;
-        outAssocPool_.Release(flowSlot);
+            // The grant these packets spent goes back too. It is only ever
+            // repaid by an acknowledgement, and one that never comes would
+            // otherwise leave the spend charged for the life of the peer,
+            // until the send gate refuses every flow to it with nothing able
+            // to notice: the death clock only watches associations that still
+            // owe packets, and this one owes none.
+            refundTo->outstandingToPeer -= drainedPackets <= refundTo->outstandingToPeer
+                ? drainedPackets : refundTo->outstandingToPeer;
+        }
+        if (!emitting) outAssocPool_.Release(flowSlot);
     }
 
-    void FlowTable::FailAssoc(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept
+    bool FlowTable::FailAssoc(uint32_t flowSlot, uint16_t flowId, Peer* refundTo) noexcept
     {
         // FAILED, not freed: the app has to be able to see what happened, so
         // the slot stays leased until CloseFlow. What it held goes back now,
@@ -1165,18 +1622,32 @@ namespace bcp::flux
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(flowSlot));
 
-        uint32_t drained = 0;
-        if (flow->flowId == flowId && flow->life != FlowLifecycle::CLOSED)
+        // Already FAILED is not failed again. A peer answers every packet on a
+        // refused flow with its own rejection, so several arrive for one
+        // association, and re-running the drain would also let a caller report
+        // the same failure once per reply.
+        uint32_t drained        = 0;
+        uint32_t drainedPackets = 0;
+        bool     failed  = false;
+        if (flow->flowId == flowId
+            && flow->life != FlowLifecycle::CLOSED
+            && flow->life != FlowLifecycle::FAILED)
         {
-            drained = DrainOutInflight(flow);
+            drained = DrainOutInflight(flow, &drainedPackets);
             DrainOutWaiting(flow);
             flow->life = FlowLifecycle::FAILED;
+            failed = true;
         }
         outAssocPool_.UnlockWrite(flowSlot);
 
         if (refundTo && drained)
+        {
             refundTo->bytesInFlight -= drained <= refundTo->bytesInFlight
                 ? drained : refundTo->bytesInFlight;
+            refundTo->outstandingToPeer -= drainedPackets <= refundTo->outstandingToPeer
+                ? drainedPackets : refundTo->outstandingToPeer;
+        }
+        return failed;
     }
 
     void FlowTable::SweepPeer(uint32_t peerSlot) noexcept
@@ -1215,28 +1686,37 @@ namespace bcp::flux
                     inAssocPool_.WriteLock(flowSlot));
                 DrainInHoldback(assoc);
                 assoc->life = FlowLifecycle::CLOSED;
+                const bool emitting = assoc->emitting;
                 inAssocPool_.UnlockWrite(flowSlot);
-                inAssocPool_.Release(flowSlot);
+                if (!emitting) inAssocPool_.Release(flowSlot);
             }
         }
     }
 
     // --- Ring drains ---
 
-    uint32_t FlowTable::DrainOutInflight(OutAssociation* flow) noexcept
+    uint32_t FlowTable::DrainOutInflight(OutAssociation* flow,
+                                         uint32_t* outPackets) noexcept
     {
-        uint32_t drainedBytes = 0;
+        uint32_t drainedBytes   = 0;
+        uint32_t drainedPackets = 0;
         InFlightEntry* ring = flow->InFlight();
         for (uint32_t i = 0; i < flow->inflightCap; ++i)
         {
-            if (ring[i].seq != 0) drainedBytes += ring[i].wireSize;   // still in flight: refund
+            if (ring[i].seq != 0 && !ring[i].acked)
+            {
+                drainedBytes += ring[i].wireSize;   // still in flight: refund
+                ++drainedPackets;                   // and the grant it spent
+            }
             if (ring[i].packetSlot != common::collections::SlotPool::INVALID)
                 stagingPool_.Release(ring[i].packetSlot);
             ring[i].packetSlot = common::collections::SlotPool::INVALID;
             ring[i].seq        = 0;
             ring[i].wireSize   = 0;
+            ring[i].acked      = false;
         }
         flow->unresolved = 0;
+        if (outPackets) *outPackets = drainedPackets;
         return drainedBytes;
     }
 
@@ -1258,14 +1738,54 @@ namespace bcp::flux
         }
     }
 
+    uint32_t FlowTable::DropInHoldback(InAssociation* flow) noexcept
+    {
+        if (flow->reorderCap == 0) return 0;
+        uint32_t dropped = 0;
+        HoldbackEntry* ring = flow->Holdback();
+        for (uint32_t i = 0; i < flow->reorderCap; ++i)
+        {
+            if (ring[i].packetSlot == common::collections::SlotPool::INVALID)
+                continue;
+
+            recvPool_->Release(ring[i].packetSlot);
+            peerRecvStates_[flow->peerSlot].ReleaseOne();
+            heldTotal_->fetch_sub(1, std::memory_order_relaxed);
+            if (flow->heldCount > 0) --flow->heldCount;
+            // The bit has to go with the bytes. A sequence left marked seen is
+            // a sequence the resend is discarded as a duplicate, and the sender
+            // has no other way to learn this side no longer holds it.
+            SeenClear(flow->Seen(), ring[i].seq, flow->windowBits);
+            ring[i].packetSlot = common::collections::SlotPool::INVALID;
+            ring[i].seq = 0;
+            ++dropped;
+        }
+        return dropped;
+    }
+
     void FlowTable::DrainInHoldback(InAssociation* flow) noexcept
     {
         if (flow->reorderCap == 0) return;
         HoldbackEntry* ring = flow->Holdback();
         for (uint32_t i = 0; i < flow->reorderCap; ++i)
         {
-            if (ring[i].packetSlot != common::collections::SlotPool::INVALID)
-                recvPool_->Release(ring[i].packetSlot);
+            if (ring[i].packetSlot == common::collections::SlotPool::INVALID)
+                continue;
+
+            // Every count that was raised when the packet was held comes back
+            // down with it. Releasing the slot alone turns two occupancy
+            // measurements into monotonic event counts: the socket-wide held
+            // total gates HasRoomFor and is reset nowhere, so a leak there
+            // eventually refuses hold-back for every peer, and the per-peer
+            // pin is charged against that peer's grant for as long as it
+            // lives. This differs from DropInHoldback only in leaving the seen
+            // bit alone, because the whole generation is going away and the
+            // sender will not be resending into it.
+            recvPool_->Release(ring[i].packetSlot);
+            peerRecvStates_[flow->peerSlot].ReleaseOne();
+            heldTotal_->fetch_sub(1, std::memory_order_relaxed);
+            if (flow->heldCount > 0) --flow->heldCount;
+
             ring[i].packetSlot = common::collections::SlotPool::INVALID;
             ring[i].seq = 0;
         }
@@ -1274,44 +1794,221 @@ namespace bcp::flux
     // --- Retransmit ---
 
     void FlowTable::ResolveOutEntry(OutAssociation* flow, InFlightEntry& entry,
-                                    bool acked, uint64_t nowMicros, CongestionDelta& delta) noexcept
+                                    bool acked, CongestionDelta& delta) noexcept
     {
-        if (entry.seq == 0) return;   // already resolved: idempotent
+        // Idempotent. A freed entry reads as seq 0, but an acknowledged one
+        // keeps its sequence while its copy is retained, and acks repeat, so
+        // that flag is the other half of the guard.
+        if (entry.seq == 0 || entry.acked) return;
 
         delta.resolvedBytes += entry.wireSize;
+        delta.resolvedPackets += 1;
         if (acked)
         {
             delta.ackedBytes += entry.wireSize;
-            if (nowMicros >= entry.sentAtMicros)
-            {
-                const uint64_t sample = nowMicros - entry.sentAtMicros;
-                SampleRtt(flow, sample);   // per-flow RTT, for this flow's RTO
-                delta.rttSampleMicros = sample > UINT32_MAX
-                    ? UINT32_MAX : static_cast<uint32_t>(sample);
-            }
         }
         else
         {
+            // The epoch travels with the verdict. The peer discards a loss
+            // whose epoch is older than its own, so reporting one without
+            // naming it leaves the default of zero and the whole signal is
+            // dropped for every epoch from one to a hundred and twenty eight.
+            if (!delta.sawLoss
+                || static_cast<int8_t>(entry.congestionEpoch - delta.lostEpoch) > 0)
+                delta.lostEpoch = entry.congestionEpoch;
             delta.sawLoss = true;
         }
 
         if (flow->unresolved > 0) --flow->unresolved;
+
+        // Only an ordered flow retains. Its receiver buffers packets behind a
+        // gap and can be told to drop them, so an acknowledgement is not the
+        // end of the sender's obligation. An unordered receiver hands every
+        // packet straight to the application and keeps nothing it could lose,
+        // so the acknowledgement is final and the copy goes now. Its cursor
+        // never moves either, so a retained copy there would never be freed.
+        if (acked && IsOrdered(flow->mode))
+        {
+            // The window slot is free but the copy is not. ReleaseAckedRun
+            // frees it once the receiver reports a cursor past this sequence.
+            entry.acked = true;
+            return;
+        }
+
         if (entry.packetSlot != common::collections::SlotPool::INVALID)
             stagingPool_.Release(entry.packetSlot);   // different pool: safe under flow lock
         entry.seq        = 0;
         entry.packetSlot = common::collections::SlotPool::INVALID;
         entry.wireSize   = 0;
+        entry.acked      = false;
     }
 
-    void FlowTable::RetransmitInflight(OutAssociation& flow, uint64_t now, CongestionDelta& delta,
+    void FlowTable::RefundResendAttempts(uint32_t assocSlot, const uint32_t* seqs,
+                                         uint32_t count) noexcept
+    {
+        OutAssociation* flow = reinterpret_cast<OutAssociation*>(
+            outAssocPool_.WriteLock(assocSlot));
+        if (!flow) return;
+
+        const uint32_t mask = flow->inflightCap - 1;
+        InFlightEntry* ring = flow->InFlight();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            InFlightEntry& entry = ring[seqs[i] & mask];
+            // An ack may have resolved it while the send was attempted, and the
+            // slot may already belong to a later sequence. Only the entry still
+            // carrying this seq is the one that was charged.
+            if (entry.seq != seqs[i] || entry.acked) continue;
+            if (entry.retries > 0) --entry.retries;
+            entry.sentAtMicros = 0;   // overdue against any timeout: retry next tick
+        }
+        outAssocPool_.UnlockWrite(assocSlot);
+    }
+
+    void FlowTable::DeclareLostBelow(OutAssociation& flow, uint32_t largestAcked,
+                                     uint64_t now, uint64_t lossDelayMicros,
+                                     CongestionDelta& delta) noexcept
+    {
+        // Everything that turns an acknowledgement into a verdict of loss is
+        // here, and nothing else declares one. The timer used to as well, and
+        // that was the mistake: a deadline that fires early then cost half the
+        // window instead of one wasted packet.
+        //
+        // Two rules, both needing something above the gap to have arrived,
+        // because without that there is no evidence at all and a timer alone
+        // cannot conclude anything.
+        //
+        // Count: three sequences past it have landed. Reordering that deep is
+        // rare enough that waiting longer only delays the repair.
+        //
+        // Time: fewer than three have landed, but this one has been out longer
+        // than a round trip and an eighth. Fills the gap between the count rule
+        // and the probe, which is where a tail sits.
+        //
+        // Only reliable flows: an unreliable one is never resent, so declaring
+        // its packets early changes nothing it can act on.
+        if (flow.mode == FlowMode::UNRELIABLE) return;
+
+        InFlightEntry* ring = flow.InFlight();
+        for (uint32_t i = 0; i < flow.inflightCap; ++i)
+        {
+            InFlightEntry& entry = ring[i];
+            if (entry.seq == 0 || entry.acked || entry.lostByAck) continue;
+
+            // Signed, so the comparison still holds across a sequence wrap.
+            if (static_cast<int32_t>(largestAcked - entry.seq) <= 0) continue;
+
+            const bool farBehind =
+                static_cast<int32_t>(largestAcked - entry.seq)
+                    >= static_cast<int32_t>(internal::LOSS_PACKET_THRESHOLD);
+            // A send time of zero is the marker for a packet that has not been
+            // on the wire, not a packet sent at the dawn of time. It cannot be
+            // overdue, because it has not been anywhere.
+            const bool longOverdue =
+                entry.sentAtMicros != 0 && Elapsed(now, entry.sentAtMicros) > lossDelayMicros;
+
+            if (!farBehind && !longOverdue) continue;
+
+            // Handed to the retransmit scan rather than resent here. Zero reads
+            // as overdue against any timeout, so the next tick carries it
+            // through the one sanctioned resend path instead of growing a
+            // second one beside it.
+            entry.lostByAck    = true;
+            entry.freeResend   = true;   // the peer is talking, so this is free
+            entry.sentAtMicros = 0;
+            delta.lostDeclaredBytes += entry.wireSize;
+            // The newest epoch among the losses. An older one was already in
+            // flight when the peer last reacted.
+            if (!delta.sawLoss
+                || static_cast<int8_t>(entry.congestionEpoch - delta.lostEpoch) > 0)
+                delta.lostEpoch = entry.congestionEpoch;
+            delta.sawLoss = true;
+        }
+    }
+
+    void FlowTable::ReleaseAckedRun(OutAssociation& flow, uint32_t remoteRecvNext) noexcept
+    {
+        const uint32_t mask = flow.inflightCap - 1;
+        InFlightEntry* ring = flow.InFlight();
+
+        // Nothing outstanding can sit further back than the ring is wide, so a
+        // base further behind than that is stale and catches up over several
+        // acks rather than in one long scan.
+        // A copy is kept until the receiver says its cursor has passed the
+        // sequence. An acknowledgement only means the packet arrived, and a
+        // receiver can still drop what it has buffered ahead of a gap, so
+        // acknowledgement alone is not permission to forget it.
+        uint32_t steps = flow.inflightCap;
+        while (flow.ackBase != flow.nextSeq && flow.ackBase < remoteRecvNext && steps-- > 0)
+        {
+            InFlightEntry& entry = ring[flow.ackBase & mask];
+            if (entry.seq == flow.ackBase)
+            {
+                if (!entry.acked) break;   // still outstanding, nothing above it can go
+
+                if (entry.packetSlot != common::collections::SlotPool::INVALID)
+                    stagingPool_.Release(entry.packetSlot);
+                entry.seq          = 0;
+                entry.packetSlot   = common::collections::SlotPool::INVALID;
+                entry.wireSize     = 0;
+                entry.retries      = 0;
+                entry.sentAtMicros = 0;
+                entry.acked        = false;
+                entry.lostByAck    = false;
+                entry.freeResend   = false;
+            }
+            // An entry that does not carry this sequence was given up rather
+            // than acked, and is already gone.
+            flow.ackBase += 1;
+            if (flow.ackBase == 0) flow.ackBase = 1;
+        }
+    }
+
+    void FlowTable::RetransmitInflight(OutAssociation& flow, Peer& peer,
+                                       uint64_t now, CongestionDelta& delta,
                                        uint32_t* resendSeqs, uint32_t* resendSlots,
-                                       uint32_t& resendCount, bool& exhausted) noexcept
+                                       uint32_t& resendCount, bool& assocDead) noexcept
     {
         // Scan the in-flight ring for entries past their RTO. Reliable ones are
         // collected for retransmit (refresh sentAt, keep them in flight);
         // unreliable ones are declared lost and resolved. Loss feedback goes into
         // `delta`, never the peer: the caller applies it under the peer lock.
-        const uint64_t rto  = RetransmitTimeout(&flow, retryIntervalMicros_);
+        // Three quantities from one measurement, and they have to agree.
+        //
+        // `base` is the timeout this path has earned, with no backoff. The
+        // deadline is a multiple of it, so a slow path gets proportionally
+        // longer to answer and a fast one is not left waiting on a constant
+        // that has nothing to do with it.
+        //
+        // The probe interval is then capped so at least FLOW_DEATH_MIN_PROBES
+        // of them fit inside that deadline. Backing off is right, and it must
+        // not be allowed to shrink the evidence the verdict is taken on: with
+        // the interval free to grow while the window collapses alongside it,
+        // the offered rate fell far enough that the deadline expired having
+        // asked three times, on a link that was merely lossy. Never below
+        // `base`, so a genuinely slow measured path is never rushed.
+        const uint64_t base = peer.rtt.RetransmitTimeout(retryIntervalMicros_,
+                                                         ackDelayMicros_);
+        uint64_t deathBound = internal::FLOW_DEATH_ROUNDS * base;
+        if (deathBound < retryIntervalMicros_) deathBound = retryIntervalMicros_;
+
+        uint64_t probeCap = deathBound / internal::FLOW_DEATH_MIN_PROBES;
+        if (probeCap < base) probeCap = base;
+
+        uint64_t rto = peer.rtt.RetransmitTimeout(retryIntervalMicros_, ackDelayMicros_,
+                                                  now);
+        if (rto > probeCap) rto = probeCap;
+
+        // The death, judged before anything is resent. Owing packets and
+        // resolving none for the whole deadline means this target has stopped
+        // answering the flow.
+        if (flow.unresolved > 0
+            && Elapsed(now, flow.lastResolvedMicros) > deathBound)
+        {
+            assocDead = true;
+            return;   // the caller fails it; resending into silence buys nothing
+        }
+
         const uint32_t cap  = flow.inflightCap;
         const FlowMode mode = flow.mode;
         InFlightEntry* ring = flow.InFlight();
@@ -1319,43 +2016,93 @@ namespace bcp::flux
         {
             InFlightEntry& entry = ring[i];
             if (entry.seq == 0) continue;
-            if (now - entry.sentAtMicros < rto) continue;
+            if (entry.acked)
+            {
+                // A receiver short of memory drops what it buffered ahead of a
+                // gap and has no way to say so. Once a retained copy is this
+                // old the flow is stalled anyway, so re-offering costs a packet
+                // and is the only path by which a dropped one comes back. It is
+                // not a loss: no budget trim, no retry spent.
+                // Zero is the resend marker, not a time, so an entry carrying
+                // it is not old, it is unsent. Reading it as a timestamp makes
+                // the machine's uptime the age and re-offers an acknowledged
+                // packet on every tick, ahead of genuinely lost ones in the
+                // per-tick budget.
+                if (entry.sentAtMicros == 0
+                    || Elapsed(now, entry.sentAtMicros) < flowStallTimeout_) continue;
+                if (entry.packetSlot != common::collections::SlotPool::INVALID
+                    && resendCount < RESENDS_PER_ASSOC_PER_TICK
+                    && PacingAllows(peer, now, entry.wireSize))
+                {
+                    SpendPacing(peer, entry.wireSize);
+                    resendSeqs[resendCount]    = entry.seq;
+                    resendSlots[resendCount++] = entry.packetSlot;
+                    entry.sentAtMicros = now;
+                }
+                continue;
+            }
+            if (Elapsed(now, entry.sentAtMicros) < rto) continue;
 
-            // RTO fired: a loss on this path either way.
+            // The deadline passed with nothing above this packet
+            // acknowledged, so no evidence exists either way. Send it again to
+            // provoke an answer, and say a probe went out.
+            //
+            // This is NOT a loss and does not touch the budget. A deadline can
+            // only be a guess about a path nobody can see, and the guess is
+            // wrong most often exactly when the path is worst. Reacting to it
+            // as congestion once cost 582 phantom losses in eight seconds on a
+            // link that dropped nothing. What the probe buys is an
+            // acknowledgement, and the acknowledgement is what can actually
+            // say which packets are missing.
             if (mode == FlowMode::UNRELIABLE)
             {
-                ResolveOutEntry(&flow, entry, false, now, delta);   // lost, dropped
+                // Never resent, so there is nothing to probe with and nothing
+                // the application can do about it. Resolve it and move on,
+                // which is also what reports the loss and the epoch it
+                // belongs to.
+                ResolveOutEntry(&flow, entry, false, delta);
             }
             else
             {
-                delta.sawLoss = true;   // reliable: trim the budget, keep it in flight
-
-                // Out of attempts: the remote has stopped answering this flow
-                // entirely. Retrying further only burns budget, so the caller
-                // fails the flow and the app reads it off the handle. This is
-                // the only give-up left now that opening takes no round trip.
-                if (entry.retries >= maxAttempts_)
-                {
-                    exhausted = true;
-                    continue;
-                }
-
+                // The clock gates collection itself. A packet the clock
+                // refuses keeps its state untouched, still overdue, and the
+                // next tick offers it again, so recovery drains at the rate
+                // the path can carry. Unpaced, a burst of losses came back as
+                // a burst of copies at tick speed, re-overflowed the buffer
+                // the trim had just drained, and each wave of copies then
+                // drowned the wave before it.
+                //
+                // sawProbe is only claimed for a packet that was actually
+                // taken, because its consumer reasons about silence after a
+                // probe went out, and a refused probe never did.
                 if (entry.packetSlot != common::collections::SlotPool::INVALID
-                    && resendCount < RESENDS_PER_ASSOC_PER_TICK)
+                    && resendCount < RESENDS_PER_ASSOC_PER_TICK
+                    && PacingAllows(peer, now, entry.wireSize))
                 {
+                    delta.sawProbe = true;
+                    SpendPacing(peer, entry.wireSize);
                     resendSeqs[resendCount]    = entry.seq;
                     resendSlots[resendCount++] = entry.packetSlot;
-                    entry.sentAtMicros = now;   // don't re-fire before next RTO
-                    ++entry.retries;
+                    entry.sentAtMicros = now;   // don't re-fire before next deadline
+                    // Saturating. Nothing bounds this count since the give-up
+                    // moved to a clock, and it is the marker that keeps a
+                    // retransmitted packet out of the round-trip sample. A
+                    // wrap to zero would make one sample-eligible again and
+                    // measure it from its last resend, which forges a round
+                    // trip below the physical path into a minimum that only
+                    // ever falls.
+                    if (entry.freeResend)                 entry.freeResend = false;
+                    else if (entry.retries < UINT8_MAX)   ++entry.retries;
                 }
             }
         }
     }
 
-    void FlowTable::RetransmitPass(uint32_t assocSlot, uint64_t now, CongestionDelta& delta,
+    void FlowTable::RetransmitPass(uint32_t assocSlot, Peer& peer,
+                                   uint64_t now, CongestionDelta& delta,
                                    uint16_t& outFlowId, uint32_t* resendSeqs,
                                    uint32_t* resendSlots, uint32_t& resendCount,
-                                   bool& exhausted) noexcept
+                                   bool& assocDead) noexcept
     {
         OutAssociation* flow = reinterpret_cast<OutAssociation*>(
             outAssocPool_.WriteLock(assocSlot));
@@ -1364,8 +2111,8 @@ namespace bcp::flux
         switch (flow->life)
         {
         case FlowLifecycle::OPEN:
-            RetransmitInflight(*flow, now, delta, resendSeqs, resendSlots, resendCount,
-                               exhausted);
+            RetransmitInflight(*flow, peer, now, delta, resendSeqs, resendSlots, resendCount,
+                               assocDead);
             break;
         default: break;
         }
@@ -1387,6 +2134,20 @@ namespace bcp::flux
         }
         outAssocPool_.UnlockRead(assocSlot);
         return valid;
+    }
+
+
+    bool FlowTable::WouldAdmit(const Peer& peer, uint32_t assocSlot,
+                               uint16_t wireSize) noexcept
+    {
+        const OutAssociation* flow = reinterpret_cast<const OutAssociation*>(
+            outAssocPool_.ReadLock(assocSlot));
+        if (!flow) return false;
+        const bool ok = flow->life == FlowLifecycle::OPEN
+                     && flow->waitingCount == 0
+                     && CanSend(*flow, peer, wireSize, flow->mode != FlowMode::UNRELIABLE);
+        outAssocPool_.UnlockRead(assocSlot);
+        return ok;
     }
 
     // --- The waiting-ring drain ---
@@ -1432,7 +2193,7 @@ namespace bcp::flux
     }
 
     bool FlowTable::ClaimWaiting(const WaitingCandidate& candidate, Peer& peer,
-                                 PacketSlot& packet) noexcept
+                                 PacketSlot& packet, uint64_t now) noexcept
     {
         // A concurrent Update may have drained the head between the peek and
         // this lock, so the current head is re-checked against the very slot
@@ -1449,7 +2210,8 @@ namespace bcp::flux
                 flow->Waiting()[flow->waitingHead & (flow->waitingCap - 1u)];
             const bool windowed = flow->mode != FlowMode::UNRELIABLE;
             if (head.packetSlot == candidate.packetSlot
-                && CanSend(*flow, peer, head.wireSize, windowed))
+                && CanSend(*flow, peer, head.wireSize, windowed)
+                && PacingAllows(peer, now, head.wireSize))
             {
                 const uint16_t wireSize = head.wireSize;
                 head = WaitingEntry{ 0, common::collections::SlotPool::INVALID, 0 };
@@ -1470,28 +2232,56 @@ namespace bcp::flux
 
     // --- Delivery ---
 
-    bool FlowTable::QueueReady(PacketSlotHandle& handle) noexcept
+    bool FlowTable::QueueReady(PacketSlotHandle& handle, uint32_t peerSlot) noexcept
     {
         const uint32_t idx = handle.GetSlotIndex();
         if (idx == common::collections::SlotPool::INVALID) return false;
-        if (!readyQueue_->Push(idx)) return false;   // full: backpressure, caller drops
+
+        // Everything from this peer takes the same lane, and a lane has one
+        // reader, which is what carries the sequence order built above all the
+        // way out to the application.
+        if (!readyLanes_->Push(readyLanes_->LaneOf(peerSlot), idx, peerSlot))
+            return false;   // full: backpressure, caller drops
         (void)handle.Detach();                       // queued; must not release the slot
+        peerRecvStates_[peerSlot].PinOne();
+        heldTotal_->fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
-    uint32_t FlowTable::DeliverIn(uint32_t assocSlot, uint16_t flowId, uint32_t seq,
-                                  PacketSlotHandle& incoming) noexcept
+    uint32_t FlowTable::DeliverIn(uint32_t assocSlot, uint16_t flowId, uint32_t assocEpoch,
+                                  uint32_t seq, PacketSlotHandle& incoming) noexcept
     {
         InAssociation* flow = reinterpret_cast<InAssociation*>(inAssocPool_.WriteLock(assocSlot));
         uint32_t produced = 0;
-        if (flow->life == FlowLifecycle::OPEN && flow->flowId == flowId)
+        // The generation is what separates this association from a later tenant
+        // of the same slot. Without it a packet admitted just before the peer
+        // aged out would commit into whichever peer took the slot next, marking
+        // its bitmap and acking a sequence it never saw.
+        if (flow->epoch == assocEpoch
+            && flow->life == FlowLifecycle::OPEN && flow->flowId == flowId)
         {
-            produced = flow->mode == FlowMode::RELIABLE_ORDERED
+            const uint32_t cursorBefore = flow->recvNext;
+            produced = IsOrdered(flow->mode)
                 ? DeliverOrdered(*flow, incoming, seq)
                 : DeliverUnordered(*flow, incoming, seq);
+            // The cursor moving is the only progress the stall timer counts. A
+            // held or duplicate packet leaves it where it was, so a flow stuck
+            // behind a gap keeps aging toward the jam timeout.
+            if (flow->recvNext != cursorBefore)
+                flow->lastProgressMicros = common::MonotonicMicros();
         }
         inAssocPool_.UnlockWrite(assocSlot);
         return produced;
+    }
+
+    bool FlowTable::HasRoomFor(uint32_t peerSlot) const noexcept
+    {
+        const uint32_t grant = peerRecvStates_[peerSlot].grant.load(
+            std::memory_order_relaxed);
+        if (grant != 0
+            && peerRecvStates_[peerSlot].occupancy.load(std::memory_order_relaxed) >= grant)
+            return false;
+        return heldTotal_->load(std::memory_order_relaxed) < holdCeiling_;
     }
 
     uint32_t FlowTable::DeliverUnordered(InAssociation& flow, PacketSlotHandle& incoming, uint32_t seq) noexcept
@@ -1503,7 +2293,7 @@ namespace bcp::flux
         // and only a fresh ack stops the resend.
         if (AlreadySeen(&flow, seq))
         {
-            ArmAck(&flow);
+            ArmAckForArrival(&flow, seq, false);
             return 0;
         }
         // Unreliable is newest only: a packet older than the newest delivered
@@ -1513,14 +2303,23 @@ namespace bcp::flux
         if (flow.mode == FlowMode::UNRELIABLE && seq <= flow.recvHighest)
         {
             CommitSeen(&flow, seq);
-            ArmAck(&flow);
+            ArmAckForArrival(&flow, seq, true);
             return 0;
         }
+        // No cursor here, so nothing waits behind this packet and refusing it
+        // strands nothing. This is the entry that would otherwise let one peer
+        // fill the pool with traffic nobody is blocked on.
+        if (!HasRoomFor(flow.peerSlot))
+        {
+            ArmAckForArrival(&flow, seq, false);
+            return 0;   // uncommitted and unacked, so the sender resends
+        }
+
         // Commit only if it actually queues (two-step: queued == acked).
-        if (!QueueReady(incoming))
+        if (!QueueReady(incoming, flow.peerSlot))
             return 0;   // ready queue full: uncommitted, unacked -> dropped/resent
         CommitSeen(&flow, seq);
-        ArmAck(&flow);
+        ArmAckForArrival(&flow, seq, true);
         return 1;
     }
 
@@ -1531,25 +2330,44 @@ namespace bcp::flux
         // cannot be flooded.
         if (seq < flow.recvNext)
         {
-            ArmAck(&flow);   // already delivered: re-ack cumulatively
+            // Already delivered, so the sender is resending against an ack it
+            // never got. Answer now rather than making it wait again.
+            flow.ackImmediate = true;
+            ArmAckForArrival(&flow, seq, false);
             return 0;
         }
 
         if (seq == flow.recvNext)
         {
+            // A cursor packet with a run behind it always enters, because
+            // admitting it frees more than it takes and refusing it would wedge
+            // the flow for good. With nothing held it frees nothing, so it is
+            // an ordinary entry and asks like any other.
+            if (flow.heldCount == 0 && !HasRoomFor(flow.peerSlot))
+            {
+                ArmAckForArrival(&flow, seq, false);
+                return 0;
+            }
             // Queue the cursor packet first; only advance and commit if it took
             // (full queue -> leave everything untouched, unacked).
-            if (!QueueReady(incoming))
+            if (!QueueReady(incoming, flow.peerSlot))
                 return 0;
             CommitSeen(&flow, seq);
-            ArmAck(&flow);
+            ArmAckForArrival(&flow, seq, true);
             flow.recvNext = seq + 1;
             if (flow.recvNext == 0) flow.recvNext = 1;
             return 1 + DrainHoldbackRun(flow);
         }
 
         // seq > recvNext: ahead of the cursor.
+        //
+        // A peer at its grant stops being held for. Ejecting rather than
+        // holding is what bounds one remote's share of the shared recv pool,
+        // and it can never stall the flow: the packet at the cursor is
+        // delivered rather than held, so the one packet that would drain this
+        // buffer is never the one refused. Zero grants no limit.
         const bool holdable = flow.reorderCap > 0
+                           && HasRoomFor(flow.peerSlot)
                            && seq < flow.recvNext + flow.reorderCap;
         if (holdable)
         {
@@ -1558,8 +2376,12 @@ namespace bcp::flux
             {
                 slot.seq = seq;
                 slot.packetSlot = incoming.Detach();   // stays in recv pool, leased
+                ++flow.heldCount;
+                peerRecvStates_[flow.peerSlot].PinOne();
+                heldTotal_->fetch_add(1, std::memory_order_relaxed);
                 CommitSeen(&flow, seq);                 // held -> ackable (SACK)
-                ArmAck(&flow);
+                flow.ackImmediate = true;               // out of order: answer now
+                ArmAckForArrival(&flow, seq, true);
             }
             // else already held: duplicate, incoming drops (releases its slot)
             return 0;
@@ -1567,8 +2389,11 @@ namespace bcp::flux
 
         // Out of the reorder window: EJECT. Do NOT commit-seen (so the sender
         // still retransmits) and do NOT hold it (no copy, no pin). Arm the
-        // cumulative ack so the sender learns our recvNext and fills the gap.
-        ArmAck(&flow);
+        // cumulative ack so the sender learns our recvNext and fills the gap,
+        // and answer at once, since that cursor is the only thing that will
+        // stop it sending more it cannot use.
+        flow.ackImmediate = true;
+        ArmAckForArrival(&flow, seq, false);
         return 0;
     }
 
@@ -1585,10 +2410,16 @@ namespace bcp::flux
             if (held.packetSlot == common::collections::SlotPool::INVALID
                 || held.seq != flow.recvNext)
                 break;   // gap: stop draining
-            if (!readyQueue_->Push(held.packetSlot))
+
+            // Hold-back to lane is a move, not a new pin, so the peer's
+            // occupancy is unchanged and nothing is counted here.
+            if (!readyLanes_->Push(readyLanes_->LaneOf(flow.peerSlot),
+                                   held.packetSlot, flow.peerSlot))
                 break;   // queue full: leave the tail held
+
             held.packetSlot = common::collections::SlotPool::INVALID;
             held.seq = 0;
+            if (flow.heldCount > 0) --flow.heldCount;
             ++produced;
             flow.recvNext += 1;
             if (flow.recvNext == 0) flow.recvNext = 1;

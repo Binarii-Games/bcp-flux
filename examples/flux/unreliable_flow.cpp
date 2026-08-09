@@ -43,16 +43,17 @@ static void Tick(flux::Socket& socket)
 
     while (delivered < BURST)
     {
+        socket.Flush();
         socket.Update();
 
-        const uint32_t count = socket.Poll(inbox, 16);
-        for (uint32_t i = 0; i < count; ++i)
+        flux::PollCursor cursor = socket.Poll(inbox, 16);
+        while (cursor.Next())
         {
             // The flow id and sequence number ride the wire header, so an
             // UNRELIABLE packet is still numbered, it just is not resent.
-            const uint16_t flowId = inbox[i].Read()->FlowId();
+            const uint16_t flowId = cursor.Packet().Read()->FlowId();
 
-            flux::PacketSlotReader reader{std::move(inbox[i])};
+            flux::PacketSlotReader& reader = cursor.Message();
             uint32_t seq = 0;
             reader.TakeU32(seq);
 
@@ -96,6 +97,7 @@ int main()
     // accounting and feed congestion control; they never cause a resend.
     while (delivered < BURST)
     {
+        a.Flush();
         a.Update();
         a.Poll(sink, 8);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

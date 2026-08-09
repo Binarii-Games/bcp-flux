@@ -20,7 +20,7 @@ namespace bcp::flux::platform {
         // the single form the rest of the codebase uses (ResolveAddress
         // produces the same mapping on the send side).
         handle_ = ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-        if (handle_ < 0) return common::Error::SocketFailed;
+        if (handle_ < 0) return common::Error::IoFailed;
 
         int optTrue  = 1;
         int optFalse = 0;
@@ -43,7 +43,7 @@ namespace bcp::flux::platform {
         if (flags < 0 || fcntl(handle_, F_SETFL, flags | O_NONBLOCK) < 0)
         {
             Close();
-            return common::Error::SocketFailed;
+            return common::Error::IoFailed;
         }
 
         sockaddr_in6 addr{};
@@ -85,10 +85,67 @@ namespace bcp::flux::platform {
         sendSlotPool_.Shutdown();
     }
 
+    uint32_t PosixSocket::SendBatch(const Outgoing* items, uint32_t count)
+    {
+        if (handle_ < 0 || count == 0) return 0;
+
+#if defined(__linux__)
+        // One trip into the kernel for the whole array. Linux reports how many
+        // it accepted and stops at the first refusal, so the loop below picks
+        // up from there rather than assuming all or nothing.
+        uint32_t done = 0;
+        while (done < count)
+        {
+            constexpr uint32_t MAX_PER_CALL = 64;
+            const uint32_t take = (count - done) < MAX_PER_CALL
+                                ? (count - done) : MAX_PER_CALL;
+
+            mmsghdr msgs[MAX_PER_CALL]{};
+            iovec   iov [MAX_PER_CALL]{};
+            for (uint32_t i = 0; i < take; ++i)
+            {
+                const Outgoing& item = items[done + i];
+                iov[i].iov_base = const_cast<uint8_t*>(item.data);
+                iov[i].iov_len  = item.size;
+                msgs[i].msg_hdr.msg_name    = const_cast<sockaddr_storage*>(item.target);
+                msgs[i].msg_hdr.msg_namelen = item.target->ss_family == AF_INET
+                    ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
+                msgs[i].msg_hdr.msg_iov     = &iov[i];
+                msgs[i].msg_hdr.msg_iovlen  = 1;
+            }
+
+            const int sent = ::sendmmsg(handle_, msgs, take, 0);
+            if (sent <= 0)
+            {
+                common::LogF(common::LogLevel::Error,
+                             "PosixSocket sendmmsg failed: %s (errno %d)",
+                             std::strerror(errno), errno);
+                break;
+            }
+            done += static_cast<uint32_t>(sent);
+            // A short count is the kernel refusing the next one, so stop rather
+            // than spinning on the same datagram.
+            if (static_cast<uint32_t>(sent) < take) break;
+        }
+        return done;
+#else
+        // No sendmmsg here, so this is the loop these platforms already ran.
+        // Same syscalls in the same order, reached through one call.
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (SendTo(*items[i].target, items[i].data, items[i].size)
+                != common::Error::Ok) break;
+            ++done;
+        }
+        return done;
+#endif
+    }
+
     common::Error PosixSocket::SendTo(const sockaddr_storage& dest, const uint8_t* data, uint16_t size)
     {
-        if (handle_ < 0) return common::Error::SocketFailed;
-        if (size > internal::MAX_WIRE_PACKET_SIZE) return common::Error::PacketTooLarge;
+        if (handle_ < 0) return common::Error::IoFailed;
+        if (size > internal::MAX_WIRE_PACKET_SIZE) return common::Error::TooLarge;
 
         // The kernel wants the exact sockaddr size for the family, not
         // sizeof(sockaddr_storage); some stacks reject the padded length.
@@ -114,7 +171,7 @@ namespace bcp::flux::platform {
     common::Result<uint32_t> PosixSocket::ReceiveFrom(PacketSlotHandle* outPackets, uint32_t maxCount)
     {
         if (handle_ < 0)
-            return common::Result<uint32_t>::Fail(common::Error::SocketFailed);
+            return common::Result<uint32_t>::Fail(common::Error::IoFailed);
 
         uint32_t count = 0;
 
@@ -149,15 +206,6 @@ namespace bcp::flux::platform {
         }
 
         return common::Result<uint32_t>::Success(count);
-    }
-
-    void PosixSocket::ReleasePacket(uint8_t** addresses, uint32_t count)
-    {
-        for (uint32_t i = 0; i < count; i++)
-        {
-            const uint32_t idx = GetSlotIndexFromPtr(addresses[i]);
-            recvSlotPool_.Release(idx);
-        }
     }
 
     uint32_t PosixSocket::GetSlotIndexFromPtr(const uint8_t* address)

@@ -8,6 +8,7 @@
 #include <common/result.h>  
 #include <common/log.h>     
 #include <common/platform.h>
+#include <flux/platform.h>
 
 namespace bcp::flux
 {

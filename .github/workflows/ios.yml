@@ -1,0 +1,16 @@
+name: ios build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Cross-compiles everything and runs nothing: there is no device on a runner
+# to execute tests, so this badge attests compilation.
+jobs:
+  arm64:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: macos-latest
+      buildonly: true
+      cmake: -DCMAKE_SYSTEM_NAME=iOS -DBCP_SANITIZE= -DBCP_EXAMPLES=OFF

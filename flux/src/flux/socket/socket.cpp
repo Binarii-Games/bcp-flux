@@ -7,6 +7,8 @@
 #include <flux/socket/platform/posix_socket.h>
 #include <flux/internal/constants.h>
 #include <flux/wire/packet_builder.h>
+#include <flux/crypto/packet_seal.h>
+#include <flux/wire/batch.h>
 #include <flux/socket/packet_slot.h>
 #include <flux/socket/pending_packet.h>
 #include <flux/peer/peer_handle.h>
@@ -23,82 +25,42 @@ namespace bcp::flux
         /** Rounds up to a multiple of 16 so slot payloads stay aligned. */
         constexpr uint32_t AlignUp16(uint32_t n) noexcept { return (n + 15) & ~15u; }
 
-        /** Rebuilds the XChaCha20 nonce locally; the wire carries only the 8-byte
-            counter. The lane byte splits the nonce space between the two sides'
-            independent counters, which share one key. */
-        void ExpandNonce(common::crypto::Nonce& out, uint64_t counter, uint8_t lane) noexcept
+
+
+
+
+
+
+
+
+        /** The challenge cookie as a MAC key, labelled so it cannot collide
+            with any other derivation.
+
+            The cookie travels in the clear, so this key is not secret and the
+            MAC it produces is not authentication: anyone on the path can
+            compute a valid one. What it catches is a corrupted or blindly
+            injected HS_RES, which is the failure that binds a peer to a public
+            key nobody holds. Real proof of identity arrives with the
+            confirmation MAC once a session key exists. */
+        common::crypto::SessionKey CookieKey(uint64_t challenge) noexcept
         {
-            out = {};
-            for (size_t i = 0; i < internal::WIRE_NONCE_SIZE; ++i)
-                out[i] = static_cast<uint8_t>(counter >> (8 * i));
-            out[internal::WIRE_NONCE_SIZE] = lane;
+            static constexpr uint8_t LABEL[8] = {'f','l','u','x','-','h','s',0};
+            common::crypto::SessionKey key{};
+            std::memcpy(key.data(), LABEL, sizeof(LABEL));
+            for (size_t i = 0; i < sizeof(challenge); ++i)
+                key[sizeof(LABEL) + i] = static_cast<uint8_t>(challenge >> (i * 8));
+            return key;
         }
 
-        /** Writes the little-endian 8-byte counter into a packet's nonce field. */
-        void StampNonceCounter(uint8_t* nonceField, uint64_t counter) noexcept
-        {
-            for (size_t i = 0; i < internal::WIRE_NONCE_SIZE; ++i)
-                nonceField[i] = static_cast<uint8_t>(counter >> (8 * i));
-        }
 
-        /** The counter has to travel — the receiver cannot know which packet
-            this is otherwise — but travelling in the clear makes it a serial
-            number, and a sequence that stops at one address and resumes at the
-            next value from another address links a peer across a migration no
-            matter how the tag rotates. So the field carries the counter
-            encrypted under a mask derived from the peer's header key and this
-            packet's AEAD tag: the tag is unique and unpredictable per packet,
-            so the same counter never produces the same bytes twice, and an
-            observer sees eight bytes that never form a sequence.
-            Key-holders both sides recompute it identically; nobody else can.
-
-            Masking is its own inverse, so one function serves both directions.
-
-            @pre `aeadTag` is the packet's final tag: on send that means after
-                 the seal, on receive before the open. */
-        void MaskNonceCounter(uint8_t* nonceField,
-                              const common::crypto::SessionKey& headerKey,
-                              const uint8_t* aeadTag) noexcept
-        {
-            uint8_t mask[common::crypto::KEY_SIZE];
-            common::crypto::DeriveSubKey(mask, headerKey.data(), aeadTag);
-            for (size_t i = 0; i < internal::WIRE_NONCE_SIZE; ++i)
-                nonceField[i] ^= mask[i];
-            common::crypto::Wipe(mask, sizeof(mask));
-        }
-
-        /** Reads the little-endian 8-byte counter out of a nonce field. */
-        uint64_t ReadNonceCounter(const uint8_t* nonceField) noexcept
-        {
-            uint64_t counter = 0;
-            for (size_t i = 0; i < internal::WIRE_NONCE_SIZE; ++i)
-                counter |= static_cast<uint64_t>(nonceField[i]) << (8 * i);
-            return counter;
-        }
-
-        /** Builds the AEAD associated data: the controller byte, plus the 4-byte
-            migration tag on a tagged packet. Both are readable on the wire and
-            neither is alterable.
-
-            @param tag Null on an untagged packet.
-            @return The AAD length. */
-        size_t BuildSecureAad(uint8_t* aad, uint8_t controller, const uint8_t* tag) noexcept
-        {
-            aad[0] = controller;
-            size_t aadLen = internal::WIRE_CONTROLLER_SIZE;
-            if (tag)
-            {
-                std::memcpy(aad + aadLen, tag, internal::WIRE_PEER_TAG_SIZE);
-                aadLen += internal::WIRE_PEER_TAG_SIZE;
-            }
-            return aadLen;
-        }
 
         /** The handshake transcript both sides bind into the session key and the
             confirmation MAC. Role-ordered, so both ends assemble identical bytes. */
         void BuildTranscript(uint8_t out[internal::HS_TRANSCRIPT_SIZE],
                              const common::crypto::PublicKey& initiatorPk,
                              const common::crypto::PublicKey& responderPk,
+                             const common::crypto::PublicKey& initiatorEph,
+                             const common::crypto::PublicKey& responderEph,
                              const uint8_t saltI[internal::WIRE_HS_SALT_SIZE],
                              const uint8_t saltR[internal::WIRE_HS_SALT_SIZE],
                              const uint32_t initiatorCaps,
@@ -110,6 +72,8 @@ namespace bcp::flux
             uint8_t* p = out;
             std::memcpy(p, initiatorPk.data(), initiatorPk.size());         p += initiatorPk.size();
             std::memcpy(p, responderPk.data(), responderPk.size());         p += responderPk.size();
+            std::memcpy(p, initiatorEph.data(), initiatorEph.size());       p += initiatorEph.size();
+            std::memcpy(p, responderEph.data(), responderEph.size());       p += responderEph.size();
             std::memcpy(p, saltI, internal::WIRE_HS_SALT_SIZE);             p += internal::WIRE_HS_SALT_SIZE;
             std::memcpy(p, saltR, internal::WIRE_HS_SALT_SIZE);             p += internal::WIRE_HS_SALT_SIZE;
             p[0] = static_cast<uint8_t>(initiatorCaps >> 0);
@@ -153,12 +117,28 @@ namespace bcp::flux
 
     void Socket::Shutdown() noexcept
     {
-        // Idempotent: the first call marks the socket down and closes the OS
-        // handle; the pools and buffers release through their own destructors.
+        // Idempotent: the first call tears the socket down, later calls and the
+        // destructor's call return here. The caller must ensure no other thread
+        // is in Poll or Update, the same rule the destructor has always had,
+        // since this now frees the pools those paths read.
         if (!initialized_.exchange(false, std::memory_order_acq_rel))
             return;
+
+        // Peers and flows first, while the kernel still owns the recv and send
+        // pools they point at, then the pools this socket owns, then the kernel
+        // itself. Each release nulls its own pointers, so a later Init starts
+        // from clean state rather than leaking the previous allocation.
+        peers_.Shutdown();
+        flows_.Shutdown();
+        transfers_.Shutdown();
+        pendingPool_.Shutdown();
+        readyLanes_.Shutdown();
+        events_.Shutdown();
         if (kernel_)
+        {
             kernel_->Close();
+            kernel_.reset();
+        }
     }
 
     common::Error Socket::Init(const Config& config)
@@ -181,7 +161,18 @@ namespace bcp::flux
 
         // The ready path holds recv-slot indices, so it can never need more
         // entries than there are recv slots.
-        if (!readyQueue_.Init(config.recvSlotCount))
+        // Rounding a lane count up would hand out fewer identities than lanes,
+        // and the leftover lane fills with packets nobody ever pops until the
+        // receive pool is dry and the socket goes quiet. Refuse instead.
+        if (config.pollLanes == 0 || config.pollLanes > ReadyLanes::MAX_LANES
+            || (config.pollLanes & (config.pollLanes - 1)) != 0)
+            return common::Error::InvalidParam;
+
+        // A lane per draining thread, each sized for the whole receive pool.
+        // Sharing one pool's worth between them would let a push fail on a busy
+        // lane while another sat empty, and a push that fails is a packet
+        // dropped after the sender was told it arrived.
+        if (!readyLanes_.Init(config.pollLanes, config.recvSlotCount))
             return common::Error::NotInitialized;
         if (listener_.Init(kernel_.get()) != common::Error::Ok)
             return common::Error::NotInitialized;
@@ -197,6 +188,15 @@ namespace bcp::flux
         if (common::Error error = InitFlows(config); error != common::Error::Ok)
             return error;
         if (common::Error error = InitLiveness(config); error != common::Error::Ok)
+            return error;
+        // Sized from the association pools, so every entity that can exist has
+        // an entry of its own and nothing can be crowded out.
+        if (common::Error error = events_.Init(
+                config.events.hook, config.events.context, config.events.subscribed,
+                config.flows.outCount + config.flows.bulkOutCount,
+                config.flows.inCount + config.flows.bulkInCount,
+                config.maxPeers, readyLanes_.LaneCount());
+            error != common::Error::Ok)
             return error;
 
         migration_            = config.enableMigration;
@@ -239,6 +239,31 @@ namespace bcp::flux
         // One replay block per peer slot: [highWater][bitmap words...]. Rounds up
         // to a multiple of 64 counters, at least one word. All zero: an unproven
         // peer receives nothing, and each establish resets its block.
+        // One entry per peer slot, and the peer pool rounds its capacity up to
+        // a power of two, so the array has to match or a high slot index reads
+        // past the end.
+        peerRecvStates_.reset(new (std::nothrow)
+                             PeerRecvState[common::NextPowerOfTwo(config.maxPeers)]);
+        if (!peerRecvStates_) return common::Error::NotInitialized;
+
+        // Hold-back may fill the receive pool down to the reserve and no
+        // further. A pool at or under the reserve leaves nothing to buffer
+        // with, which is correct rather than a misconfiguration: reception
+        // keeps working and only reordering stops. The derived default is a
+        // fraction, because a socket with a large pool is one expecting many
+        // peers, and headroom has to track arrivals per tick.
+        uint32_t reserve = config.recvReserveSlots;
+        if (reserve == 0)
+        {
+            reserve = config.recvSlotCount / internal::RECV_RESERVE_DIVISOR;
+            if (reserve < internal::RECV_RESERVE_FLOOR)
+                reserve = internal::RECV_RESERVE_FLOOR;
+        }
+        recvHoldCeiling_ = config.recvSlotCount > reserve
+            ? config.recvSlotCount - reserve : 0;
+
+        recvBatch_ = config.recvBatch != 0 ? config.recvBatch : config.recvSlotCount;
+
         replayWords_ = (config.replayWindowBits + 63) / 64;
         if (replayWords_ == 0)
             replayWords_ = 1;
@@ -261,27 +286,52 @@ namespace bcp::flux
         FlowTable::Params params;
         params.flowCount           = f.flowCount;
         params.outCount            = f.outCount;
+    params.bulkOutCount        = f.bulkOutCount;
         params.inCount             = f.inCount;
+        params.bulkInCount         = f.bulkInCount;
         params.maxOutPerPeer       = f.maxOutPerPeer;
         params.maxInPerPeer        = f.maxInPerPeer;
+        recvGrant_                 = f.recvGrant;
         params.maxPeers            = config.maxPeers;
-        params.reorderCount        = f.reorderCount;
         params.stagingCount        = f.stagingCount;
         params.reliableWait        = f.reliableWaitCount;
         params.unreliableWait      = f.unreliableWaitCount;
         params.ackDelayMicros      = config.timers.ackDelayMicros;
         params.retryIntervalMicros = config.timers.retryIntervalMicros;
-        params.maxAttempts         = config.timers.maxAttempts;
+        params.flowStallTimeoutMicros = config.liveness.flowStallTimeoutMicros;
 
-        if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyQueue_);
+        if (common::Error error = flows_.Init(params, recvPool_, sendPool_, &readyLanes_,
+                                             peerRecvStates_.get(),
+                                             &heldTotal_, recvHoldCeiling_);
             error != common::Error::Ok)
             return error;
+
+        {
+            TransferTable::Params transferParams;
+            transferParams.outCount         = f.transferOutCount;
+            transferParams.inCount          = f.transferInCount;
+            transferParams.maxPeers         = config.maxPeers;
+            transferParams.maxTransferBytes = f.maxTransferBytes;
+            if (common::Error error = transfers_.Init(transferParams);
+                error != common::Error::Ok)
+                return error;
+        }
 
         // Floored at one full wire packet: the budget gates sends, and a floor
         // no packet fits under would refuse a full-size packet forever;
         // "throttled, never strangled" requires the floor to admit one.
         minCongestionBudget_ = f.minCongestionBudget != 0
             ? f.minCongestionBudget : internal::CC_MIN_BUDGET_DEFAULT;
+        {
+            // No budget larger than every flow window on this peer full at
+            // once can ever bind a send, it can only store a burst.
+            const uint64_t ceiling = static_cast<uint64_t>(config.flows.maxOutPerPeer)
+                                   * internal::FLOW_WINDOW_BULK
+                                   * internal::MAX_WIRE_PACKET_SIZE;
+            maxCongestionBudget_ = ceiling == 0 ? internal::CC_INITIAL_WINDOW_BYTES
+                                 : ceiling > UINT32_MAX ? UINT32_MAX
+                                 : static_cast<uint32_t>(ceiling);
+        }
         if (minCongestionBudget_ < internal::MAX_WIRE_PACKET_SIZE)
             minCongestionBudget_ = internal::MAX_WIRE_PACKET_SIZE;
         return common::Error::Ok;
@@ -299,14 +349,18 @@ namespace bcp::flux
             return common::Error::InvalidParam;
         seenGrainStamp_ = static_cast<uint32_t>(grainStamp);
 
-        if (config.liveness.idleTimeoutMicros != 0)
-        {
-            const uint64_t idleStamp =
-                (config.liveness.idleTimeoutMicros >> internal::SEEN_STAMP_SHIFT) + seenGrainStamp_;
-            if (idleStamp == 0 || idleStamp >= (1ull << 31))
-                return common::Error::InvalidParam;
-            evictAfterStamp_ = static_cast<uint32_t>(idleStamp);
-        }
+        // Idle eviction is mandatory, so zero takes the default rather than
+        // switching it off. A live peer refreshes the clock on every packet it
+        // sends, so only a silent one ages out, and reclaiming it is what lets a
+        // restarted process take its slot back.
+        const uint64_t idleMicros = config.liveness.idleTimeoutMicros != 0
+            ? config.liveness.idleTimeoutMicros : internal::PEER_IDLE_TIMEOUT_DEFAULT;
+        const uint64_t idleStamp =
+            (idleMicros >> internal::SEEN_STAMP_SHIFT) + seenGrainStamp_;
+        if (idleStamp == 0 || idleStamp >= (1ull << 31))
+            return common::Error::InvalidParam;
+        evictAfterStamp_   = static_cast<uint32_t>(idleStamp);
+        idleTimeoutMicros_ = idleMicros;
 
         acceptUnsecureFromUnknown_ = config.liveness.acceptUnsecureFromUnknown;
         return common::Error::Ok;
@@ -368,12 +422,35 @@ namespace bcp::flux
 
     void Socket::DeriveSessionInto(common::crypto::SessionKey& out,
                                     const common::crypto::PublicKey& theirPk,
+                                    const common::crypto::SecretKey& myEphSk,
+                                    const common::crypto::PublicKey& theirEphPk,
                                     const uint8_t* transcript, size_t transcriptLen) noexcept
     {
-        common::crypto::SharedSecret shared;
-        common::crypto::ComputeSharedSecret(shared, secretKey_, theirPk);
-        common::crypto::DeriveSessionKey(out, shared, transcript, transcriptLen);
-        common::crypto::Wipe(shared.data(), shared.size());
+        // Two exchanges, both required. The ephemeral pair is what makes the
+        // session unrecoverable afterwards, since neither secret half outlives
+        // this function on either side. The long-lived pair is what makes it
+        // authenticated, since only the holder of that key can arrive at the
+        // same answer, which is what the confirmation MAC then proves. Either
+        // one alone loses the other property.
+        //
+        // One KDF pass over both. The long-lived secret keys the hash and the
+        // ephemeral one leads the context, which keeps the derivation to a
+        // single call and leaves the vendored crypto floor untouched.
+        common::crypto::SharedSecret staticShared;
+        common::crypto::SharedSecret ephShared;
+        common::crypto::ComputeSharedSecret(staticShared, secretKey_, theirPk);
+        common::crypto::ComputeSharedSecret(ephShared, myEphSk, theirEphPk);
+
+        uint8_t context[common::crypto::SHARED_SIZE + internal::HS_TRANSCRIPT_SIZE];
+        std::memcpy(context, ephShared.data(), ephShared.size());
+        std::memcpy(context + ephShared.size(), transcript, transcriptLen);
+
+        common::crypto::DeriveSessionKey(out, staticShared, context,
+                                         ephShared.size() + transcriptLen);
+
+        common::crypto::Wipe(context, sizeof(context));
+        common::crypto::Wipe(ephShared.data(), ephShared.size());
+        common::crypto::Wipe(staticShared.data(), staticShared.size());
     }
 
     PeerSendMaterials Socket::GatherSendMaterials(Peer& peer) noexcept
@@ -383,90 +460,13 @@ namespace bcp::flux
         PeerSendMaterials materials;
         materials.key       = peer.session;
         materials.headerKey = peer.headerKey;
+        materials.macKey    = peer.macKey;
         materials.counter   = ++peer.sendCounter;
         materials.lane      = LaneTo(peer.theirPk);
         materials.tag       = peer.myTag;
         return materials;
     }
 
-    void Socket::SealSecurePacket(PacketSlot& dst, const uint8_t* plaintext,
-                                   size_t headerSize, size_t bodyLen,
-                                   const PeerSendMaterials& materials, bool tagged) noexcept
-    {
-        // On a tagged packet the migration tag goes into the authenticated
-        // header (and the AAD). `dst.data[0]` (controller) is already set; for a
-        // retransmit the caller has copied the header from staging, for in-place
-        // `plaintext` points into `dst` itself.
-        uint8_t aad[internal::WIRE_CONTROLLER_SIZE + internal::WIRE_PEER_TAG_SIZE];
-        const uint8_t* tagBytes = nullptr;
-        if (tagged)
-        {
-            uint8_t* tagField = dst.data + internal::MIN_SECURE_WIRE_SIZE;
-            std::memcpy(tagField, materials.tag.data(), materials.tag.size());
-            tagBytes = materials.tag.data();
-        }
-        const size_t aadLen = BuildSecureAad(aad, dst.data[0], tagBytes);
-
-        uint8_t* nonceField = dst.data + internal::WIRE_CONTROLLER_SIZE + internal::WIRE_TAG_SIZE;
-        StampNonceCounter(nonceField, materials.counter);
-
-        common::crypto::Nonce nonce;
-        ExpandNonce(nonce, materials.counter, materials.lane);
-
-        common::crypto::Tag aeadTag;
-        common::crypto::Encrypt(dst.data + headerSize, aeadTag, materials.key, nonce,
-                                plaintext, bodyLen, aad, aadLen);
-        std::memcpy(dst.data + internal::WIRE_CONTROLLER_SIZE, aeadTag.data(), aeadTag.size());
-
-        // Last, because the mask comes from the tag the seal just produced. The
-        // nonce was built from the real counter above; only the wire copy is
-        // masked, so the AEAD is unaffected.
-        MaskNonceCounter(nonceField, materials.headerKey, aeadTag.data());
-    }
-
-    bool Socket::OpenSecurePacket(PacketSlot& packet,
-                                   const common::crypto::SessionKey& key,
-                                   const common::crypto::SessionKey& headerKey,
-                                   uint8_t senderLane,
-                                   uint64_t& outCounter) noexcept
-    {
-        const bool tagged = packet.IsTagged();
-        const size_t headerSize = tagged
-            ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-            : internal::MIN_SECURE_WIRE_SIZE;
-        if (packet.dataSize < headerSize)
-            return false;
-
-        common::crypto::Tag tag;
-        std::memcpy(tag.data(), packet.data + internal::WIRE_CONTROLLER_SIZE, tag.size());
-
-        // Unmask into a local, never back into the header: a wrong key here is
-        // routine (the migration path tries every candidate against the same
-        // packet), and a header mutated by a failed attempt would poison the
-        // next one.
-        uint8_t nonceField[internal::WIRE_NONCE_SIZE];
-        std::memcpy(nonceField,
-                    packet.data + internal::WIRE_CONTROLLER_SIZE + internal::WIRE_TAG_SIZE,
-                    sizeof(nonceField));
-        MaskNonceCounter(nonceField, headerKey, tag.data());
-        const uint64_t counter = ReadNonceCounter(nonceField);
-
-        common::crypto::Nonce nonce;
-        ExpandNonce(nonce, counter, senderLane);
-
-        uint8_t aad[internal::WIRE_CONTROLLER_SIZE + internal::WIRE_PEER_TAG_SIZE];
-        const size_t aadLen = BuildSecureAad(
-            aad, packet.data[0],
-            tagged ? packet.data + internal::MIN_SECURE_WIRE_SIZE : nullptr);
-
-        uint8_t* body = packet.data + headerSize;
-        const size_t bodyLen = packet.dataSize - headerSize;
-        if (!common::crypto::Decrypt(body, key, nonce, body, bodyLen, tag, aad, aadLen))
-            return false;
-
-        outCounter = counter;
-        return true;
-    }
 
     // --- Send path ---
 
@@ -480,6 +480,11 @@ namespace bcp::flux
     common::Result<PacketSlotWriter> Socket::AcquireKernelWriter()
     {
         return kernel_->Write();
+    }
+
+    bool Socket::FlowModeOf(const FlowHandle& flow, FlowMode& outMode) noexcept
+    {
+        return flows_.ModeOf(flow, outMode);
     }
 
     common::Result<PacketSlotWriter> Socket::AcquireFlowWriter(const FlowHandle& flow)
@@ -498,6 +503,276 @@ namespace bcp::flux
             return kernel_->Write();
 
         return flows_.AcquireStagingWriter();
+    }
+
+    bool Socket::OfferToBatch(PacketSlotHandle& pHandle, bool requireAuth,
+                              common::Error& status)
+    {
+        if (!initialized_.load(std::memory_order_acquire) || !flows_.SendEnabled())
+            return false;
+
+        const PacketSlot* packet = pHandle.Read();
+        if (!packet || !packet->HasFlow() || packet->IsInternal() || !packet->IsSecure())
+            return false;
+
+        const uint8_t  flowData = packet->FlowData();
+        const uint16_t flowId   = packet->FlowId();
+        const Address  to       = packet->address;
+
+        // A message the caller framed itself as part of a larger one keeps its
+        // own packet. The framing bits live on the packet and describe its first
+        // and last message, so several hand-framed pieces sharing one could not
+        // each say what they are. Batching is for whole messages.
+        //
+        // It still must not overtake what is already waiting. Sequence numbers
+        // are handed out when a packet is admitted, so a message that went
+        // straight out while a batch sat open would take the lower number and
+        // arrive first, reordering a flow the caller sent in order. Emptying the
+        // batch first is what keeps send order and wire order the same.
+        const bool handFramed = (flowData & (FLOW_PART_MORE | FLOW_PART_CONT)) != 0;
+        if (handFramed)
+        {
+            if (FlushFlowOf(to, flowId)) return false;   // nothing ahead of it, send it now
+            status = common::Error::TooManyPending;      // still queued ahead: ask again
+            return true;
+        }
+
+        // Under the peer borrow only long enough to find the association. The
+        // append takes the flow lock after this closes, which keeps the order
+        // packet then peer then flow.
+        uint32_t assocSlot   = common::collections::SlotPool::INVALID;
+        bool     gateRefused = false;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(to);
+            if (peerHandle.Failed()) return false;
+            const Peer* peer = peerHandle.Read();
+            if (!peer || !peer->IsValid()) return false;   // handshaking: the ordinary path parks it
+            if (requireAuth && !peer->authenticated) return false;   // and reports it
+            assocSlot = flows_.FindOutAssoc(peerHandle.GetSlotIndex(), flowId);
+
+            // The gate has to answer the caller, not the flush. A batched send
+            // returns Ok the moment it is packed, so if this flow could not
+            // admit another packet the message must go the ordinary way and let
+            // the caller see the refusal, exactly as it did before batching.
+            if (assocSlot != common::collections::SlotPool::INVALID
+             && !flows_.WouldAdmit(*peer, assocSlot, packet->dataSize))
+                gateRefused = true;
+        }
+
+        // Emptied before the ordinary path runs, for the same reason as a
+        // hand-framed message: whatever is already batched was sent first and
+        // must take the lower sequence.
+        if (gateRefused)
+        {
+            if (FlushFlowOf(to, flowId)) return false;
+            status = common::Error::TooManyPending;
+            return true;
+        }
+        if (assocSlot == common::collections::SlotPool::INVALID)
+            return false;   // first send on this flow: the ordinary path creates the association
+
+
+        FlowTable::BatchAdmit admitted =
+            flows_.AppendToBatch(assocSlot, *packet, internal::MAX_WIRE_PACKET_SIZE);
+
+        if (admitted == FlowTable::BatchAdmit::Sealed)
+        {
+            // Full. Send what is there, then this message opens the next batch.
+            status = FlushOneBatch(to, assocSlot);
+            if (status != common::Error::Ok) return true;
+            admitted = flows_.AppendToBatch(assocSlot, *packet, internal::MAX_WIRE_PACKET_SIZE);
+        }
+
+        if (admitted != FlowTable::BatchAdmit::Appended)
+        {
+            // A flush is carrying this batch, so the message cannot join it and
+            // cannot go around it either: the batch has not been given its
+            // sequence yet, and anything sent now would take a lower one and
+            // arrive first. Refused instead, which is the answer the caller
+            // already handles, and the flush it is waiting on is in progress.
+            status = common::Error::TooManyPending;
+            return true;
+        }
+
+        status = common::Error::Ok;
+        return true;
+    }
+
+    bool Socket::FlushFlowOf(const Address& to, uint16_t flowId)
+    {
+        uint32_t assocSlot = common::collections::SlotPool::INVALID;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(to);
+            if (peerHandle.Failed() || !peerHandle.Read()) return true;
+            assocSlot = flows_.FindOutAssoc(peerHandle.GetSlotIndex(), flowId);
+        }
+        if (assocSlot == common::collections::SlotPool::INVALID) return true;
+
+        (void)FlushOneBatch(to, assocSlot);
+
+        // Emptied is the only answer that lets the caller go around the batch.
+        // Another thread's flush may hold it, or the gate may have refused it,
+        // and in both cases something is still queued ahead of the caller.
+        FlowMode mode = FlowMode::RELIABLE_ORDERED;
+        return !flows_.PeekBatch(assocSlot, mode);
+    }
+
+    Socket::SealedBatch Socket::SealOneBatch(const Address& to, uint32_t assocSlot,
+                                             common::Error& status)
+    {
+        status = common::Error::Ok;
+
+        // The slot comes first, then the batch. Taking the batch empties it, so
+        // a dry pool after that point would throw away messages the caller was
+        // told had been accepted. This way a dry pool simply leaves the batch
+        // where it is, to go out on the next flush.
+        FlowMode mode = FlowMode::RELIABLE_ORDERED;
+        if (!flows_.PeekBatch(assocSlot, mode)) return {};
+
+        // A reliable batch is its own retransmit source and must outlive the
+        // send, so it goes to staging. An unreliable one is gone once on the
+        // wire and takes an ordinary kernel slot. Acquired with no peer lock
+        // held, since a slot lock is taken before a peer lock, never after.
+        common::Result<PacketSlotWriter> out = mode == FlowMode::UNRELIABLE
+            ? kernel_->Write() : flows_.AcquireStagingWriter();
+        if (out.isErr()) { status = out.error; return {}; }   // batch untouched
+
+        PacketSlotHandle handle = std::move(out.Take()).ExtractHandle();
+        PacketSlot* slot = handle.Write();
+        if (!slot) { status = common::Error::InvalidState; return {}; }
+
+        // Gather under the borrow, seal after it closes.
+        FlowMode taken = mode;
+        uint16_t size  = 0;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(to);
+            if (peerHandle.Failed() || !peerHandle.Read()) return {};
+            size = flows_.TakeBatch(assocSlot, slot->data,
+                                    internal::MAX_WIRE_PACKET_SIZE, taken);
+        }
+        if (size == 0) return {};   // nothing taken, so nothing to finish
+
+        // Past here the batch is in flight and MUST be finished on every path
+        // out, or it stays that way and the flow refuses every later append and
+        // every later flush.
+        if (taken != mode)
+        {
+            // Recycled under us, so the slot came from the wrong pool. Give the
+            // batch back rather than send it to the wrong place.
+            flows_.FinishBatch(assocSlot, size, false);
+            status = common::Error::InvalidState;
+            return {};
+        }
+
+        slot->dataSize = size;
+        slot->address  = to;
+
+        // SealForSend, not Send: this came out of a batch and offering it back
+        // to the one it came from would loop.
+        SealedBatch sealed;
+        sealed.packet    = sender_.SealForSend(std::move(handle), status);
+        sealed.assocSlot = assocSlot;
+        sealed.size      = size;
+
+        // No packet back means the gate consumed it, parked behind a handshake
+        // when the status is Ok and refused otherwise. It will never reach
+        // SendSealed, so the batch is settled here instead.
+        if (!sealed.packet.Read())
+        {
+            flows_.FinishBatch(assocSlot, size, status == common::Error::Ok);
+            return {};
+        }
+        return sealed;
+    }
+
+    uint32_t Socket::SendSealed(SealedBatch* sealed, uint32_t count)
+    {
+        if (count == 0) return 0;
+
+        ISocketKernel::Outgoing wire[MAX_FLUSH_PER_PEER];
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const PacketSlot* packet = sealed[i].packet.Read();
+            assert(packet && "a sealed batch holds its wire slot until here");
+            wire[i].target = &packet->address.addr;
+            wire[i].data   = packet->data;
+            wire[i].size   = packet->dataSize;
+        }
+
+        // One call, so a backend that can put several datagrams out per syscall
+        // does. What it reports back is a count from the first, not a mask.
+        const uint32_t sent = kernel_->SendBatch(wire, count);
+
+        // Only now is a batch spent. A refusal means nothing of it reached the
+        // wire, so it stays in place for a later flush rather than discarding
+        // messages the caller was told had been accepted. Either way the flush
+        // is over, and saying so is what stops one refusal wedging the flow.
+        for (uint32_t i = 0; i < count; ++i)
+            flows_.FinishBatch(sealed[i].assocSlot, sealed[i].size, i < sent);
+
+        return sent;
+    }
+
+    common::Error Socket::FlushOneBatch(const Address& to, uint32_t assocSlot)
+    {
+        common::Error status = common::Error::Ok;
+        SealedBatch sealed = SealOneBatch(to, assocSlot, status);
+        if (!sealed.packet.Read()) return status;
+
+        return SendSealed(&sealed, 1) == 1 ? common::Error::Ok
+                                           : common::Error::IoFailed;
+    }
+
+    void Socket::Flush()
+    {
+        if (!initialized_.load(std::memory_order_acquire) || !flows_.SendEnabled())
+            return;
+
+        uint32_t cursor = 0;
+        for (;;)
+        {
+            Address batch[32];
+            const uint32_t count = peers_.CollectAddresses(cursor, batch, 32);
+            if (count == 0) break;
+
+            for (uint32_t b = 0; b < count; ++b)
+            {
+                // One borrow per peer, not one per flow. Which associations are
+                // holding anything is decided here under that single borrow,
+                // and only those are sealed afterwards with nothing held. A
+                // flush on a socket with nothing waiting costs a peer read and
+                // a handful of association reads, which matters because this is
+                // called every time round the caller's loop.
+                uint32_t holding[MAX_FLUSH_PER_PEER];
+                uint32_t holdingCount = 0;
+                {
+                    PeerHandle peerHandle = peers_.GetPeer(batch[b]);
+                    if (peerHandle.Failed() || !peerHandle.Read()) continue;
+                    const uint32_t peerSlot = peerHandle.GetSlotIndex();
+                    for (uint32_t i = 0; i < flows_.MaxOutPerPeer()
+                                      && holdingCount < MAX_FLUSH_PER_PEER; ++i)
+                    {
+                        const uint32_t assocSlot = flows_.OutAssocAt(peerSlot, i);
+                        if (assocSlot == common::collections::SlotPool::INVALID) continue;
+                        FlowMode mode = FlowMode::RELIABLE_ORDERED;
+                        if (flows_.PeekBatch(assocSlot, mode)) holding[holdingCount++] = assocSlot;
+                    }
+                }
+
+                // Seal them all, then hand the peer's whole round to the kernel
+                // at once. They go to one address, which is the case sendmmsg
+                // and its equivalents are for.
+                SealedBatch sealed[MAX_FLUSH_PER_PEER];
+                uint32_t ready = 0;
+                for (uint32_t k = 0; k < holdingCount; ++k)
+                {
+                    common::Error status = common::Error::Ok;
+                    SealedBatch one = SealOneBatch(batch[b], holding[k], status);
+                    if (one.packet.Read()) sealed[ready++] = std::move(one);
+                }
+                (void)SendSealed(sealed, ready);
+            }
+        }
     }
 
     PacketSlotHandle Socket::PreProcessOut(PacketSlotHandle pHandle, common::Error& status,
@@ -574,11 +849,11 @@ namespace bcp::flux
                 }
 
                 const uint16_t minSize = packet->IsTagged()
-                    ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-                    : internal::MIN_SECURE_WIRE_SIZE;
+                    ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+                    : internal::WIRE_SECURE_HEAD_SIZE;
                 if (packet->dataSize < minSize)
                 {
-                    status = common::Error::InvalidHeader;
+                    status = common::Error::Malformed;
                     return PacketSlotHandle::Invalid();
                 }
 
@@ -612,7 +887,8 @@ namespace bcp::flux
                     // packet that never flies never burns a nonce counter.
                     const SendAdmission admission = flows_.AdmitOut(
                         *peer, peerHandle.GetSlotIndex(), *writable,
-                        pHandle.GetSlotIndex(), writable->dataSize, sessionUp);
+                        pHandle.GetSlotIndex(), writable->dataSize, sessionUp,
+                        common::MonotonicMicros());
                     switch (admission)
                     {
                     case SendAdmission::Sent:
@@ -668,27 +944,38 @@ namespace bcp::flux
 
             const bool tagged = writable->IsTagged();
             const size_t headerSize = tagged
-                ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-                : internal::MIN_SECURE_WIRE_SIZE;
+                ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+                : internal::WIRE_SECURE_HEAD_SIZE;
             const size_t bodyLen = writable->dataSize - headerSize;
 
             // A reliable body is its own retransmit source: the ciphertext goes
             // to the wire slot and the plaintext slot stays leased, held by the
             // ring until the seq resolves. Everything else seals in place.
+            const bool macOnly = writable->IsMacOnly();
+
             if (keepsBodyForResend)
             {
                 wirePacket->address  = writable->address;
                 wirePacket->dataSize = writable->dataSize;
-                std::memcpy(wirePacket->data, writable->data, headerSize);
-                SealSecurePacket(*wirePacket, writable->data + headerSize, headerSize,
-                                 bodyLen, materials, tagged);
+                // MAC-only covers the whole datagram, so the copy is the whole
+                // datagram rather than just the header the seal would rewrite.
+                std::memcpy(wirePacket->data, writable->data,
+                            macOnly ? writable->dataSize : headerSize);
+                if (macOnly)
+                    SealMacOnlyPacket(*wirePacket, headerSize, bodyLen, materials, tagged);
+                else
+                    SealSecurePacket(*wirePacket, writable->data + headerSize, headerSize,
+                                     bodyLen, materials, tagged);
                 common::crypto::Wipe(materials.key.data(), materials.key.size());
                 (void)pHandle.Detach();   // the ring owns the staging slot now
                 return wireHandle;
             }
 
-            SealSecurePacket(*writable, writable->data + headerSize, headerSize,
-                             bodyLen, materials, tagged);
+            if (macOnly)
+                SealMacOnlyPacket(*writable, headerSize, bodyLen, materials, tagged);
+            else
+                SealSecurePacket(*writable, writable->data + headerSize, headerSize,
+                                 bodyLen, materials, tagged);
             common::crypto::Wipe(materials.key.data(), materials.key.size());
             return pHandle;
         }
@@ -708,43 +995,52 @@ namespace bcp::flux
         // either produced the peer or returned an error.
         if (peers_.GetPeer(address).Failed())
         {
-            status = common::Error::PeerNotFound;
+            status = common::Error::NotFound;
             return PacketSlotHandle::Invalid();
         }
         return PreProcessOut(std::move(pHandle), status, requireAuth);
     }
 
-    void Socket::SealStagingToWire(const Address& to, const PacketSlot& staging,
+    bool Socket::SealStagingToWire(const Address& to, const PacketSlot& staging,
                                     const PeerSendMaterials& materials)
     {
         const bool tagged = staging.IsTagged();
         const size_t headerSize = tagged
-            ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-            : internal::MIN_SECURE_WIRE_SIZE;
+            ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+            : internal::WIRE_SECURE_HEAD_SIZE;
         if (staging.dataSize < headerSize
             || staging.dataSize > internal::MAX_WIRE_PACKET_SIZE)
-            return;
+            return false;
 
         common::Result<PacketSlotWriter> out = kernel_->Write();
-        if (out.isErr()) return;
+        if (out.isErr()) return false;   // send pool dry: nothing went anywhere
         PacketSlotHandle wireHandle = std::move(out.Take()).ExtractHandle();
         PacketSlot* wire = wireHandle.Write();
-        if (!wire) return;
+        if (!wire) return false;
 
         // Fresh nonce, current tag, current address `to`; the body's seq is
         // whatever the caller left there. The caller's lock on the staging
         // slot keeps the bytes stable across the copy and seal.
         wire->address  = to;
         wire->dataSize = staging.dataSize;
-        std::memcpy(wire->data, staging.data, headerSize);
         const size_t bodyLen = staging.dataSize - headerSize;
-        SealSecurePacket(*wire, staging.data + headerSize, headerSize, bodyLen,
-                         materials, tagged);
+        if (staging.IsMacOnly())
+        {
+            std::memcpy(wire->data, staging.data, staging.dataSize);
+            SealMacOnlyPacket(*wire, headerSize, bodyLen, materials, tagged);
+        }
+        else
+        {
+            std::memcpy(wire->data, staging.data, headerSize);
+            SealSecurePacket(*wire, staging.data + headerSize, headerSize, bodyLen,
+                             materials, tagged);
+        }
 
-        (void)kernel_->SendTo(wire->address.addr, wire->data, wire->dataSize);
+        return kernel_->SendTo(wire->address.addr, wire->data, wire->dataSize)
+               == common::Error::Ok;
     }
 
-    void Socket::ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
+    bool Socket::ResendStaging(const Address& to, uint32_t flowSlot, uint32_t stagingSlot,
                                 uint32_t expectedSeq, const PeerSendMaterials& materials)
     {
         // The staging slot travels as a bare index; touchable only through a
@@ -752,13 +1048,18 @@ namespace bcp::flux
         // exit. Handle read-lock first, THEN flow (staging->peer->flow order).
         PacketSlotHandle stagingHandle{stagingSlot, flows_.StagingPool()};
         const PacketSlot* staging = stagingHandle.Read();
-        if (!staging) return;
+        if (!staging) return false;
 
         // Validate the ring still owns this slot at this seq: a concurrent ack
         // may have resolved it (and recycled the slot) since the caller scanned.
+        // A seq the ring no longer owns was resolved while this pass ran. That
+        // is not a failed attempt, and the entry it would refund no longer
+        // exists, so it reports sent.
+        bool sent = true;
         if (flows_.ResendStillValid(flowSlot, expectedSeq, stagingSlot))
-            SealStagingToWire(to, *staging, materials);
+            sent = SealStagingToWire(to, *staging, materials);
         (void)stagingHandle.Detach();   // the ring keeps the lease
+        return sent;
     }
 
     void Socket::SendSecureControl(const Address& to, const PeerSendMaterials& materials,
@@ -780,7 +1081,7 @@ namespace bcp::flux
         PacketSlot* packet = handle.Write();
         if (!packet) return;
 
-        constexpr size_t headerSize = internal::MIN_SECURE_WIRE_SIZE
+        constexpr size_t headerSize = internal::WIRE_SECURE_HEAD_SIZE
                                     + internal::WIRE_PEER_TAG_SIZE;
         const size_t bodyLen = packet->dataSize - headerSize;
         SealSecurePacket(*packet, packet->data + headerSize, headerSize, bodyLen,
@@ -793,26 +1094,31 @@ namespace bcp::flux
 
 // --- Receive path ---
 
-    uint32_t Socket::Poll(PacketSlotHandle* outPackets, size_t max)
+    void Socket::ReceiveIntoPool()
     {
-        // Per-Poll-pass migration budget on this thread's stack. Under the
-        // fully-concurrent contract several threads may Poll at once, so the
-        // budget must not be a shared member; the immutable per-socket ceiling
-        // seeds a fresh local each pass.
-        if (!initialized_.load(std::memory_order_relaxed))
-            return 0;
-
+        // Per-pass migration budget on this thread's stack. Several threads may
+        // drive the socket at once, so the budget must not be a shared member.
+        // The immutable per-socket ceiling seeds a fresh local each pass.
         uint32_t migrateBudget = migrateBudgetPerPoll_;
 
-        // Pass 1: pull from the kernel and decrypt in place, consume handshake
-        // and secure-control traffic, and push every committed app packet onto
-        // the ready queue. Nothing is written to the caller's array here; each
-        // input slot is consumed (queued, held, or dropped), so pass 2 can reuse
-        // the whole array with no aliasing.
-        uint32_t count = listener_.Poll(outPackets, max);
+        // Pull from the kernel and decrypt in place, consume handshake and
+        // secure-control traffic, and push every committed app packet onto the
+        // ready queue for Poll to hand over. Every slot taken here is consumed:
+        // queued, held, or dropped.
+        //
+        // Bounded by the batch rather than by anything a caller asked for,
+        // because emptying the OS buffer is the point. What can actually be
+        // taken is bounded by the free recv slots regardless, and a peer's share
+        // of those is bounded by its grant.
+        PacketSlotHandle inbox[internal::RECV_CHUNK];
+        for (uint32_t taken = 0; taken < recvBatch_; )
+        {
+        const uint32_t count = listener_.Poll(inbox, internal::RECV_CHUNK);
+        if (count == 0) break;   // socket empty, nothing left to take this tick
+        taken += count;
         for (size_t scan = 0; scan < count; ++scan)
         {
-            const PacketSlot* packet = outPackets[scan].Read();
+            const PacketSlot* packet = inbox[scan].Read();
             if (!packet) continue;   // failed handle, drop
 
             if (packet->IsInternal())
@@ -821,19 +1127,19 @@ namespace bcp::flux
                 // claiming to be secure is forged or corrupt. Secure control
                 // hides in the encrypted channel byte, not this bit.
                 if (packet->IsSecure()) continue;
-                ProcessInternal(std::move(outPackets[scan]));
+                ProcessInternal(std::move(inbox[scan]));
                 continue;
             }
 
             // Authenticate and decrypt in place; drop on any failure.
-            if (!PreProcessIn(outPackets[scan], migrateBudget))
+            if (!PreProcessIn(inbox[scan], migrateBudget))
                 continue;
 
             // The plaintext now reveals data vs. control; control is consumed
             // here, never delivered.
             if (packet->SecureChannel() != internal::SECURE_CHANNEL_APP)
             {
-                ProcessSecureControl(std::move(outPackets[scan]));
+                ProcessSecureControl(std::move(inbox[scan]));
                 continue;
             }
 
@@ -841,26 +1147,79 @@ namespace bcp::flux
             // packets are the unreliable baseline: queue on arrival. A full
             // queue leaves the packet uncommitted (unacked) and it drops.
             if (packet->HasFlow())
-                (void)ProcessFlowIn(std::move(outPackets[scan]));
+                (void)ProcessFlowIn(std::move(inbox[scan]));
             else
-                (void)QueueReady(outPackets[scan]);
+                (void)QueueReady(inbox[scan]);
         }
+        }
+    }
 
-        // Pass 2: drain the ready queue into the caller's array, up to max. A
-        // packet's slot stayed leased in the recv pool while queued; rebuild a
-        // handle over it. Leftovers stay queued for the next Poll. Delivered
+    void Socket::RecordPeerEvent(Peer& peer, uint32_t peerSlot, SocketEvent what) noexcept
+    {
+        // The caller holds this peer's write lock, so the flag is set through
+        // the peer it already has. Asking the table for the lock again would be
+        // the re-acquire that self-deadlocks.
+        if (events_.Record(EventScope::PEER, peerSlot, readyLanes_.LaneOf(peerSlot),
+                           what, peer.addr, internal::INVALID_FLOW_ID))
+            peer.emitting = true;
+    }
+
+    void Socket::OnEventDelivered(void* context, EventScope scope, uint32_t slot) noexcept
+    {
+        // The slot may have been torn down while its event waited, in which
+        // case the teardown left the lease alone for this moment.
+        Socket& socket = *static_cast<Socket*>(context);
+        if (scope == EventScope::PEER) socket.peers_.ClearEmitting(slot);
+        else                           socket.flows_.ClearEmitting(scope, slot);
+    }
+
+    PollCursor Socket::Poll(PacketSlotHandle* outPackets, size_t max,
+                            ThreadIdentity identity)
+    {
+        if (!initialized_.load(std::memory_order_relaxed))
+            return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
+
+        // Delivery only. Reception happens in Update, which is what empties the
+        // OS buffer into the recv pool and applies the receive rules there. A
+        // packet's slot stayed leased in the recv pool while queued, so rebuild
+        // a handle over it. Leftovers stay queued for the next Poll. Delivered
         // handles are stamped with this socket, which is what lets
         // PrepareResponse build a reply from the packet alone.
+        // Claim before draining, and the cursor holds it until the caller is
+        // done reading. A lane nobody claims is simply taken by whichever
+        // thread arrives next, so no lane silts up because a thread stopped
+        // calling, and preferring the caller's last lane keeps a thread on one
+        // lane while nothing contends.
+        const uint32_t lane = readyLanes_.ClaimLane(identity.lane);
+        if (lane == ReadyLanes::NO_LANE)
+            return PollCursor{nullptr, ReadyLanes::NO_LANE, outPackets, 0};
+
+        // Before the packets, and only for this lane. An event about a peer
+        // reaches the thread that handles that peer's traffic, so an
+        // application holding per-peer state without a lock keeps it. Holding
+        // the lane across a handler is what makes that exact rather than
+        // usually right, and it is also what keeps a second thread out of these
+        // entries.
+        events_.Dispatch(lane, &Socket::OnEventDelivered, this);
+
         size_t delivered = 0;
-        uint32_t idx = 0;
-        while (delivered < max && readyQueue_.Pop(idx))
+        ReadyEntry ready{};
+        while (delivered < max && readyLanes_.Pop(lane, ready))
         {
-            outPackets[delivered] = PacketSlotHandle{ idx, recvPool_ };
+            // Out of the lane and into the caller's hands, so it stops counting
+            // against the peer that sent it. Non-flow packets are unattributed
+            // and never counted, so there is nothing to give back for them.
+            if (ready.peerSlot != common::collections::SlotPool::INVALID)
+            {
+                peerRecvStates_[ready.peerSlot].ReleaseOne();
+                heldTotal_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            outPackets[delivered] = PacketSlotHandle{ ready.slotIndex, recvPool_ };
             outPackets[delivered].BindSocket(this);
             ++delivered;
         }
 
-        return static_cast<uint32_t>(delivered);
+        return PollCursor{&readyLanes_, lane, outPackets, static_cast<uint32_t>(delivered)};
     }
 
     bool Socket::PreProcessIn(PacketSlotHandle& pHandle, uint32_t& migrateBudget)
@@ -896,13 +1255,14 @@ namespace bcp::flux
 
         const bool tagged = packet->IsTagged();
         const size_t headerSize = tagged
-            ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-            : internal::MIN_SECURE_WIRE_SIZE;
+            ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+            : internal::WIRE_SECURE_HEAD_SIZE;
         if (packet->dataSize < headerSize)
             return false;
 
         common::crypto::SessionKey key;
         common::crypto::SessionKey headerKey;
+        common::crypto::SessionKey macKey;
         uint8_t senderLane = 0;
         {
             PeerHandle peerHandle = peers_.GetPeer(packet->address);
@@ -917,6 +1277,7 @@ namespace bcp::flux
             if (!peer || !peer->IsValid()) return false;
             key = peer->session;
             headerKey = peer->headerKey;
+            macKey = peer->macKey;
             senderLane = LaneFrom(peer->theirPk);
         }
 
@@ -925,17 +1286,22 @@ namespace bcp::flux
         {
             common::crypto::Wipe(key.data(), key.size());
             common::crypto::Wipe(headerKey.data(), headerKey.size());
+            common::crypto::Wipe(macKey.data(), macKey.size());
             return false;
         }
 
         // The counter is masked on the wire, so the open is what recovers it;
-        // it then feeds the replay check below.
+        // it then feeds the replay check below. A MAC-only packet is verified
+        // rather than decrypted, and everything past this point is identical
+        // because the two share a layout.
         uint64_t counter = 0;
-        const bool decrypted = OpenSecurePacket(*writablePacket, key, headerKey,
-                                                senderLane, counter);
+        const bool opened = writablePacket->IsMacOnly()
+            ? OpenMacOnlyPacket(*writablePacket, macKey, headerKey, counter)
+            : OpenSecurePacket(*writablePacket, key, headerKey, senderLane, counter);
         common::crypto::Wipe(key.data(), key.size());
         common::crypto::Wipe(headerKey.data(), headerKey.size());
-        if (!decrypted)
+        common::crypto::Wipe(macKey.data(), macKey.size());
+        if (!opened)
             return false;
 
         // Replay check, only now that the packet has proven genuine: a forgery
@@ -971,7 +1337,7 @@ namespace bcp::flux
         if (!packet) return;
         const Address from = packet->address;
 
-        PacketSlotReader reader{std::move(pHandle)};
+        PacketSlotReader reader{pHandle};
         uint8_t opcode;
         if (!reader.TakeU8(opcode)) return;
 
@@ -1011,7 +1377,12 @@ namespace bcp::flux
             case internal::SECURE_CHANNEL_PATH_CHLG:      PathChallenge_Respond(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_PATH_RESP:      PathChallenge_Complete(from, buf, plen); break;
             case internal::SECURE_CHANNEL_FLOW_REJECT:    Flow_Reject(from, buf, plen);    break;
+            case internal::SECURE_CHANNEL_GRANT:          Grant_Update(from, buf, plen);   break;
+            case internal::SECURE_CHANNEL_GRANT_ACK:      Grant_Acked(from, buf, plen);    break;
             case internal::SECURE_CHANNEL_FLOW_ACK:       Flow_Ack(from, buf, plen);       break;
+            case internal::SECURE_CHANNEL_TRANSFER:       Transfer_Data(from, buf, plen);  break;
+            case internal::SECURE_CHANNEL_TRANSFER_ACK:   Transfer_Ack(from, buf, plen);   break;
+            case internal::SECURE_CHANNEL_TRANSFER_REJECT: Transfer_Reject(from, buf, plen); break;
             default: break;   // unknown channel: authenticated but unhandled, drop
         }
     }
@@ -1020,7 +1391,16 @@ namespace bcp::flux
     {
         const uint32_t idx = handle.GetSlotIndex();
         if (idx == common::collections::SlotPool::INVALID) return false;
-        if (!readyQueue_.Push(idx)) return false;   // full: backpressure, caller drops
+        const PacketSlot* packet = handle.Read();
+        if (!packet) return false;
+        // A non-flow packet carries no sequence, so there is no order to keep.
+        // Hashing the address only keeps one sender's traffic landing together.
+        const uint32_t lane = readyLanes_.LaneOf(packet->address.hash());
+        // No flow means no association and so no peer slot in hand. Attributing
+        // it would cost a peer lookup on every non-flow packet, so this rides
+        // unattributed and does not count against anyone's occupancy.
+        if (!readyLanes_.Push(lane, idx, common::collections::SlotPool::INVALID))
+            return false;   // full: backpressure, caller drops
         (void)handle.Detach();                      // queued; must not release the slot
         return true;
     }
@@ -1037,8 +1417,18 @@ namespace bcp::flux
         const Address  from     = packet->address;
         if (flowId == internal::INVALID_FLOW_ID || seq == 0) return 0;
 
-        uint32_t flowSlot = common::collections::SlotPool::INVALID;
-        bool     reject   = false;
+        // A batch is only as trustworthy as its length chain. Checked here,
+        // before the flow machinery sees it, so a damaged one is never
+        // committed to the seen bitmap and the sender resends it rather than
+        // being told it arrived.
+        if (packet->IsBatch()
+         && !wire::BatchValidate(packet->Content(packet->ContentOffset()),
+                                 static_cast<uint16_t>(packet->ContentLength())))
+            return 0;
+
+        uint32_t flowSlot  = common::collections::SlotPool::INVALID;
+        uint32_t flowEpoch = 0;
+        bool     reject    = false;
         PeerSendMaterials rejectMaterials;
         {
             PeerHandle peerHandle = peers_.GetPeer(from);
@@ -1050,13 +1440,33 @@ namespace bcp::flux
             if (!peer || !peer->IsValid()) return 0;
 
             const uint32_t peerSlot = peerHandle.GetSlotIndex();
-            if (flows_.AdmitIn(peerSlot, from, peer->id, flowId, flowData, flowSlot)
-                == FlowAdmit::Rejected)
+            const FlowAdmit admit = flows_.AdmitIn(peerSlot, from, peer->id, flowId,
+                                                   flowData, flowSlot, flowEpoch);
+            if (admit == FlowAdmit::Rejected)
             {
                 // An undecodable flow data byte, or caps. Tell the sender so it
                 // stops rather than retransmitting into silence.
                 rejectMaterials = GatherSendMaterials(*peer);
                 reject = true;
+            }
+            // Registered means this packet is the first of a flow the remote
+            // opened. Existing says nothing new, and every later packet of the
+            // same flow reports Existing. Recorded here, under the peer lock
+            // that still holds the association's slot, so the entry it writes
+            // is that association's own.
+            // Marked while the peer lock is still held, so the teardown that
+            // reads the mark cannot run between recording and marking.
+            // Reopened is the same association numbering from one again, with
+            // everything it held thrown away, so it is news in the same way a
+            // first registration is.
+            if (admit == FlowAdmit::Registered || admit == FlowAdmit::Reopened)
+            {
+                const SocketEvent what = admit == FlowAdmit::Registered
+                    ? SocketEvent::INCOMING_FLOW_OPENED
+                    : SocketEvent::INCOMING_FLOW_REOPENED;
+                if (events_.Record(EventScope::IN_FLOW, flowSlot,
+                                   readyLanes_.LaneOf(peerSlot), what, from, flowId))
+                    flows_.MarkEmitting(EventScope::IN_FLOW, flowSlot);
             }
         }
 
@@ -1076,7 +1486,7 @@ namespace bcp::flux
 
         if (flowSlot == common::collections::SlotPool::INVALID) return 0;
 
-        return flows_.DeliverIn(flowSlot, flowId, seq, incoming);
+        return flows_.DeliverIn(flowSlot, flowId, flowEpoch, seq, incoming);
     }
 
     bool Socket::TryMigrate(PacketSlotHandle& pHandle, uint32_t& migrateBudget)
@@ -1116,7 +1526,7 @@ namespace bcp::flux
             PacketSlot* writablePacket = pHandle.Write();
             if (!writablePacket) return false;
 
-            constexpr size_t headerSize = internal::MIN_SECURE_WIRE_SIZE
+            constexpr size_t headerSize = internal::WIRE_SECURE_HEAD_SIZE
                                         + internal::WIRE_PEER_TAG_SIZE;
             if (writablePacket->dataSize < headerSize) return false;
 
@@ -1322,9 +1732,20 @@ namespace bcp::flux
             // A refused rebind (the address raced into use by another peer)
             // leaves the old route; the mover's next packet simply starts a
             // fresh validation round.
-            (void)peers_.UpdateAddress(slot, from);
+            const bool moved = peers_.UpdateAddress(slot, from) == common::Error::Ok;
             SlideTagWindow(slot, session, theirLane, oldBase, newBase);
             common::crypto::Wipe(session.data(), session.size());
+
+            // Recorded after the rebind and under a fresh borrow, because the
+            // table ops above cannot run with a handle held, and because the
+            // address worth reporting is the one it moved to.
+            if (moved)
+            {
+                PeerHandle movedHandle = peers_.GetPeer(from);
+                if (Peer* movedPeer = movedHandle.Failed() ? nullptr : movedHandle.Write())
+                    RecordPeerEvent(*movedPeer, movedHandle.GetSlotIndex(),
+                                    SocketEvent::PEER_MIGRATED);
+            }
         }
     }
 
@@ -1418,6 +1839,12 @@ namespace bcp::flux
         uint8_t saltI[internal::WIRE_HS_SALT_SIZE];
         if (!common::crypto::RandomBytes(saltI, sizeof(saltI))) return;
 
+        // The throwaway pair, one per attempt. The public half travels, the
+        // secret half waits on the peer for HS_FINISH and is wiped there.
+        common::crypto::SecretKey ephSk;
+        common::crypto::PublicKey ephPk;
+        if (!common::crypto::GenerateKeypair(ephSk, ephPk)) return;
+
         common::Result<PacketSlotWriter> result = BuildInternal(SocketOpCode::HS_RES);
         if (result.isErr()) return;
         PacketSlotWriter writer = result.Take();
@@ -1430,7 +1857,10 @@ namespace bcp::flux
             if (peer->state != HandshakeState::AWAITING_CHALLENGE) return;
             peer->state = HandshakeState::AWAITING_FINISH;
             std::memcpy(peer->hsSalt, saltI, sizeof(saltI));
+            peer->hsEphSecret = ephSk;
+            peer->hsEphPub    = ephPk;
         }
+        common::crypto::Wipe(ephSk.data(), ephSk.size());
 
         uint32_t initiatorCaps;
         BuildCapsBitmap(initiatorCaps);
@@ -1438,34 +1868,76 @@ namespace bcp::flux
         writer.WriteAddress(from);
         writer.PutU64(challenge);
         writer.PutBytes(publicKey_.data(), publicKey_.size());
+        writer.PutBytes(ephPk.data(), ephPk.size());
         writer.PutBytes(saltI, sizeof(saltI));
         writer.PutU16(internal::VERSION);
         writer.PutU32(initiatorCaps);
 
+        // Cover the whole message, keyed by the cookie the responder minted and
+        // this side is echoing back. Both ends hold that value, so the check
+        // costs no exchange, and it is the only thing standing between a
+        // damaged public key and a peer entry bound to an identity nobody
+        // holds. Appended last, so the range is one unbroken run.
+        PacketSlotHandle resHandle = std::move(writer).ExtractHandle();
+        {
+            PacketSlot* raw = resHandle.Write();
+            if (!raw) return;
+            if (static_cast<size_t>(raw->dataSize) + internal::WIRE_HS_MAC_SIZE
+                > internal::MAX_WIRE_PACKET_SIZE)
+                return;
+
+            common::crypto::Mac mac;
+            common::crypto::ComputeMac(mac, CookieKey(challenge), raw->data, raw->dataSize);
+            std::memcpy(raw->data + raw->dataSize, mac.data(), mac.size());
+            raw->dataSize = static_cast<uint16_t>(raw->dataSize + internal::WIRE_HS_MAC_SIZE);
+        }
+
         // Handshake traffic bypasses the flow gate, so the only failure here
         // is a dry pool. A lost one is recovered by the handshake retry.
-        (void)sender_.Send(std::move(writer).ExtractHandle());
+        (void)sender_.Send(std::move(resHandle));
     }
 
     void Socket::Handshake_Validate(const Address& from, PacketSlotReader& reader)
     {
         uint64_t challenge = 0;
         common::crypto::PublicKey pk;
+        common::crypto::PublicKey ephI;
         uint8_t saltI[internal::WIRE_HS_SALT_SIZE];
         uint16_t initiatorVersion{0};
         uint32_t initiatorCaps{0};
         if (!reader.TakeU64(challenge)) return;
+
+        // The gate, first because it is the cheap one and it is what stops a
+        // flood costing this socket anything.
+        if (!challengeGenerator_.Verify(from.addr, challenge)) return;
+
+        // Then integrity, before a single field is read out. Everything below
+        // derives an identity from bytes this side did not choose, and a
+        // corrupted key here is indistinguishable from a real one: it registers
+        // a peer under an id nobody holds and locks the address out. Checking
+        // first means a damaged message never reaches that code.
+        {
+            const PacketSlot* raw = reader.Packet();
+            if (!raw || raw->dataSize < internal::WIRE_HS_MAC_SIZE) return;
+
+            const size_t covered = raw->dataSize - internal::WIRE_HS_MAC_SIZE;
+            common::crypto::Mac expected;
+            common::crypto::ComputeMac(expected, CookieKey(challenge), raw->data, covered);
+            if (!common::crypto::Equal(expected.data(), raw->data + covered,
+                                       expected.size()))
+                return;
+        }
+
         if (!reader.TakeBytes(pk.data(), pk.size())) return;
+        if (!reader.TakeBytes(ephI.data(), ephI.size())) return;
         if (!reader.TakeBytes(saltI, sizeof(saltI))) return;
         if (!reader.TakeU16(initiatorVersion)) return;
         if (!reader.TakeU32(initiatorCaps)) return;
 
-        // The gate. Until this passes, the sender has cost this socket nothing.
-        if (!challengeGenerator_.Verify(from.addr, challenge)) return;
-
         const BcpId id = BcpId::Derive(pk);
 
-        bool established = false;
+        bool established = false;   // answering a duplicate, not building anew
+        bool repeat      = false;
         bool needBind    = false;
         bool unprovenId  = false;
         uint32_t slot    = 0;
@@ -1475,6 +1947,7 @@ namespace bcp::flux
             {
                 if (peers_.RegisterPeer(from, &id, slot) != common::Error::Ok)
                     return;   // table full; the initiator's retry will land later
+                SeedPeerRecvState(slot);
             }
             else
             {
@@ -1501,7 +1974,19 @@ namespace bcp::flux
                     }
                     else
                     {
-                        established = true;
+                        // Same ephemeral means the same attempt arriving twice,
+                        // so the answer already sent is the only correct one. A
+                        // different ephemeral is a fresh attempt, and it re-keys
+                        // only an unconfirmed peer. A confirmed session has been
+                        // proven live, and no part of an HS_RES is authenticated,
+                        // so letting one re-key it would let an on-path forgery
+                        // replace a working session with garbage nobody can open.
+                        // A live peer changes only by migration; a dead one is
+                        // reconnected to after its entry idles out.
+                        repeat = common::crypto::Equal(peer->hsPeerEph.data(),
+                                                       ephI.data(), ephI.size());
+                        if (!repeat && peer->confirmed) return;
+                        established = repeat;
                     }
                 }
                 else
@@ -1542,65 +2027,69 @@ namespace bcp::flux
         // BindTag/UnbindTags take table locks, and the table's contract forbids
         // calling them with a handle held.
         bool bindWindow  = false;
-        bool dropOldTags = false;
         common::crypto::SessionKey tagSession{};
         uint32_t responderCaps;
         BuildCapsBitmap(responderCaps);
 
+        common::crypto::PublicKey ephR;
         if (!established)
         {
+            // A fresh attempt, so a fresh throwaway pair to answer it with. The
+            // secret half never leaves this scope.
+            common::crypto::SecretKey ephSk;
             if (!common::crypto::RandomBytes(saltR, sizeof(saltR))) return;
+            if (!common::crypto::GenerateKeypair(ephSk, ephR)) return;
 
-            BuildTranscript(transcript, pk, publicKey_, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
+            BuildTranscript(transcript, pk, publicKey_, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
 
             PeerHandle peerHandle = peers_.GetPeer(from);
-            if (peerHandle.Failed()) return;
+            if (peerHandle.Failed())
+            {
+                common::crypto::Wipe(ephSk.data(), ephSk.size());
+                return;
+            }
             Peer* peer = peerHandle.Write();
-            CommitSession(*peer, pk, transcript, sizeof(transcript));
+            CommitSession(*peer, pk, ephSk, ephI, transcript, sizeof(transcript));
+            RecordPeerEvent(*peer, peerHandle.GetSlotIndex(), SocketEvent::PEER_ESTABLISHED);
+            common::crypto::Wipe(ephSk.data(), ephSk.size());   // the whole point
+
             common::crypto::ComputeMac(confirm, peer->session, transcript, sizeof(transcript));
             std::memcpy(peer->hsSalt, saltR, sizeof(saltR));
+
+            // Enough to repeat this exact answer, and nothing that could
+            // reconstruct the key. A duplicate HS_RES is replied to from here.
+            peer->hsPeerEph = ephI;
+            peer->hsEphPub  = ephR;
+            std::memcpy(peer->hsConfirm, confirm.data(), sizeof(peer->hsConfirm));
+
             ReplayFor(peerHandle.GetSlotIndex()).Reset();   // fresh key -> remote's counter restarts at 0
             tagSession = peer->session;
             bindWindow = migration_;
         }
         else
         {
-            // Re-derive from the incoming salt and the stored one. A stale
-            // duplicate carries the same salt and reproduces the current key, so
-            // nothing changes; a genuine re-handshake carries a fresh salt and
-            // re-keys both sides consistently. The counter resets only when the
-            // key actually changes; resetting it under an unchanged key would
-            // reuse nonces.
+            // The same attempt arriving again, which means the answer was lost
+            // rather than refused. Repeat it verbatim. Re-deriving is not an
+            // option and re-keying is not either: the secret that made this
+            // session was wiped at both ends when it was made, so the only
+            // reachable key is the one already installed.
             PeerHandle peerHandle = peers_.GetPeer(from);
             if (peerHandle.Failed()) return;
-            Peer* peer = peerHandle.Write();
+            const Peer* peer = peerHandle.Read();
             std::memcpy(saltR, peer->hsSalt, sizeof(saltR));
-            BuildTranscript(transcript, pk, publicKey_, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
-
-            common::crypto::SessionKey candidate;
-            DeriveSessionInto(candidate, pk, transcript, sizeof(transcript));
-            if (!common::crypto::Equal(candidate.data(), peer->session.data(), candidate.size()))
-            {
-                // A retried HS_RES can carry a fresh salt, which derives a
-                // different session. Installing it goes through the one path
-                // that installs a session: assigning the key here and listing
-                // what else to reset is how headerKey was left behind, masking
-                // every counter with the previous session's key and failing
-                // every open in both directions with both ends established.
-                CommitSession(*peer, pk, transcript, sizeof(transcript));
-                ReplayFor(peerHandle.GetSlotIndex()).Reset();   // key changed -> remote's counter restarts
-                tagSession  = peer->session;
-                bindWindow  = migration_;
-                dropOldTags = true;    // the old key's window is dead weight
-            }
-            common::crypto::ComputeMac(confirm, peer->session, transcript, sizeof(transcript));
-            common::crypto::Wipe(candidate.data(), candidate.size());
+            ephR = peer->hsEphPub;
+            std::memcpy(confirm.data(), peer->hsConfirm, sizeof(peer->hsConfirm));
         }
 
         if (bindWindow)
         {
-            if (dropOldTags)
-                (void)peers_.UnbindTags(slot);
+            // Clear any window a previous key left before binding this one. A
+            // first establish holds none, so this is a no-op; a re-key holds a
+            // window whose tags derive from the key just replaced, and dropping
+            // them is the only correct move, so it is not conditional. Left
+            // bound, they pile up in the shared tag index and eventually starve
+            // every peer's migration.
+            (void)peers_.UnbindTags(slot);
             BindTagWindow(slot, tagSession, LaneFrom(pk), 0);
         }
         common::crypto::Wipe(tagSession.data(), tagSession.size());
@@ -1611,6 +2100,7 @@ namespace bcp::flux
 
         writer.WriteAddress(from);
         writer.PutBytes(publicKey_.data(), publicKey_.size());
+        writer.PutBytes(ephR.data(), ephR.size());
         writer.PutBytes(saltR, sizeof(saltR));
         writer.PutBytes(ownTag_.data(), ownTag_.size());
         writer.PutU16(internal::VERSION);
@@ -1628,12 +2118,14 @@ namespace bcp::flux
     void Socket::Handshake_Complete(const Address& from, PacketSlotReader& reader)
     {
         common::crypto::PublicKey pk;
+        common::crypto::PublicKey ephR;
         uint8_t saltR[internal::WIRE_HS_SALT_SIZE];
         Certificate::IdentityTag tag;
         uint16_t responderVersion;
         uint32_t responderCaps;
         common::crypto::Mac confirm;
         if (!reader.TakeBytes(pk.data(), pk.size())) return;
+        if (!reader.TakeBytes(ephR.data(), ephR.size())) return;
         if (!reader.TakeBytes(saltR, sizeof(saltR))) return;
         if (!reader.TakeBytes(tag.data(), tag.size())) return;
         if (!reader.TakeU16(responderVersion)) return;
@@ -1643,6 +2135,8 @@ namespace bcp::flux
         const BcpId id = BcpId::Derive(pk);
 
         uint8_t saltI[internal::WIRE_HS_SALT_SIZE];
+        common::crypto::SecretKey ephSk;
+        common::crypto::PublicKey ephI;
         uint32_t slot = 0;
         {
             PeerHandle peerHandle = peers_.GetPeer(from);
@@ -1659,6 +2153,8 @@ namespace bcp::flux
              && peer->state != HandshakeState::AWAITING_CHALLENGE) return;
             slot = peerHandle.GetSlotIndex();
             std::memcpy(saltI, peer->hsSalt, sizeof(saltI));   // our contribution
+            ephSk = peer->hsEphSecret;
+            ephI  = peer->hsEphPub;
         }
 
         // The trust gate. A trusted tag presented with the wrong key is an
@@ -1676,10 +2172,10 @@ namespace bcp::flux
         // holds the private half of the key it presented, and nothing in the
         // exchange was tampered with. Checked before anything establishes.
         uint8_t transcript[internal::HS_TRANSCRIPT_SIZE];
-        BuildTranscript(transcript, publicKey_, pk, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
+        BuildTranscript(transcript, publicKey_, pk, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
 
         common::crypto::SessionKey session;
-        DeriveSessionInto(session, pk, transcript, sizeof(transcript));
+        DeriveSessionInto(session, pk, ephSk, ephR, transcript, sizeof(transcript));
 
         common::crypto::Mac expected;
         common::crypto::ComputeMac(expected, session, transcript, sizeof(transcript));
@@ -1703,11 +2199,19 @@ namespace bcp::flux
                 return;
             }
             Peer* peer = peerHandle.Write();
-            CommitSession(*peer, pk, transcript, sizeof(transcript));
+            CommitSession(*peer, pk, ephSk, ephR, transcript, sizeof(transcript));
+            RecordPeerEvent(*peer, peerHandle.GetSlotIndex(), SocketEvent::PEER_ESTABLISHED);
             std::memcpy(peer->announcedTag, tag.data(), tag.size());
             peer->authenticated = (match == CertStore::Match::Trusted);
             ReplayFor(peerHandle.GetSlotIndex()).Reset();   // fresh session -> remote's counter starts at 0
+
+            // The session exists now, so the secret that made it must not.
+            // Leaving it on the peer would keep the exchange reconstructible
+            // for as long as the peer lives, which is the whole thing this
+            // exists to prevent.
+            common::crypto::Wipe(peer->hsEphSecret.data(), peer->hsEphSecret.size());
         }
+        common::crypto::Wipe(ephSk.data(), ephSk.size());
 
         // Handle scope closed: bind the responder's tag window so its future
         // moves are recognizable from the first packet off a new address.
@@ -1719,6 +2223,8 @@ namespace bcp::flux
     }
 
     void Socket::CommitSession(Peer& peer, const common::crypto::PublicKey& theirPk,
+                                const common::crypto::SecretKey& myEphSk,
+                                const common::crypto::PublicKey& theirEphPk,
                                 const uint8_t* transcript, size_t transcriptLen) noexcept
     {
         // The peer-commit core shared by Validate's establish branch and
@@ -1728,7 +2234,7 @@ namespace bcp::flux
         // args: ReplayFor().Reset (needs the slot), and, in Complete, the
         // announced tag and authentication verdict.
         peer.theirPk = theirPk;
-        DeriveSessionInto(peer.session, theirPk, transcript, transcriptLen);
+        DeriveSessionInto(peer.session, theirPk, myEphSk, theirEphPk, transcript, transcriptLen);
         // Split off the counter-masking key. The label is fixed and public; it
         // only has to differ from every other input the session key is ever
         // fed, so the two derivations cannot collide.
@@ -1737,11 +2243,37 @@ namespace bcp::flux
         };
         common::crypto::DeriveSubKey(peer.headerKey.data(), peer.session.data(),
                                      HEADER_KEY_LABEL);
+
+        // Same mechanism, different label, so the two never share a domain.
+        static constexpr uint8_t MAC_KEY_LABEL[16] = {
+            'f','l','u','x','-','m','a','c','-','o','n','l','y',0,0,0
+        };
+        common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
+                                     MAC_KEY_LABEL);
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
+        // A secure channel exists from here, so this is the first moment a
+        // grant can be told to anyone, and the tick does the sending.
+        // Generation advances rather than resetting, because the remote
+        // compares against what it already applied and a restart at zero would
+        // read as stale.
+        //
+        // A socket that grants no limit announces nothing. There is no value to
+        // carry, and staying silent is what keeps an unconfigured socket byte
+        // for byte what it was before grants existed.
+        if (recvGrant_ != 0)
+        {
+            ++peer.ourGrantGeneration;
+            peer.grantSendPending  = true;
+            peer.grantSentAtMicros = 0;   // send at the next tick, not one RTO later
+        }
         peer.myTag        = DerivePeerTag(peer.session, LaneTo(theirPk), 0);
         peer.state        = HandshakeState::ESTABLISHED;
+        // The acknowledgement silence clock starts here, so a peer that never
+        // acknowledges anything still has a defined death, measured from the
+        // moment it could first have answered.
+        peer.rtt.MarkAcked(common::MonotonicMicros());
     }
 
     common::Result<PacketSlotWriter> Socket::BuildInternal(SocketOpCode op)
@@ -1836,6 +2368,12 @@ namespace bcp::flux
     {
         if (!initialized_.load(std::memory_order_acquire) || !flows_.SendEnabled())
             return common::Error::NotInitialized;
+
+        // Anything still sitting in a batch goes now. Its association is about
+        // to be torn down and the batch would go with it, which on a reliable
+        // flow would silently lose messages the caller was told were accepted.
+        Flush();
+
         if (!flows_.BeginClose(flow))
             return common::Error::InvalidState;   // stale handle, or already closing
 
@@ -1889,6 +2427,214 @@ namespace bcp::flux
         return flows_.StateOf(flow, peerHandle.GetSlotIndex());
     }
 
+    uint32_t Socket::ReceivingFlowCount(const Address& peer)
+    {
+        if (!flows_.ReceiveEnabled()) return 0;
+
+        PeerHandle peerHandle = peers_.GetPeer(peer);
+        if (peerHandle.Failed() || !peerHandle.Read())
+            return 0;
+
+        return flows_.InAssocCountForPeer(peerHandle.GetSlotIndex());
+    }
+
+    void Socket::SeedPeerRecvState(uint32_t slot) noexcept
+    {
+        peerRecvStates_[slot].Reset();   // a reused slot starts owing nothing
+        peerRecvStates_[slot].grant.store(recvGrant_, std::memory_order_relaxed);
+    }
+
+    void Socket::ApplyGrant(uint32_t slot, Peer& peer, uint32_t value) noexcept
+    {
+        peerRecvStates_[slot].grant.store(value, std::memory_order_relaxed);
+        ++peer.ourGrantGeneration;
+        peer.grantSendPending  = true;
+        peer.grantSentAtMicros = 0;   // go on the next tick, not one interval later
+    }
+
+    void Socket::CutGrantIfAbusive(PeerHandle peerHandle)
+    {
+        if (peerHandle.Failed()) return;
+        const uint32_t slot = peerHandle.GetSlotIndex();
+        PeerRecvState& state = peerRecvStates_[slot];
+
+        // Stale strikes are dropped before they are counted. The policy is
+        // about a rate and the counter only knows a total, so without this a
+        // peer accumulates its way to a permanent halving over any length of
+        // connection, and nothing ever gives the grant back.
+        const uint64_t lastStall = state.lastStallMicros.load(std::memory_order_relaxed);
+        const uint64_t now = common::MonotonicMicros();
+        if (lastStall != 0 && now > lastStall
+            && now - lastStall > internal::GRANT_STRIKE_WINDOW_MICROS)
+        {
+            state.stallReclaims.store(0, std::memory_order_relaxed);
+            state.lastStallMicros.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        if (state.stallReclaims.load(std::memory_order_relaxed)
+            < internal::GRANT_STRIKES_BEFORE_CUT)
+            return;
+
+        // A peer with no limit has nothing to cut. Giving it one here would let
+        // a lossy path invent a restriction the socket never configured.
+        const uint32_t current = state.grant.load(std::memory_order_relaxed);
+        if (current == 0)
+        {
+            state.stallReclaims.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        uint32_t cut = current / internal::GRANT_CUT_DIVISOR;
+        if (cut < internal::GRANT_CUT_FLOOR) cut = internal::GRANT_CUT_FLOOR;
+        state.stallReclaims.store(0, std::memory_order_relaxed);
+        if (cut >= current) return;   // already at the floor, nothing to say
+
+        Peer* peer = peerHandle.Write();
+        if (!peer) return;
+        ApplyGrant(slot, *peer, cut);
+        RecordPeerEvent(*peer, slot, SocketEvent::PEER_GRANT_CUT);
+    }
+
+    common::Error Socket::SetRecvGrant(const Address& peer, uint32_t slots)
+    {
+        if (!initialized_.load(std::memory_order_acquire))
+            return common::Error::NotInitialized;
+
+        PeerHandle peerHandle = peers_.GetPeer(peer);
+        if (peerHandle.Failed()) return common::Error::NotFound;
+        Peer* state = peerHandle.Write();
+        if (!state) return common::Error::InvalidState;
+
+        // In force from here. A peer already past the new figure is not made to
+        // give anything back, it simply stops being buffered for until it
+        // drains under it.
+        ApplyGrant(peerHandle.GetSlotIndex(), *state, slots);
+        return common::Error::Ok;
+    }
+
+    uint32_t Socket::RecvGrantFor(const Address& peer)
+    {
+        if (!initialized_.load(std::memory_order_acquire)) return 0;
+        PeerHandle peerHandle = peers_.GetPeer(peer);
+        if (peerHandle.Failed() || !peerHandle.Read()) return 0;
+        return peerRecvStates_[peerHandle.GetSlotIndex()].grant.load(
+            std::memory_order_relaxed);
+    }
+
+    void Socket::SendGrant(const Address& to, const PeerSendMaterials& materials,
+                           uint32_t grant, uint32_t generation)
+    {
+        uint8_t payload[internal::WIRE_GRANT_PAYLOAD_SIZE];
+        payload[0] = static_cast<uint8_t>(grant >> 0);
+        payload[1] = static_cast<uint8_t>(grant >> 8);
+        payload[2] = static_cast<uint8_t>(grant >> 16);
+        payload[3] = static_cast<uint8_t>(grant >> 24);
+        payload[4] = static_cast<uint8_t>(generation >> 0);
+        payload[5] = static_cast<uint8_t>(generation >> 8);
+        payload[6] = static_cast<uint8_t>(generation >> 16);
+        payload[7] = static_cast<uint8_t>(generation >> 24);
+
+        SendSecureControl(to, materials, internal::SECURE_CHANNEL_GRANT,
+                          payload, sizeof(payload));
+    }
+
+    void Socket::Grant_Update(const Address& from, const uint8_t* payload, size_t len)
+    {
+        if (len < internal::WIRE_GRANT_PAYLOAD_SIZE) return;
+        const uint32_t grant = static_cast<uint32_t>(payload[0])
+                             | static_cast<uint32_t>(payload[1]) << 8
+                             | static_cast<uint32_t>(payload[2]) << 16
+                             | static_cast<uint32_t>(payload[3]) << 24;
+        const uint32_t generation = static_cast<uint32_t>(payload[4])
+                                  | static_cast<uint32_t>(payload[5]) << 8
+                                  | static_cast<uint32_t>(payload[6]) << 16
+                                  | static_cast<uint32_t>(payload[7]) << 24;
+
+        PeerSendMaterials materials;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(from);
+            if (peerHandle.Failed()) return;
+            Peer* peer = peerHandle.Write();
+            if (!peer || !peer->IsValid()) return;
+
+            // Wrap-safe ordering. A signed difference treats generation 0
+            // arriving after 0xFFFFFFFF as newer, which it is, where a plain
+            // comparison would freeze the value at the wrap.
+            const int32_t age = static_cast<int32_t>(generation - peer->theirGrantGeneration);
+            if (age > 0)
+            {
+                peer->theirGrantGeneration = generation;
+                if (peer->theirGrant != grant)
+                {
+                    peer->theirGrant = grant;
+                    RecordPeerEvent(*peer, peerHandle.GetSlotIndex(),
+                                    SocketEvent::PEER_GRANT_CHANGED);
+                }
+            }
+            materials = GatherSendMaterials(*peer);
+        }
+
+        uint8_t ack[internal::WIRE_GRANT_ACK_PAYLOAD_SIZE];
+        ack[0] = static_cast<uint8_t>(generation >> 0);
+        ack[1] = static_cast<uint8_t>(generation >> 8);
+        ack[2] = static_cast<uint8_t>(generation >> 16);
+        ack[3] = static_cast<uint8_t>(generation >> 24);
+        SendSecureControl(from, materials, internal::SECURE_CHANNEL_GRANT_ACK,
+                          ack, sizeof(ack));
+        common::crypto::Wipe(materials.key.data(), materials.key.size());
+    }
+
+    void Socket::Grant_Acked(const Address& from, const uint8_t* payload, size_t len)
+    {
+        if (len < internal::WIRE_GRANT_ACK_PAYLOAD_SIZE) return;
+        const uint32_t generation = static_cast<uint32_t>(payload[0])
+                                  | static_cast<uint32_t>(payload[1]) << 8
+                                  | static_cast<uint32_t>(payload[2]) << 16
+                                  | static_cast<uint32_t>(payload[3]) << 24;
+
+        PeerHandle peerHandle = peers_.GetPeer(from);
+        if (peerHandle.Failed()) return;
+        Peer* peer = peerHandle.Write();
+        if (!peer) return;
+
+        // Only the outstanding generation clears the flag. An ack for an older
+        // one is a straggler from a value already superseded.
+        if (peer->grantSendPending && generation == peer->ourGrantGeneration)
+            peer->grantSendPending = false;
+    }
+
+    void Socket::SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now)
+    {
+        PeerSendMaterials materials;
+        uint32_t generation = 0;
+        uint32_t grant      = 0;
+        {
+            // The transferred handle is this function's to release: the gather
+            // happens in this scope and the send after it, so the peer lock is
+            // never held across the syscall.
+            PeerHandle owned = std::move(peerHandle);
+            if (owned.Failed()) return;
+            Peer* peer = owned.Write();
+            if (!peer || !peer->IsValid() || !peer->grantSendPending) return;
+
+            // Paced like a retransmit. Without this the flag would put one op
+            // on the wire every tick until the ack lands.
+            if (peer->grantSentAtMicros != 0
+                && now - peer->grantSentAtMicros < internal::HANDSHAKE_RETRY_DEFAULT)
+                return;
+            peer->grantSentAtMicros = now;
+
+            generation = peer->ourGrantGeneration;
+            grant      = peerRecvStates_[owned.GetSlotIndex()].grant.load(
+                             std::memory_order_relaxed);
+            materials  = GatherSendMaterials(*peer);
+        }
+
+        SendGrant(to, materials, grant, generation);
+        common::crypto::Wipe(materials.key.data(), materials.key.size());
+    }
+
     void Socket::Flow_Reject(const Address& from, const uint8_t* payload, size_t len)
     {
         // The remote refused to register one of OUR flows: it is at its caps,
@@ -1912,15 +2658,24 @@ namespace bcp::flux
         // the remote has never objected to.
         if (!flows_.OutAssocEpochIs(flowSlot, flowEpoch)) return;
 
-        flows_.FailAssoc(flowSlot, flowId, peer);
+        if (!flows_.FailAssoc(flowSlot, flowId, peer)) return;
+        if (events_.Record(EventScope::OUT_FLOW, flowSlot,
+                           readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
+                           SocketEvent::OUTGOING_FLOW_REFUSED, from, flowId))
+            flows_.MarkEmitting(EventScope::OUT_FLOW, flowSlot);
     }
 
     void Socket::Flow_Ack(const Address& from, const uint8_t* payload, size_t len)
     {
         // Answers OUR sent packets: OUT side. Body is a run of
-        // [flowId(2)][epoch(1)][rangeCount(1)][first(4),last(4)]*count for one
-        // peer. The epoch names which generation of that id the ranges belong
-        // to, and an entry naming any other one resolves nothing.
+        // [flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][ackDelay(2)]
+        // [first(4),last(4)]*count for one peer. The epoch names which
+        // generation of that id the entry belongs to, and an entry naming any
+        // other one resolves nothing. recvNext is the remote's delivery cursor:
+        // everything below it has been handed to its application and can never
+        // be asked for again. ackDelay is how long the remote sat on this reply
+        // after the newest sequence it names arrived, which comes back out of
+        // the round trip so what we measure is the path.
         if (!flows_.SendEnabled()) return;
         const uint64_t now = common::MonotonicMicros();
 
@@ -1936,13 +2691,19 @@ namespace bcp::flux
         const uint32_t peerSlot = peerHandle.GetSlotIndex();
 
         size_t off = 0;
-        while (off + 4 <= len)
+        while (off + internal::WIRE_ACK_ENTRY_HEAD_SIZE <= len)
         {
             const uint16_t flowId = static_cast<uint16_t>(payload[off])
                                   | static_cast<uint16_t>(payload[off + 1]) << 8;
             const uint8_t flowEpoch = payload[off + 2] & FLOW_EPOCH_MASK;
             uint8_t rangeCount = payload[off + 3];
-            off += 4;
+            const uint32_t remoteRecvNext = static_cast<uint32_t>(payload[off + 4])
+                                          | static_cast<uint32_t>(payload[off + 5]) << 8
+                                          | static_cast<uint32_t>(payload[off + 6]) << 16
+                                          | static_cast<uint32_t>(payload[off + 7]) << 24;
+            const uint16_t remoteAckDelay = static_cast<uint16_t>(payload[off + 8])
+                                          | static_cast<uint16_t>(payload[off + 9]) << 8;
+            off += internal::WIRE_ACK_ENTRY_HEAD_SIZE;
             if (rangeCount > internal::FLOW_ACK_RANGE_COUNT) break;   // malformed: apply what we have
 
             AckRange ranges[internal::FLOW_ACK_RANGE_COUNT];
@@ -1962,14 +2723,26 @@ namespace bcp::flux
             }
             if (truncated) break;
 
-            flows_.ApplyAckRanges(peerSlot, flowId, flowEpoch, ranges, rangeCount, now, ccDelta);
+            flows_.ApplyAckRanges(peerSlot, *peerHandle.Read(), flowId, flowEpoch, remoteRecvNext,
+                                  remoteAckDelay, ranges, rangeCount, now, ccDelta);
         }
 
         // Apply the gathered feedback once, on the same handle upgraded to
         // write. The upgrade drops the read lock before taking write, so the
         // peer is revalidated on the other side of the gap.
         Peer* peer = peerHandle.Write();
-        if (peer && peer->IsValid()) ApplyCongestion(*peer, ccDelta, now);
+        if (peer && peer->IsValid())
+        {
+            // This reply arrived and named this peer, so the peer is there.
+            // That is true whether or not its ranges resolved anything: an ack
+            // for a generation we have already moved past resolves nothing and
+            // is still proof of life, and so is a pure duplicate. Reading the
+            // silence off resolved bytes instead let a peer answering
+            // continuously look dead, which backs the timeout off, collapses
+            // the window, and eventually evicts it.
+            peer->rtt.MarkAcked(now);
+            ApplyCongestion(*peer, ccDelta, now);
+        }
     }
 
     void Socket::FlushPeerAcks(const Address& addr, PeerHandle peer)
@@ -2005,59 +2778,6 @@ namespace bcp::flux
         common::crypto::Wipe(materials.key.data(), materials.key.size());
     }
 
-    void Socket::ApplyCongestion(Peer& peer, const CongestionDelta& delta,
-                                  uint64_t nowMicros) noexcept
-    {
-        // Free what resolved, guarded so a bookkeeping drift can never wrap the
-        // counter past zero into a huge value.
-        peer.bytesInFlight -= delta.resolvedBytes <= peer.bytesInFlight
-            ? delta.resolvedBytes : peer.bytesInFlight;
-
-        // Smooth the per-peer round-trip from the newest acked sample.
-        if (delta.rttSampleMicros != 0)
-            peer.pathSrttMicros = peer.pathSrttMicros == 0
-                ? delta.rttSampleMicros
-                : (peer.pathSrttMicros * 7 + delta.rttSampleMicros) / 8;
-
-        // Grow on acknowledged bytes: double the budget per round-trip below the
-        // threshold, one packet per round-trip at or above it. Saturating, so
-        // growth can never wrap the budget.
-        if (delta.ackedBytes != 0)
-        {
-            uint32_t growth;
-            if (peer.congestionBudget < peer.slowStartThreshold)
-                growth = delta.ackedBytes;
-            else
-            {
-                growth = static_cast<uint32_t>(
-                    static_cast<uint64_t>(internal::MAX_WIRE_PACKET_SIZE)
-                    * delta.ackedBytes / peer.congestionBudget);
-                if (growth == 0) growth = 1;
-            }
-            peer.congestionBudget = peer.congestionBudget + growth < peer.congestionBudget
-                ? UINT32_MAX : peer.congestionBudget + growth;
-        }
-
-        // Trim on loss, at most once per round-trip, never below the floor. The
-        // threshold follows the trimmed budget, so growth resumes as the
-        // one-packet-per-round-trip crawl rather than doubling.
-        if (delta.sawLoss)
-        {
-            const uint32_t interval = peer.pathSrttMicros != 0
-                ? peer.pathSrttMicros : flows_.RetryIntervalMicros();
-            if (peer.lastLossReactionMicros == 0
-                || nowMicros - peer.lastLossReactionMicros >= interval)
-            {
-                uint32_t trimmed = static_cast<uint32_t>(
-                    static_cast<uint64_t>(peer.congestionBudget)
-                    * internal::CC_LOSS_RETAIN_PERCENT / 100);
-                if (trimmed < minCongestionBudget_) trimmed = minCongestionBudget_;
-                peer.congestionBudget       = trimmed;
-                peer.slowStartThreshold     = trimmed;
-                peer.lastLossReactionMicros = nowMicros;
-            }
-        }
-    }
 
     // --- Tick + peer management ---
 
@@ -2071,13 +2791,22 @@ namespace bcp::flux
         {
             PeerHandle peer = peers_.GetPeer(addr);
             if (peer.Failed())
-                return common::Error::PeerNotFound;
+                return common::Error::NotFound;
             pending::Clear(pendingPool_, peer);
 
             // The sweep mutates both directories, so it needs the peer's write
             // lock rather than the read lock above.
-            if ((flows_.SendEnabled() || flows_.ReceiveEnabled()) && peer.Write())
-                flows_.SweepPeer(peer.GetSlotIndex());
+            if (Peer* dying = peer.Write())
+            {
+                // Recorded before the removal below, which is what leaves the
+                // slot leased until this is read. Idle eviction and a handshake
+                // that stopped answering both reach here too, so this one site
+                // covers every way a peer goes away.
+                RecordPeerEvent(*dying, peer.GetSlotIndex(), SocketEvent::PEER_LOST);
+                if (flows_.SendEnabled() || flows_.ReceiveEnabled())
+                    flows_.SweepPeer(peer.GetSlotIndex());
+                    transfers_.SweepPeer(peer.GetSlotIndex());
+            }
         }
         return peers_.RemovePeer(addr);
     }
@@ -2103,6 +2832,7 @@ namespace bcp::flux
                                             // its HS_INIT is already on the way
         if (registration != common::Error::Ok)
             return registration;
+        SeedPeerRecvState(slot);
 
         {
             PeerHandle peerHandle = peers_.GetPeer(addr);
@@ -2151,7 +2881,15 @@ namespace bcp::flux
         // falls back to the protocol default rather than flooding.
         const uint32_t interval = handshakeRetryMicros_ != 0
             ? handshakeRetryMicros_ : internal::HANDSHAKE_RETRY_DEFAULT;
-        const uint32_t retryStamps = interval >> internal::SEEN_STAMP_SHIFT;
+        // At least one stamp. The interval is carried in microseconds and the
+        // gate compares it in stamp grains, so anything under a grain
+        // truncates to zero, the gate becomes "elapsed < 0", and the attempt
+        // count is spent once per tick instead of once per interval. A tight
+        // polling loop then declares a peer unreachable in microseconds. The
+        // same rounding is why the pacing clock keeps its remainder rather
+        // than dropping it.
+        uint32_t retryStamps = interval >> internal::SEEN_STAMP_SHIFT;
+        if (retryStamps == 0) retryStamps = 1;
 
         uint32_t retried = 0;
         uint32_t cursor  = 0;
@@ -2221,13 +2959,34 @@ namespace bcp::flux
     {
         if (!initialized_.load(std::memory_order_acquire)) return;
 
+        // One pass at a time, and a caller who finds one running returns at
+        // once rather than waiting. The pass walks every peer taking write
+        // locks, so concurrent passes queue behind each other's locks and
+        // starve the receive path of the same locks: measured on one socket
+        // serving sixteen peers, eight threads all ticking moved the transfer
+        // 2.6x slower than eight threads with a single ticker. The returning
+        // callers lose nothing, because the pass they skipped was already
+        // doing the work they came to ask for.
+        if (updateGate_.exchange(true, std::memory_order_acquire)) return;
+        UpdatePass(nowOverride);
+        updateGate_.store(false, std::memory_order_release);
+    }
+
+    void Socket::UpdatePass(uint64_t nowOverride)
+    {
         // Before anything else: a handshake nobody finishes strands whatever
         // parked behind it, and the packet carrying it is the one thing here
         // that no retransmit covers, because a peer with no session has no
         // flow state to scan. Paced and bounded internally.
+        // Before anything else on the tick: take what has arrived. Everything
+        // below reasons about peer and flow state that this updates.
+        ReceiveIntoPool();
+
         (void)RetryHandshakes();
 
-        if (!flows_.SendEnabled() && !flows_.ReceiveEnabled() && evictAfterStamp_ == 0) return;
+        // No flow gate on the sweep: idle eviction is mandatory, so the per-peer
+        // pass runs even on a socket with no flows. An empty peer table makes
+        // the loop below break at once.
 
         uint32_t evicted = 0;
         uint32_t cursor = 0;
@@ -2247,6 +3006,7 @@ namespace bcp::flux
                 // held across either call boundary.
                 bool ackDue = false;
                 bool evictIdle = false;
+                bool jammed = false;
                 {
                     PeerHandle peerHandle = peers_.GetPeer(addr);
                     if (peerHandle.Failed() || !peerHandle.Read()) continue;
@@ -2255,17 +3015,34 @@ namespace bcp::flux
                     // the same clock: registration stamped them, handshake
                     // chatter does not refresh (it is forgeable), so an entry
                     // that never completes gets a single timeout to live.
-                    if (evictAfterStamp_ != 0 && evicted < internal::MAX_EVICT_PER_UPDATE)
+                    if (evicted < internal::MAX_EVICT_PER_UPDATE)
                     {
+                        const Peer* alive = peerHandle.Read();
                         const uint32_t nowStamp = SeenStamp(Now(nowOverride));
-                        const uint32_t idleFor =
-                            nowStamp - peerHandle.Read()->lastSeenAt;
+                        const uint32_t idleFor  = nowStamp - alive->lastSeenAt;
                         if (idleFor > evictAfterStamp_) evictIdle = true;
+
+                        // The second silence. A peer can stay alive on the
+                        // receive clock, its data reaches us, while it
+                        // acknowledges nothing we send. Retransmission cannot
+                        // mend a session broken like that, and without this
+                        // check it limps forever: flows fail, the application
+                        // reopens them, and the loop never ends. Same timeout
+                        // as the receive silence, ending in the same clear
+                        // death, and the application answers PEER_LOST with a
+                        // reconnect that rebuilds the state fresh.
+                        if (!evictIdle
+                            && alive->IsValid()
+                            && alive->bytesInFlight > 0
+                            && alive->rtt.SilentForMicros(Now(nowOverride))
+                                   > idleTimeoutMicros_)
+                            evictIdle = true;
                     }
                     if (!evictIdle && flows_.ReceiveEnabled())
                     {
                         const uint64_t now = Now(nowOverride);   // fresh for this peer
                         ackDue = flows_.AnyAckDue(peerHandle.GetSlotIndex(), now);
+                        jammed = flows_.AnyJammed(peerHandle.GetSlotIndex(), now);
                     }
                 }
 
@@ -2285,6 +3062,14 @@ namespace bcp::flux
                 if (ackDue)
                     FlushPeerAcks(addr, peers_.GetPeer(addr));
 
+                // Judged before the announcement, so a cut decided on this tick
+                // goes out on this tick rather than waiting for the next.
+                CutGrantIfAbusive(peers_.GetPeer(addr));
+
+                // Retried every tick until the peer acknowledges it, so a lost
+                // announcement is not a peer that never learns its limit.
+                SendPendingGrant(addr, peers_.GetPeer(addr), Now(nowOverride));
+
                 // Out-flows: open/close retries with give-up, and reliable
                 // retransmits / unreliable loss declarations past the RTO. Each
                 // reads the clock fresh at entry.
@@ -2296,6 +3081,30 @@ namespace bcp::flux
                     // Capacity freed above (and by acks since the last tick)
                     // goes to the packets that have waited longest.
                     DrainWaitingSends(addr);
+                }
+
+                // Transfers run beside the flows on the same tick and the same
+                // peer, sharing its budget and its pacing clock. Its own handle
+                // by value, so nothing is held across the sends inside.
+                if (transfers_.SendEnabled())
+                {
+                    TransferPass(addr, peers_.GetPeer(addr), Now(nowOverride));
+                }
+
+                // A jammed receiving flow pins recv slots for a gap the sender
+                // is not filling. Flagged read-only above, freed here under the
+                // peer write lock, the same context the teardown sweep runs in,
+                // so the flow locks nest peer -> flow. The free re-checks, since
+                // a racing DeliverIn may have moved the cursor meanwhile.
+                if (jammed)
+                {
+                    PeerHandle reclaimHandle = peers_.GetPeer(addr);
+                    Peer* stalled = reclaimHandle.Failed() ? nullptr : reclaimHandle.Write();
+                    if (stalled
+                        && flows_.ReclaimJammedInFlows(reclaimHandle.GetSlotIndex(),
+                                                       Now(nowOverride)) > 0)
+                        RecordPeerEvent(*stalled, reclaimHandle.GetSlotIndex(),
+                                        SocketEvent::PEER_FLOW_JAMMED);
                 }
             }
         }
@@ -2312,7 +3121,7 @@ namespace bcp::flux
 
         // Gather what to do (and the peer materials) under the transferred
         // handle, then send after it drops: nothing locked across a send.
-        bool exhausted = false;   // a reliable packet ran out of retransmits
+        bool assocDead = false;   // owed packets, and nothing resolved for the whole bound
         uint16_t flowId = 0;
         uint32_t resendSlots[FlowTable::RESENDS_PER_ASSOC_PER_TICK];
         uint32_t resendSeqs[FlowTable::RESENDS_PER_ASSOC_PER_TICK];
@@ -2332,39 +3141,43 @@ namespace bcp::flux
             // peer lock, and it drops with the scope, before any send.
             PeerHandle peerHandle = std::move(peer);
             if (peerHandle.Failed()) return;
-            const Peer* readPeer = peerHandle.Read();
+            // Writable from the start, because the retransmit gather spends
+            // the pacing allowance as it collects.
+            Peer* peerState = peerHandle.Write();
             // A packet admitted while the handshake was still running sits in
             // an association with no session to seal it. Retransmits wait for
             // the session rather than burning attempts on a key that does not
             // exist yet.
-            if (!readPeer || !readPeer->IsValid()) return;
+            if (!peerState || !peerState->IsValid()) return;
             flowSlot = flows_.OutAssocAt(peerHandle.GetSlotIndex(), dirIndex);
             if (flowSlot == common::collections::SlotPool::INVALID) return;
 
-            flows_.RetransmitPass(flowSlot, now, ccDelta, flowId, resendSeqs, resendSlots,
-                                  resendN, exhausted);
+            flows_.RetransmitPass(flowSlot, *peerState, now, ccDelta, flowId, resendSeqs, resendSlots,
+                                  resendN, assocDead);
 
-            // Out of retransmits: the remote stopped answering this target.
-            // Runs here because the refund needs the peer's write lock, and
-            // after the association lock dropped so the two never nest wrong.
-            if (exhausted)
+            // The target stopped resolving this flow for the whole stall
+            // bound: a clear death, reported through the event, rather than
+            // probing into silence forever. Runs here because the teardown
+            // needs the peer's write lock, after the association lock dropped
+            // so the two never nest wrong.
+            if (assocDead)
             {
-                if (Peer* dying = peerHandle.Write())
-                {
-                    flows_.FailAssoc(flowSlot, flowId, dying);
-                    return;
-                }
+                const bool justFailed = flows_.FailAssoc(flowSlot, flowId, peerState);
+                if (justFailed && events_.Record(EventScope::OUT_FLOW, flowSlot,
+                                   readyLanes_.LaneOf(peerHandle.GetSlotIndex()),
+                                   SocketEvent::OUTGOING_FLOW_LOST, addr, flowId))
+                    flows_.MarkEmitting(EventScope::OUT_FLOW, flowSlot);
+                return;
             }
 
             const bool hasDelta = ccDelta.resolvedBytes != 0 || ccDelta.sawLoss;
             if (!hasDelta && resendN == 0) return;
 
-            // Congestion feedback applies under this write lock; the resends run
-            // after the scope with nothing held, because a resend takes the
-            // staging read lock and the send path takes staging before the peer.
-            // Doing it under the peer lock would invert that order.
-            Peer* peerState = peerHandle.Write();
-            if (!peerState || !peerState->IsValid()) return;
+            // Congestion feedback applies under the same write borrow. The
+            // resends themselves run after the scope with nothing held,
+            // because a resend takes the staging read lock and the send path
+            // takes staging before the peer. Doing it under the peer lock
+            // would invert that order.
             ApplyCongestion(*peerState, ccDelta, now);
             if (resendN == 0) return;
 
@@ -2386,8 +3199,17 @@ namespace bcp::flux
         // does nothing, so the next tick uses the new address. Resends therefore
         // always target the live location, never the one frozen into the staging
         // slot at first send.
+        // An attempt is only spent when the bytes leave. A dry send pool or a
+        // refused syscall costs the flow nothing, or a peer under load would
+        // exhaust its retries against its own backpressure and fail a flow that
+        // never had a packet dropped.
+        uint32_t unsentSeqs[FlowTable::RESENDS_PER_ASSOC_PER_TICK];
+        uint32_t unsentN = 0;
         for (uint32_t i = 0; i < resendN; ++i)
-            ResendStaging(addr, flowSlot, resendSlots[i], resendSeqs[i], resendMaterials[i]);
+            if (!ResendStaging(addr, flowSlot, resendSlots[i], resendSeqs[i], resendMaterials[i]))
+                unsentSeqs[unsentN++] = resendSeqs[i];
+        if (unsentN > 0)
+            flows_.RefundResendAttempts(flowSlot, unsentSeqs, unsentN);
         for (uint32_t i = 0; i < resendN; ++i)
             common::crypto::Wipe(resendMaterials[i].key.data(), resendMaterials[i].key.size());
     }
@@ -2433,7 +3255,8 @@ namespace bcp::flux
                     return;
                 }
 
-                claimed = flows_.ClaimWaiting(candidate, *peer, *packet);
+                claimed = flows_.ClaimWaiting(candidate, *peer, *packet,
+                                              common::MonotonicMicros());
 
                 if (claimed)
                     materials = GatherSendMaterials(*peer);
@@ -2455,8 +3278,8 @@ namespace bcp::flux
             {
                 const bool tagged = packet->IsTagged();
                 const size_t headerSize = tagged
-                    ? internal::MIN_SECURE_WIRE_SIZE + internal::WIRE_PEER_TAG_SIZE
-                    : internal::MIN_SECURE_WIRE_SIZE;
+                    ? internal::WIRE_SECURE_HEAD_SIZE + internal::WIRE_PEER_TAG_SIZE
+                    : internal::WIRE_SECURE_HEAD_SIZE;
                 const size_t bodyLen = packet->dataSize - headerSize;
                 packet->address = addr;
                 SealSecurePacket(*packet, packet->data + headerSize, headerSize,
@@ -2494,7 +3317,9 @@ namespace bcp::flux
                 PeerHandle peerHandle = peers_.GetPeer(batch[b]);
                 if (peerHandle.Failed() || !peerHandle.Read()) continue;
 
-                const uint64_t deadline = flows_.NextDeadline(peerHandle.GetSlotIndex());
+                const Peer* readPeer = peerHandle.Read();
+                const uint64_t deadline =
+                    flows_.NextDeadline(peerHandle.GetSlotIndex(), *readPeer);
                 if (deadline != UINT64_MAX) consider(deadline);
             }
         }

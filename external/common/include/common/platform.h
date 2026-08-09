@@ -11,21 +11,16 @@
     #include <immintrin.h>
 #endif
 
-#pragma once
 
+// MonotonicMicros needs a clock and nothing else here needs the OS. The socket
+// headers this used to carry now live in flux, which is what wants them.
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN   // avoid winsock1 clashing with winsock2
+        #define WIN32_LEAN_AND_MEAN
     #endif
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")   // MSVC: auto-links winsock, one less linker flag
+    #include <windows.h>                 // QueryPerformanceCounter
 #else
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>               // inet_ntop / inet_pton
-    #include <netdb.h>                   // getaddrinfo / addrinfo (ws2tcpip.h covers these on Windows)
-    #include <time.h>                    // clock_gettime for MonotonicMicros
+    #include <time.h>                    // clock_gettime
 #endif
 
 namespace bcp::common 

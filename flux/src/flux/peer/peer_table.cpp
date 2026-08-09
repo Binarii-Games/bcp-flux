@@ -265,7 +265,7 @@ namespace bcp::flux
 
                 std::atomic_thread_fence(std::memory_order_acquire);
                 if (version.load(std::memory_order_relaxed) == startVersion)
-                    return PeerHandle{common::Error::PeerNotFound};
+                    return PeerHandle{common::Error::NotFound};
             }
 
             // Slow path: probe under the writer lock. Acquiring it excludes
@@ -275,7 +275,7 @@ namespace bcp::flux
             while (writeLock.test_and_set(std::memory_order_acquire))
                 common::CpuPause();
 
-            PeerHandle result{common::Error::PeerNotFound};
+            PeerHandle result{common::Error::NotFound};
             uint32_t pos = static_cast<uint32_t>(hash) & mask;
             for (uint32_t dist = 0; dist < capacity; ++dist)
             {
@@ -392,7 +392,7 @@ namespace bcp::flux
         if (peerCount_.load(std::memory_order_relaxed) >= peerCapacity_)
         {
             UnlockWriter();
-            return common::Error::MaxPeersReached;
+            return common::Error::LimitReached;
         }
 
         if (FindPos(addrIdx_.get(), idxMask_, ah,
@@ -418,7 +418,7 @@ namespace bcp::flux
         if (slot == INVALID_SLOT)
         {
             UnlockWriter();
-            return common::Error::MaxPeersReached;
+            return common::Error::LimitReached;
         }
 
         // A recycled slot holds the previous peer's bytes; write every field.
@@ -429,6 +429,8 @@ namespace bcp::flux
         p->id          = id ? *id : BcpId{};
         p->theirPk     = {};
         p->session     = {};
+        p->headerKey   = {};
+        p->macKey      = {};
         p->sendCounter = 0;
         p->myTagStep    = 0;
         p->theirTagStep = 0;
@@ -438,15 +440,43 @@ namespace bcp::flux
         p->pathStep     = 0;
         std::memset(p->hsSalt, 0, sizeof(p->hsSalt));
         std::memset(p->announcedTag, 0, sizeof(p->announcedTag));
+        p->hsEphSecret = {};
+        p->hsPeerEph   = {};
+        p->hsEphPub    = {};
+        std::memset(p->hsConfirm, 0, sizeof(p->hsConfirm));
         p->pendingHead = common::collections::SlotPool::INVALID;
         p->pendingTail = common::collections::SlotPool::INVALID;
         p->firstSeenAt = SeenStamp(common::MonotonicMicros());
         p->lastSeenAt  = p->firstSeenAt;
         p->congestionBudget     = internal::CC_INITIAL_WINDOW_BYTES;
         p->bytesInFlight        = 0;
+        // Both generations restart with the slot. Inheriting a high one from a
+        // previous occupant would make every grant the new peer sends look
+        // older than what is already applied, and nothing would ever take.
+        p->theirGrant           = 0;   // no limit named yet
+        p->outstandingToPeer    = 0;
+        p->theirGrantGeneration = 0;
+        p->ourGrantGeneration   = 0;
+        p->pacingTokens         = 0;
+        p->pacingRefilledAt     = 0;
+        p->emitting             = false;
+        p->freeWhenRead         = false;
+        p->grantSendPending     = false;   // raised when a session commits
+        p->grantSentAtMicros    = 0;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
-        p->pathSrttMicros       = 0;
-        p->lastLossReactionMicros = 0;
+        p->slowStartQueueSinceMicros = 0;
+        p->rtt.Reset();
+        p->delivery.Reset();
+        p->wMaxBytes             = 0;
+        p->congestionEpochMicros = 0;
+        p->congestionEpoch       = 0;
+        p->starvedCandidateSinceMicros = 0;
+        p->starvedSinceMicros          = 0;
+        p->starvedClearSinceMicros     = 0;
+        p->starvedExitedAtMicros       = 0;
+        p->starvedQueueCapMicros       = 0;
+        p->starvedMinRttMicros         = 0;
+        p->starvedEpisodes             = 0;
         p->state       = HandshakeState::AWAITING_CHALLENGE;
         p->attempts    = 0;
         p->hasId       = (id != nullptr);
@@ -490,7 +520,7 @@ namespace bcp::flux
         {
             peerPool_.UnlockWrite(slot);
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         if (p->hasId)
@@ -536,7 +566,7 @@ namespace bcp::flux
         if (apos == NPOS)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
         const uint32_t slot = addrIdx_[apos].idx.load(std::memory_order_relaxed);
 
@@ -585,7 +615,7 @@ namespace bcp::flux
         if (bpos == NPOS)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
         const uint32_t slot = bcpIdx_[bpos].idx.load(std::memory_order_relaxed);
 
@@ -636,7 +666,7 @@ namespace bcp::flux
         if (apos == NPOS || addrIdx_[apos].idx.load(std::memory_order_relaxed) != slot)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         if (newAddr == oldAddr)
@@ -703,7 +733,7 @@ namespace bcp::flux
         if (apos == NPOS || addrIdx_[apos].idx.load(std::memory_order_relaxed) != slot)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         const uint32_t v = version_.load(std::memory_order_relaxed);
@@ -732,7 +762,7 @@ namespace bcp::flux
         if (tpos == NPOS)
         {
             UnlockWriter();
-            return common::Error::PeerNotFound;
+            return common::Error::NotFound;
         }
 
         const uint32_t v = version_.load(std::memory_order_relaxed);
@@ -820,7 +850,7 @@ namespace bcp::flux
 
             // The index moved while we probed; drop every pin and retry.
             for (uint32_t i = 0; i < pinned; ++i)
-                out[i] = PeerHandle{common::Error::PeerNotFound};
+                out[i] = PeerHandle{common::Error::NotFound};
         }
 
         // Slow path: probe under the writer lock, where the index is frozen
@@ -960,8 +990,32 @@ namespace bcp::flux
     {
         // No index entry references the slot anymore, so no new handle can be
         // minted for it; the write lock waits out the handles that still exist.
-        peerPool_.WriteLock(slot);
+        Peer* peer = reinterpret_cast<Peer*>(peerPool_.WriteLock(slot));
+
+        // An unread event about this peer is sitting in the slot's event entry.
+        // Releasing now would let a later peer land on that entry and write
+        // over it, so the lease is held and ClearEmitting releases it once the
+        // event has been delivered. The slot is already unreachable by then,
+        // which is what makes holding it harmless.
+        const bool emitting = peer && peer->emitting;
+        if (emitting) peer->freeWhenRead = true;
+
         peerPool_.UnlockWrite(slot);
-        peerPool_.Release(slot);
+        if (!emitting) peerPool_.Release(slot);
+    }
+
+    void PeerTable::ClearEmitting(uint32_t slot) noexcept
+    {
+        if (slot >= peerPool_.GetCapacity()) return;
+        bool release = false;
+        Peer* peer = reinterpret_cast<Peer*>(peerPool_.WriteLock(slot));
+        if (peer)
+        {
+            peer->emitting = false;
+            release = peer->freeWhenRead;
+            peer->freeWhenRead = false;
+        }
+        peerPool_.UnlockWrite(slot);
+        if (release) peerPool_.Release(slot);
     }
 }

@@ -1,0 +1,16 @@
+name: android build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Cross-compiles everything and runs nothing: there is no device on a runner
+# to execute tests, so this badge attests compilation.
+jobs:
+  arm64:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: ubuntu-latest
+      buildonly: true
+      cmake: -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DBCP_SANITIZE= -DBCP_EXAMPLES=OFF

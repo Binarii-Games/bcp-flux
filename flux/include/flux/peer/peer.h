@@ -7,6 +7,8 @@
 
 #include <flux/address.h>
 #include <flux/internal/constants.h>
+#include <flux/internal/delivery.h>
+#include <flux/internal/rtt.h>
 #include <flux/peer/peer_id.h>
 
 namespace bcp::flux
@@ -56,6 +58,15 @@ namespace bcp::flux
             Derived with the session, discarded with it. */
         common::crypto::SessionKey headerKey;
 
+        /** Authenticates a MAC-only packet, which is not encrypted and so has
+            no AEAD tag to be covered by. Separate from `session` because the
+            obvious later optimisation is to swap BLAKE2b for the Poly1305 the
+            AEAD already computes, and a Poly1305 key must never be reused
+            across messages. Sharing the session key would make that change
+            silently forgeable rather than merely wrong. Derived with the
+            session, discarded with it. */
+        common::crypto::SessionKey macKey;
+
         /** Nonce counter for packets we encrypt to this peer. Travels in each
             packet, so the remote never tracks it.
 
@@ -94,6 +105,22 @@ namespace bcp::flux
             responder side, which gets no announcement. */
         uint8_t announcedTag[internal::WIRE_HS_TAG_SIZE];
 
+        /** Handshake ephemeral state, and the whole point of it is that the
+            secret half does not outlive the exchange. It is wiped the moment
+            the session is derived, which is what stops a later theft of the
+            long-lived key from opening traffic recorded today.
+
+            hsEphSecret is the initiator's, held between HS_RES and HS_FINISH.
+            The other three are the responder's, and exist so a duplicate
+            HS_RES can be answered with the identical HS_FINISH rather than
+            re-keyed: the responder cannot re-derive its old answer once its
+            secret is gone, and the initiator cannot accept a re-key once its
+            own is gone either. hsPeerEph is what tells the two apart. */
+        common::crypto::SecretKey hsEphSecret;
+        common::crypto::PublicKey hsPeerEph;    ///< initiator's ephemeral, as accepted
+        common::crypto::PublicKey hsEphPub;     ///< our ephemeral, to repeat the answer
+        uint8_t hsConfirm[internal::WIRE_HS_MAC_SIZE];
+
         /** Packets queued before the handshake finished, as an intrusive list
             in the socket's pending pool: each slot holds the next index, so the
             peer keeps only the ends. UINT32_MAX (SlotPool::INVALID) means empty;
@@ -116,10 +143,123 @@ namespace bcp::flux
             @pre Read and written under the slot write lock, like sendCounter. */
         uint32_t congestionBudget;        ///< ceiling on in-flight flow bytes
         uint32_t bytesInFlight;           ///< flow bytes sent, not yet resolved
+
+        /** Recv slots this remote said it will hold for us at once. Bounds what
+            we may leave outstanding to it, alongside the congestion window.
+            Zero means it has named no limit. */
+        uint32_t theirGrant;
+
+        /** Packets sent to this remote that it has not yet resolved. Compared
+            against theirGrant, so this side stops sending what the far side
+            would only throw away.
+
+            An estimate rather than the truth. It cannot see what the remote has
+            delivered but its application has not polled, so it reads low. The
+            remote's own enforcement is authoritative and this only spares the
+            bandwidth of sending into a refusal. */
+        uint32_t outstandingToPeer;
+
+        /** Generation of the newest grant applied from this remote, so an op
+            that arrives out of order is ignored rather than undoing a newer
+            one. */
+        uint32_t theirGrantGeneration;
+
+        /** Generation of the last grant this side sent, incremented when the
+            value changes so the remote can order them. */
+        uint32_t ourGrantGeneration;
+
+        /** Set while this peer still owes us an acknowledgement for our current
+            grant. Raised when a session commits and again whenever the value
+            changes, cleared by an ack naming ourGrantGeneration. The tick
+            resends while it is set, which is what makes an announcement
+            survive a lost packet. */
+        bool grantSendPending;
+
+        /** When the pending grant last went out. The tick paces the resend
+            against this, because a flag alone would put one op on the wire per
+            tick for as long as the ack takes. Zero sends at the first
+            opportunity. */
+        uint64_t grantSentAtMicros;
+
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
-                                          ///< at or above, it grows one packet per round-trip
-        uint32_t pathSrttMicros;          ///< smoothed round-trip time; 0 until the first sample
-        uint64_t lastLossReactionMicros;  ///< last trim, so a loss trims at most once per round-trip
+                                          ///< at or above, the curve decides
+
+        /** When a standing queue was first seen while still in slow start,
+            0 while the path reads clean. The ramp doubles until the newest
+            sample shows a queue, holds flat while this clock runs, and ends
+            slow start when the queue outlives the confirmation. Timed rather
+            than counted, because the question it answers is how long the
+            queue persisted, not how many acknowledgements arrived while it
+            did. */
+        uint64_t slowStartQueueSinceMicros;
+
+        /** The budget this peer held when congestion was last detected, and
+            when that happened. The curve climbs back toward the first as a
+            function of time since the second, which is what makes recovery
+            independent of how long the path is. */
+        uint32_t wMaxBytes;
+        uint64_t congestionEpochMicros;
+
+        /** Which congestion event the packets now in flight belong to.
+            Incremented on every reaction, and stamped onto each packet as it is
+            sent, so a loss reported afterwards can be told apart: one carrying
+            an older epoch was already on the path when we reacted and is part
+            of the event we already answered, while one carrying the current
+            epoch left after it and is news. Bounds the reaction to one per
+            event exactly, where a clock could only ever approximate it. */
+        uint8_t congestionEpoch;
+
+        /** The starvation verdict, and the bookkeeping that reaches it.
+
+            A sender that answers a standing queue by holding back can be
+            starved by a neighbour that answers the same queue by filling
+            further. The verdict is reached when the budget has sat under
+            CC_STARVED_BUDGET_BYTES with the queue over target continuously
+            for the confirm window, with acknowledgements still arriving.
+            While it holds, the queue level recorded at the verdict replaces
+            the queue target: the budget regrows at ramp speed while the
+            queue stays at or under that level and holds when pushing past
+            it, so the sender competes for queue space that already exists
+            rather than adding more. The verdict lifts when the queue reads
+            under the ordinary target for the exit window, which means the
+            competitor left rather than paused.
+
+            The minimum round trip is frozen alongside the level. The live
+            minimum is remembered through a rotating window, and a queue that
+            stands longer than the window fills every bucket with queued
+            samples, so the reading the bound depends on deflates while the
+            real queue does not. Measured against the live minimum the bound
+            never engaged and the recovery drove the buffer to its drop
+            ceiling. Everything the verdict judges is therefore measured
+            against the minimum as it stood when the verdict was reached.
+
+            An exit does not forget the references. A competitor's probe
+            cycle can fake a departure, and a relapse inside the re-entry
+            window re-engages immediately with the kept bound, because a
+            fresh capture mid-contention would freeze a minimum the standing
+            queue has already corrupted. starvedExitedAtMicros times that
+            window, and a path clean past it forgets the episode.
+
+            starvedSinceMicros nonzero is the verdict itself. The candidate
+            and clear stamps time the entry and exit confirmation windows.
+            starvedEpisodes counts verdicts reached over the peer's
+            lifetime. */
+        uint64_t starvedCandidateSinceMicros;
+        uint64_t starvedSinceMicros;
+        uint64_t starvedClearSinceMicros;
+        uint64_t starvedExitedAtMicros;
+        uint32_t starvedQueueCapMicros;
+        uint32_t starvedMinRttMicros;
+        uint32_t starvedEpisodes;
+
+        /** The path to this peer, and the deadline built from it. Every flow
+            to this peer shares it, because they all cross the same wire. */
+        internal::RttEstimate rtt;
+
+        /** What this path was measured to carry. Read only where a loss is
+            being classified, to ask whether this sender was going fast enough
+            for the loss to have been its own doing. */
+        internal::DeliveryEstimate delivery;
 
         HandshakeState state;
         uint8_t attempts;      ///< handshake attempts so far; retry policy is the caller's
@@ -132,6 +272,27 @@ namespace bcp::flux
             message is authenticated, so until this is set the identity bound
             here is only what the message claimed. */
         bool    confirmed;
+
+        /** Pacing. `pacingTokens` is how many bytes may still leave right now,
+            topped up from the rate since `pacingRefilledAt` and capped at a
+            small burst. Zero tokens with a live round-trip sample is the gate
+            saying wait, not saying no: the packet goes to a flow's waiting ring
+            and the tick releases it when the clock has caught up.
+
+            Untouched until a round trip has been measured, since there is no
+            rate to pace at before that. */
+        uint32_t pacingTokens;
+        uint64_t pacingRefilledAt;
+
+        /** An event about this peer has been recorded and nobody has read it
+            yet. Removal leaves the slot leased while it is set, so a later peer
+            cannot land on the entry the event is sitting in, and whoever
+            delivers it releases the slot instead. `freeWhenRead` is how the
+            deferred removal is remembered, since unlike an association there is
+            no lifecycle value already meaning it. Both written under this
+            peer's write lock. */
+        bool emitting;
+        bool freeWhenRead;
 
         bool IsValid() const { return state == HandshakeState::ESTABLISHED; }
     };

@@ -62,7 +62,7 @@ static void rejects_older_than_window()
 }
 
 // Reset clears the mark and bitmap, so a counter seen before the reset is
-// accepted again — the state both sides need after re-keying to counter 1.
+// accepted again. Both sides need that state after re-keying to counter 1.
 static void reset_reopens_window()
 {
     uint64_t state[2] = {0, 0};

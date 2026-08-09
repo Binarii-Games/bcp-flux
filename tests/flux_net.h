@@ -1,8 +1,8 @@
 #pragma once
 
 // Shared scaffolding for tests and benches that drive real Flux sockets over
-// the loopback interface. The platform boilerplate — which backend to use, and
-// starting Winsock on Windows — lives here once so each test reads as the
+// the loopback interface. The platform boilerplate (which backend to use,
+// and starting Winsock on Windows) lives here once so each test reads as the
 // scenario it exercises, not as setup. All helpers are header-inline; every
 // test binary links its own copy.
 #include <common/platform.h>   // OS socket headers, incl. Winsock on Windows
