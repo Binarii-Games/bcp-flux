@@ -242,8 +242,23 @@ namespace bcp::flux
         // A retransmitted announcement finds the transfer already here. That
         // is the common case on a lossy path and must not raise a second
         // event or reset what has already arrived.
+        //
+        // It still earns an answer, and that is the whole point of handling it
+        // rather than ignoring it. A sender re-announces only because it has
+        // heard nothing, so a receiver that stays quiet here turns one lost
+        // acknowledgement into a transfer that never starts: the sender holds
+        // every data packet behind announceAcked, re-announces on the timeout,
+        // is met with silence again, and backs off until the peer times out.
+        // Measured on a link losing ten percent, where it deadlocked the
+        // transfer at zero bytes with the receiver's buffer already attached.
         const uint32_t existing = FindIn(peerSlot, transferId);
-        if (existing != NPOS) return common::Error::Ok;
+        if (existing != NPOS)
+        {
+            InTransfer* held = reinterpret_cast<InTransfer*>(inPool_.WriteLock(existing));
+            if (held) held->ackOwed = true;
+            inPool_.UnlockWrite(existing);
+            return common::Error::Ok;
+        }
 
         DirEntry* row = &inDir_[static_cast<size_t>(peerSlot) * TransferTable::MAX_PER_PEER];
         uint32_t free = TransferTable::MAX_PER_PEER;
