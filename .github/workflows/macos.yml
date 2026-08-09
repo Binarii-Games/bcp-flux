@@ -1,0 +1,12 @@
+name: macos
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  clang:
+    uses: ./.github/workflows/build.yml
+    with:
+      os: macos-latest
