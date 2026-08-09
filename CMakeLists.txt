@@ -245,5 +245,20 @@ target_include_directories(grant_reduction PRIVATE flux/src)
 # slower, so it gets more room than the ordinary integration budget.
 set_tests_properties(concurrent_flows PROPERTIES TIMEOUT 600)
 
+# The sharing bench meets msquic head to head, so it exists only where msquic
+# does. Brew, apt and vcpkg all ship libmsquic, and absence just skips it.
+find_path(MSQUIC_INCLUDE_DIR msquic.h
+    HINTS /opt/homebrew/opt/libmsquic/include /usr/local/opt/libmsquic/include)
+find_library(MSQUIC_LIBRARY msquic
+    HINTS /opt/homebrew/opt/libmsquic/lib /usr/local/opt/libmsquic/lib)
+if(MSQUIC_INCLUDE_DIR AND MSQUIC_LIBRARY)
+    add_executable(link_share_bench tests/bench/msquic/link_share_bench.cpp)
+    target_link_libraries(link_share_bench PRIVATE flux ${MSQUIC_LIBRARY})
+    target_include_directories(link_share_bench PRIVATE tests ${MSQUIC_INCLUDE_DIR})
+    target_compile_definitions(link_share_bench PRIVATE QUIC_API_ENABLE_PREVIEW_FEATURES)
+    add_test(NAME link_share_bench COMMAND link_share_bench bbr)
+    set_tests_properties(link_share_bench PROPERTIES LABELS bench TIMEOUT 600)
+endif()
+
 register_tests("external/common/tests/unit/*.cpp"  unit  240 common external/common/tests)
 register_tests("external/common/tests/bench/*.cpp" bench 600 common external/common/tests)
