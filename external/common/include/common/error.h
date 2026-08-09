@@ -45,6 +45,9 @@ namespace bcp::common {
         // Work already under way
         AlreadyPending   = 40,
         TooManyPending   = 41,
+
+        // Declined by the far side rather than failed locally
+        Refused          = 50,
     };
 
     inline const char* ErrorToString(Error err) {
@@ -70,6 +73,7 @@ namespace bcp::common {
             case Error::NotAuthenticated: return "Not authenticated";
             case Error::AlreadyPending:   return "Already pending";
             case Error::TooManyPending:   return "Too many pending";
+            case Error::Refused:          return "Refused";
             default:                      return "Unknown error";
         }
     }
