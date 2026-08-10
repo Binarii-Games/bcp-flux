@@ -7,9 +7,9 @@
 // rate limit alone cannot produce bufferbloat, and bufferbloat is what
 // separates a controller that finds the bottleneck from one that fills it.
 //
-// Shared because two callers need the identical link. The bench prints what it
-// measures and the performance gate asserts against it, and a second copy of
-// this file would let those two drift into measuring different things.
+// Kept apart from the bench that prints it, so the link and the presentation
+// of it stay separable and a second measurement can meet the identical link
+// rather than a second copy of one.
 
 #include <flux/socket/socket.h>
 #include <flux/address.h>

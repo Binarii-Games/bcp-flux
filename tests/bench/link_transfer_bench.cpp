@@ -1,6 +1,5 @@
 // What the protocol does on a link rather than what a packet costs, printed
-// as a table. The link itself is in link_model.h, shared with the performance
-// gate so the two cannot drift into measuring different things.
+// as a table. The link itself is in link_model.h.
 //
 // One transfer crosses the link once per row: clean, under independent loss at
 // one, two and five percent, and under Gilbert-Elliott loss at the same
@@ -11,8 +10,7 @@
 // Timings are wall clock through a real scheduler. The burst rows in
 // particular move several seconds between runs, because where a burst lands
 // against the window decides how much serialises behind the repair, so read
-// them as a shape rather than a number. The gate deliberately does not use
-// them for that reason.
+// them as a shape rather than a number, and never as a threshold.
 //
 //   link_transfer_bench [MiB] [filter]
 //
