@@ -202,18 +202,19 @@ namespace
                 line.pop_front();
             }
 
-            if (line.empty())
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-            else
+            // Spin instead of sleeping. The shortest sleep Windows grants is
+            // a timer tick, near 16 ms unless the process raises the rate,
+            // and a tick of delay on every release is jitter the congestion
+            // controller reads as queue growth: measured on one such machine,
+            // the clean row fell from 96 percent of the link to 39. One core
+            // for the relay is the price of releasing packets when the model
+            // says they are due.
             {
-                const uint64_t due = line.front().dueMicros;
-                const uint64_t at  = NowMicros();
-                if (due > at)
-                {
-                    const uint64_t wait = due - at;
-                    std::this_thread::sleep_for(std::chrono::microseconds(
-                        wait < 200 ? wait : 200));
-                }
+                const uint64_t at = NowMicros();
+                uint64_t until    = at + 200;
+                if (!line.empty() && line.front().dueMicros < until)
+                    until = line.front().dueMicros;
+                while (NowMicros() < until) { /* the relay owns this core */ }
             }
         }
         udp_raw::Close(fd);

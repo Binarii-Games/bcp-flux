@@ -285,7 +285,17 @@ namespace
                 nextReport += REPORT_MICROS;
             }
 
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            // Spin instead of sleeping, for the reason given in link_model.h:
+            // the shortest sleep Windows grants is a timer tick, and a tick
+            // of release jitter reads as queue growth to a delay-based sender.
+            {
+                const uint64_t at = NowMicros();
+                uint64_t until    = at + 100;
+                for (const Bottleneck* queue : { &toServer, &toClient })
+                    if (!queue->line.empty() && queue->line.front().dueMicros < until)
+                        until = queue->line.front().dueMicros;
+                while (NowMicros() < until) { /* the relay owns this core */ }
+            }
         }
 
         result.fluxDrops = dropped[0];
