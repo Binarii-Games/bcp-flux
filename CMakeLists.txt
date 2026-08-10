@@ -189,11 +189,17 @@ endif()
 #   integration/  full processes and edge cases      label: integration
 #   acceptance/   properties a finished feature owes  label: acceptance
 #   bench/        performance against a baseline      label: bench
+#   perf/         performance that must not regress   label: perf
 #
 # Fast CI runs unit + integration on every commit:
 #   ctest -LE "bench|acceptance"
 # The benches are heavier and run on demand or nightly:  ctest -L bench
-
+#
+# The perf tests are the benches' pass/fail counterpart: a bench prints what
+# happened, a perf test fails when a number that must hold stops holding. They
+# need a Release build, because a sanitized one measures the sanitizer, so they
+# stay out of the ordinary gate and run in their own CI job:
+#   ctest -L perf
 #
 # Acceptance tests state what a feature must do once it is finished, so they are
 # written before the feature and fail until it lands. That is the point of them,
@@ -227,6 +233,7 @@ register_tests("tests/unit/*.cpp"        unit        240 flux tests)
 register_tests("tests/integration/*.cpp" integration 240 flux tests)
 register_tests("tests/acceptance/*.cpp"  acceptance  240 flux tests)
 register_tests("tests/bench/*.cpp"       bench       600 flux tests)
+register_tests("tests/perf/*.cpp"        perf        900 flux tests)
 
 # The fault-injecting kernel sits beside the platform kernels in flux's private
 # tree, so a test that drives one needs the same view of them the library has.

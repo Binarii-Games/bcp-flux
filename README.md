@@ -5,6 +5,7 @@
 [![macos](https://github.com/Binarii-Games/bcp-flux/actions/workflows/macos.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/macos.yml)
 [![android](https://github.com/Binarii-Games/bcp-flux/actions/workflows/android.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/android.yml)
 [![ios](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ios.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ios.yml)
+[![perf](https://github.com/Binarii-Games/bcp-flux/actions/workflows/perf.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/perf.yml)
 
 A connectionless, encrypted UDP transport in C++20. There is no connection
 object, nothing allocates on the packet path, and one socket carries reliable
@@ -387,6 +388,15 @@ cmake --build build-rel
 
 `ctest --test-dir build-rel -L bench` runs the whole set. Benches print
 numbers and always exit 0.
+
+A bench says what happened. Its pass/fail counterpart is `ctest -L perf`,
+which fails when a number that must hold stops holding, and runs on every push
+in its own Release job. It gates the clean and independent-loss rows only: the
+burst rows swing by up to forty percent between runs on one machine, because a
+seeded model fixes which packets drop but not where a burst falls against the
+window, and gating on that would fail for no reason. Each loss row is compared
+against the clean row from the same run, so the result does not depend on how
+fast the runner is.
 
 Every bench builds from this repo alone except one. The sharing bench races
 Flux against QUIC, and msquic is not vendored here, so it has to be installed

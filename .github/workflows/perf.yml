@@ -1,0 +1,28 @@
+name: perf
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Release, and only Release. A sanitized build runs the same emulated link at
+# about 78 percent of it where Release holds 90, so it would measure the
+# instrumentation rather than the transport and the thresholds would be wrong.
+#
+# One job on one OS. The test compares each loss row against the clean row from
+# the same run, so it does not care how fast the runner is, and running it on
+# five platforms would buy repetition rather than coverage.
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure
+        run: cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release
+
+      - name: build
+        run: cmake --build build-rel --parallel 4
+
+      - name: performance
+        run: ctest --test-dir build-rel -L perf --output-on-failure
