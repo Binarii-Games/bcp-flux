@@ -193,6 +193,7 @@ endif()
 # Fast CI runs unit + integration on every commit:
 #   ctest -LE "bench|acceptance"
 # The benches are heavier and run on demand or nightly:  ctest -L bench
+
 #
 # Acceptance tests state what a feature must do once it is finished, so they are
 # written before the feature and fail until it lands. That is the point of them,
@@ -252,6 +253,14 @@ find_path(MSQUIC_INCLUDE_DIR msquic.h
     HINTS /opt/homebrew/opt/libmsquic/include /usr/local/opt/libmsquic/include)
 find_library(MSQUIC_LIBRARY msquic
     HINTS /opt/homebrew/opt/libmsquic/lib /usr/local/opt/libmsquic/lib)
+if(NOT MSQUIC_INCLUDE_DIR OR NOT MSQUIC_LIBRARY)
+    message(STATUS
+        "msquic not found: skipping link_share_bench. "
+        "Install libmsquic and reconfigure to build it (see README, Benchmarks).")
+else()
+    message(STATUS "msquic found: ${MSQUIC_LIBRARY}")
+endif()
+
 if(MSQUIC_INCLUDE_DIR AND MSQUIC_LIBRARY)
     add_executable(link_share_bench tests/bench/msquic/link_share_bench.cpp)
     target_link_libraries(link_share_bench PRIVATE flux ${MSQUIC_LIBRARY})

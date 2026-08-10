@@ -388,6 +388,10 @@ cmake --build build-rel
 `ctest --test-dir build-rel -L bench` runs the whole set. Benches print
 numbers and always exit 0.
 
+Every bench builds from this repo alone except one. The sharing bench races
+Flux against QUIC, and msquic is not vendored here, so it has to be installed
+before that bench exists. See below.
+
 ### Send path
 
 Flux against the bare `sendto()` syscall underneath it, median of 30,000
@@ -471,9 +475,36 @@ model measured 255.7 s at 33.6 Mbit, a third slower on a clean link.
 
 Both senders move 100 MiB through ONE shared tail-drop queue, started
 together, which is what makes them interact: whoever keeps more in flight
-occupies more of the queue and pushes the other toward the drop tail. This
-bench needs libmsquic installed (brew, apt and vcpkg all carry it), and the
-build skips it when msquic is absent.
+occupies more of the queue and pushes the other toward the drop tail.
+
+This is the one bench with an outside dependency. msquic is not vendored,
+because it is a large production stack with its own build and its own release
+cadence, and pinning a copy here would mean maintaining it. Install it first
+and reconfigure:
+
+```sh
+# macOS
+brew install libmsquic
+
+# Debian and Ubuntu, from Microsoft's package feed
+curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+  | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc >/dev/null
+sudo apt-add-repository https://packages.microsoft.com/ubuntu/$(lsb_release -rs)/prod
+sudo apt update && sudo apt install libmsquic
+
+# Windows, or anywhere the above does not reach
+# build from source: https://github.com/microsoft/msquic
+```
+
+```sh
+cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release
+```
+
+CMake looks for msquic at configure time and prints which way it went. Without
+it every other bench still builds and runs, and only this one is absent, so
+missing it costs you one table rather than the suite.
+
+The numbers below came from msquic 2.5.9.
 
 ```sh
 ./build-rel/link_share_bench bbr
