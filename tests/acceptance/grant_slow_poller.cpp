@@ -46,8 +46,12 @@ namespace
 {
     constexpr uint32_t RECV_SLOTS     = 128;
     constexpr uint32_t QUIET_MESSAGES = 16;
-    constexpr uint32_t POLL_EVERY     = 60;   // rounds between drains
-    constexpr uint32_t FLOOD_PER_ROUND = 24;
+
+    // Datagrams the flooder pushes to saturate the pool, far past RECV_SLOTS so
+    // every slot its grant allows is pinned. Sent in passes, each taken in
+    // before the next, so the OS buffer never has to hold the whole flood.
+    constexpr uint32_t SATURATE_PASSES = 24;
+    constexpr uint32_t FLOOD_PER_PASS  = 24;
 
     using flux_net::Loopback;
     using flux_net::Established;
@@ -104,7 +108,7 @@ namespace
         sc.flows.stagingCount        = 1024;
         sc.flows.reliableWaitCount   = 1024;
         sc.flows.unreliableWaitCount = 4096;
-        sc.flows.minCongestionBudget = 64u * 1024u * 1024u;
+        sc.flows.minCongestionBudget = 4u * 1024u * 1024u;   // above one bulk window, under the ceiling
         sc.port = flooderPort;
         if (flooder.Init(sc) != common::Error::Ok) return 0;
         sc.port = quietPort;
@@ -120,46 +124,58 @@ namespace
 
         const std::vector<uint8_t> body(400, 0x77);
         std::vector<bool> arrived(QUIET_MESSAGES, false);
-        uint32_t delivered = 0, sent = 0, round = 0;
 
-        const auto start = std::chrono::steady_clock::now();
-        while (delivered < QUIET_MESSAGES &&
-               std::chrono::steady_clock::now() - start < std::chrono::seconds(12))
+        // The whole scenario runs without a single collection, which is what
+        // makes it a decision about the grant rather than a race for a freed
+        // slot: the "slow reader" reads nothing until the very end, so no slot
+        // is ever handed back for the quiet peer to slip into.
+
+        // 1. Saturate the pool. The flooder pushes far more than it holds, taken
+        //    in pass by pass, so every slot its grant allows is pinned. Without
+        //    a grant that is the whole pool; with one it is exactly the grant.
+        for (uint32_t pass = 0; pass < SATURATE_PASSES; ++pass)
         {
-            for (uint32_t i = 0; i < FLOOD_PER_ROUND; ++i)
+            for (uint32_t i = 0; i < FLOOD_PER_PASS; ++i)
                 (void)flooder.BuildPacket().WithFlow(floodFlow)
                              .PutBytes(body.data(), body.size()).Send(receiverAddr);
             flooder.Flush();
+            receiver.Update();   // pin what fits; never Poll, so nothing is freed
+        }
 
-            if (sent < QUIET_MESSAGES)
-            {
-                const uint32_t tag = sent;
-                if (quiet.BuildPacket().WithFlow(quietFlow).PutU32(tag)
-                         .Send(receiverAddr) == common::Error::Ok)
-                    ++sent;
-            }
+        // 2. The quiet peer sends its whole run against the pinned pool and
+        //    retransmits into whatever room the grant leaves. The flooder has
+        //    stopped, so nothing competes for a slot the quiet peer is admitted
+        //    to; whether it is admitted at all is the grant's decision.
+        for (uint32_t m = 0; m < QUIET_MESSAGES; ++m)
+            (void)quiet.BuildPacket().WithFlow(quietFlow).PutU32(m).Send(receiverAddr);
+        for (int i = 0; i < 400; ++i)
+        {
             quiet.Flush();
+            quiet.Update();
+            receiver.Update();   // still no Poll: the flood stays pinned
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
 
-            receiver.Update();   // takes packets off the socket every round
-            if (++round % POLL_EVERY == 0)   // but the application collects rarely
+        // 3. Only now does the reader collect, and it drains the ready queue
+        //    without taking anything new off the socket, so the count is exactly
+        //    what step 2 admitted rather than what draining then let in.
+        uint32_t delivered = 0;
+        for (int drain = 0; drain < 32; ++drain)
+        {
+            flux::PacketSlotHandle inbox[128];
+            flux::PollCursor cursor = receiver.Poll(inbox, 128);
+            if (cursor.PacketCount() == 0) { for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid(); break; }
+            while (cursor.Next())
             {
-                flux::PacketSlotHandle inbox[64];
-                flux::PollCursor cursor = receiver.Poll(inbox, 64);
-                while (cursor.Next())
+                flux::PacketSlotReader& reader = cursor.Message();
+                uint32_t tag = 0;
+                if (reader.TakeU32(tag) && tag < QUIET_MESSAGES && !arrived[tag])
                 {
-                    flux::PacketSlotReader& reader = cursor.Message();
-                    uint32_t tag = 0;
-                    if (reader.TakeU32(tag) && tag < QUIET_MESSAGES && !arrived[tag])
-                    {
-                        arrived[tag] = true;
-                        ++delivered;
-                    }
+                    arrived[tag] = true;
+                    ++delivered;
                 }
             }
-            receiver.Flush();
-            Pump(quiet);
-            Pump(flooder);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            for (auto& h : inbox) h = flux::PacketSlotHandle::Invalid();
         }
 
         quiet.CloseFlow(quietFlow);

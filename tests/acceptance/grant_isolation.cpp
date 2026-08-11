@@ -99,9 +99,11 @@ namespace
         config.flows.stagingCount = 2048;
         // High throughput rather than misbehaviour. These are the sender's own
         // limits, so a remote sets them however it likes and the receiver never
-        // sees the choice.
+        // sees the choice. The floor sits well above one bulk flow window, so
+        // congestion never throttles the abuser, and under the pool ceiling
+        // that maxOutPerPeer sets, so Init accepts it.
         config.flows.reliableWaitCount   = 8192;
-        config.flows.minCongestionBudget = 64u * 1024u * 1024u;
+        config.flows.minCongestionBudget = 4u * 1024u * 1024u;
         config.timers.retryIntervalMicros = retryMicros;
         return socket.Init(config);
     }
