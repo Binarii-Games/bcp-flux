@@ -424,6 +424,47 @@ namespace bcp::flux
         PollCursor Poll(PacketSlotHandle* outPackets, size_t max,
                         ThreadIdentity identity = {});
 
+        /** Poll for a caller that wants indices rather than handles: same lane
+            claim, same event dispatch, same drain, but each delivered packet
+            arrives as its bare recv-pool index, leased and unlocked. The lease
+            alone keeps the bytes stable, which is the same footing a queued
+            packet already waits on; a reader takes the slot's lock only while
+            actually reading (PacketAt then Read then Detach).
+
+            The lane stays claimed until ReleasePollLane, and holding it across
+            the reading is what keeps one peer's traffic on one thread, exactly
+            as the cursor does for Poll. `lane` is in-out: the preference in,
+            the claimed lane out, ReadyLanes::NO_LANE when every lane was busy.
+
+            Every index handed out owes the pool one release, through
+            ReleaseRecvSlot with the generation read at delivery. Nothing else
+            returns these slots; forgetting one drains the pool for good. */
+        uint32_t PollSlots(uint32_t* outIndices, size_t max, uint32_t& lane);
+
+        /** Hands the lane back. With no cursor to do it, the caller of
+            PollSlots owes exactly one of these per successful claim. A stale
+            or NO_LANE value is ignored. */
+        void ReleasePollLane(uint32_t lane) noexcept;
+
+        /** A handle over a delivered recv slot, rebuilt from its index and
+            stamped with this socket, so it can read the packet and build a
+            reply. The handle owns the lease while it lives: a caller keeping
+            the slot MUST Detach() rather than let the handle die, or the death
+            releases what the index still names. Invalid when out of range or
+            the socket is down. */
+        [[nodiscard]] PacketSlotHandle PacketAt(uint32_t idx);
+
+        /** Returns a delivered slot to the receive pool, guarded by the
+            generation taken at delivery: a stale pair reports NotFound and
+            frees nothing, which is what makes a double release from an
+            undisciplined caller harmless. The one legitimate end of every
+            index PollSlots handed out. */
+        [[nodiscard]] common::Error ReleaseRecvSlot(uint32_t idx, uint32_t generation);
+
+        /** The generation currently on a recv slot, to pair with its index
+            into a name. Read it at delivery, while the lease is yours. */
+        [[nodiscard]] uint32_t RecvGenerationOf(uint32_t idx) const;
+
 
         /** The tick: flush owed acks, retransmit, retry open/close, evict idle
             peers. Flux owns no thread, so time-based work happens only here.
@@ -469,6 +510,27 @@ namespace bcp::flux
             @warning Drop the handle before calling anything else on this socket
                      for that peer. */
         [[nodiscard]] PeerHandle GetPeer(const Address& addr);
+
+        /** The peer in `slot`, but only if it is still the one `generation`
+            was taken for, so a caller can name a peer by a pair of integers
+            instead of by an address it would have to store.
+
+            For a boundary that cannot hold an Address: a language binding, a
+            table keyed by peer, anything that wants a peer to be a value small
+            enough to copy. A slot index alone would not do, because slots are
+            recycled and the next tenant would answer to the old number; the
+            generation is what makes a stale pair report a failed handle
+            instead. Pair it with PeerGenerationOf.
+
+            @warning Same rule as the address overload: drop the handle before
+                     calling anything else on this socket for that peer. */
+        [[nodiscard]] PeerHandle GetPeerBySlot(uint32_t slot, uint32_t generation);
+
+        /** The generation currently on a peer slot, to pair with it into a
+            name. Meaningful for a slot the caller has just registered or is
+            holding a handle to; without one, the peer may be removed between
+            this call and the next. */
+        [[nodiscard]] uint32_t PeerGenerationOf(uint32_t slot) const;
 
         /** Starts a session now with no data attached, so the app can pay the
             handshake at a moment it chooses. Ok when started, already under way,

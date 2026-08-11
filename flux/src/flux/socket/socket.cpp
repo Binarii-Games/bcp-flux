@@ -1222,6 +1222,71 @@ namespace bcp::flux
         return PollCursor{&readyLanes_, lane, outPackets, static_cast<uint32_t>(delivered)};
     }
 
+    uint32_t Socket::PollSlots(uint32_t* outIndices, size_t max, uint32_t& lane)
+    {
+        const uint32_t wanted = lane;
+        lane = ReadyLanes::NO_LANE;
+        if (!initialized_.load(std::memory_order_relaxed) || outIndices == nullptr)
+            return 0;
+
+        // The same three steps as Poll: claim, dispatch, drain. Only the shape
+        // of what leaves differs, an index instead of a handle, so the slot
+        // stays leased and unlocked the way it already waited in the lane.
+        const uint32_t claimed = readyLanes_.ClaimLane(wanted);
+        if (claimed == ReadyLanes::NO_LANE)
+            return 0;
+        lane = claimed;
+
+        events_.Dispatch(claimed, &Socket::OnEventDelivered, this);
+
+        size_t delivered = 0;
+        ReadyEntry ready{};
+        while (delivered < max && readyLanes_.Pop(claimed, ready))
+        {
+            if (ready.peerSlot != common::collections::SlotPool::INVALID)
+            {
+                peerRecvStates_[ready.peerSlot].ReleaseOne();
+                heldTotal_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            outIndices[delivered++] = ready.slotIndex;
+        }
+
+        return static_cast<uint32_t>(delivered);
+    }
+
+    void Socket::ReleasePollLane(uint32_t lane) noexcept
+    {
+        readyLanes_.ReleaseLane(lane);
+    }
+
+    PacketSlotHandle Socket::PacketAt(uint32_t idx)
+    {
+        if (!initialized_.load(std::memory_order_relaxed) || recvPool_ == nullptr
+            || idx >= recvPool_->GetCapacity())
+            return PacketSlotHandle::Invalid();
+
+        PacketSlotHandle handle{idx, recvPool_};
+        handle.BindSocket(this);
+        return handle;
+    }
+
+    common::Error Socket::ReleaseRecvSlot(uint32_t idx, uint32_t generation)
+    {
+        if (!initialized_.load(std::memory_order_relaxed) || recvPool_ == nullptr)
+            return common::Error::NotInitialized;
+        if (idx >= recvPool_->GetCapacity())
+            return common::Error::InvalidParam;
+        return recvPool_->Release(idx, generation)
+            ? common::Error::Ok : common::Error::NotFound;
+    }
+
+    uint32_t Socket::RecvGenerationOf(uint32_t idx) const
+    {
+        if (!initialized_.load(std::memory_order_relaxed) || recvPool_ == nullptr)
+            return 0;
+        return recvPool_->GenerationOf(idx);
+    }
+
     bool Socket::PreProcessIn(PacketSlotHandle& pHandle, uint32_t& migrateBudget)
     {
         const PacketSlot* packet = pHandle.Read();
@@ -2784,6 +2849,16 @@ namespace bcp::flux
     PeerHandle Socket::GetPeer(const Address& addr)
     {
         return peers_.GetPeer(addr);
+    }
+
+    PeerHandle Socket::GetPeerBySlot(uint32_t slot, uint32_t generation)
+    {
+        return peers_.GetPeer(slot, generation);
+    }
+
+    uint32_t Socket::PeerGenerationOf(uint32_t slot) const
+    {
+        return peers_.GenerationOf(slot);
     }
 
     common::Error Socket::RemovePeer(const Address& addr)
