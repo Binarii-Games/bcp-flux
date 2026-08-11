@@ -334,6 +334,17 @@ namespace bcp::flux
         }
         if (minCongestionBudget_ < internal::MAX_WIRE_PACKET_SIZE)
             minCongestionBudget_ = internal::MAX_WIRE_PACKET_SIZE;
+
+        // A floor above the ceiling is a contradiction the runtime cannot
+        // honour: the budget is capped at the ceiling, so it could never reach
+        // a higher floor, and the invariant that gates every send would be
+        // unsatisfiable. Refuse it here rather than let it surface as an
+        // assertion deep in congestion control on the first acknowledgement.
+        // The ceiling grows with maxOutPerPeer, so a socket that wants a high
+        // floor raises that.
+        if (minCongestionBudget_ > maxCongestionBudget_)
+            return common::Error::InvalidParam;
+
         return common::Error::Ok;
     }
 
@@ -2318,6 +2329,15 @@ namespace bcp::flux
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
+
+        // The floor holds from the first send, not only after a loss trims
+        // down to it. A fresh peer is registered at the initial window, which
+        // is below a high floor, so lift it here now that a session exists and
+        // sending is about to begin. Init has already guaranteed the floor is
+        // no higher than the ceiling, so this never overshoots the range the
+        // congestion controller asserts.
+        if (peer.congestionBudget < minCongestionBudget_)
+            peer.congestionBudget = minCongestionBudget_;
         // A secure channel exists from here, so this is the first moment a
         // grant can be told to anyone, and the tick does the sending.
         // Generation advances rather than resetting, because the remote
