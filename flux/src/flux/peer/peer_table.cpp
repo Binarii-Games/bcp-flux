@@ -340,11 +340,17 @@ namespace bcp::flux
         addrIdx_.reset(new (std::nothrow) AddrIndexEntry[idxCapacity_]);
         bcpIdx_.reset(new (std::nothrow) BcpIndexEntry[idxCapacity_]);
         tagIdx_.reset(new (std::nothrow) TagIndexEntry[tagIdxCapacity_]);
-        if (!addrIdx_ || !bcpIdx_ || !tagIdx_)
+        generation_.reset(new (std::nothrow) std::atomic<uint32_t>[capacity]);
+        if (!addrIdx_ || !bcpIdx_ || !tagIdx_ || !generation_)
         {
             Shutdown();
             return common::Error::AllocFailed;
         }
+
+        // Value-initialisation leaves an atomic array indeterminate, so the
+        // counters start where a fresh name expects them.
+        for (uint32_t i = 0; i < capacity; ++i)
+            generation_[i].store(0, std::memory_order_relaxed);
 
         const uint32_t stride = static_cast<uint32_t>(
             (sizeof(Peer) + common::CACHE_LINE - 1) & ~(common::CACHE_LINE - 1));
@@ -365,6 +371,7 @@ namespace bcp::flux
         addrIdx_.reset();
         bcpIdx_.reset();
         tagIdx_.reset();
+        generation_.reset();
         peerPool_.Shutdown();
         idxCapacity_    = 0;
         idxMask_        = 0;
@@ -907,6 +914,36 @@ namespace bcp::flux
                       [&](const Peer& p) { return p.hasId && p.id == id; });
     }
 
+    PeerHandle PeerTable::GetPeer(uint32_t slot, uint32_t generation)
+    {
+        if (!addrIdx_ || !generation_)
+            return PeerHandle{common::Error::NotInitialized};
+        if (slot >= peerCapacity_)
+            return PeerHandle{common::Error::NotFound};
+
+        // The read lock is what makes the check meaningful: DrainAndFree
+        // advances the counter under the write half, so a removal either
+        // finished before this load or waits until the handle is gone.
+        const Peer* peer = reinterpret_cast<const Peer*>(peerPool_.ReadLock(slot));
+        if (peer == nullptr)
+            return PeerHandle{common::Error::NotFound};
+
+        if (generation_[slot].load(std::memory_order_relaxed) != generation)
+        {
+            peerPool_.UnlockRead(slot);
+            return PeerHandle{common::Error::NotFound};
+        }
+
+        return PeerHandle{slot, &peerPool_, peer};
+    }
+
+    uint32_t PeerTable::GenerationOf(uint32_t slot) const
+    {
+        if (!generation_ || slot >= peerCapacity_)
+            return 0;
+        return generation_[slot].load(std::memory_order_relaxed);
+    }
+
     uint32_t PeerTable::CollectAddresses(uint32_t& cursor, Address* out, uint32_t max)
     {
         if (!addrIdx_ || max == 0)
@@ -991,6 +1028,15 @@ namespace bcp::flux
         // No index entry references the slot anymore, so no new handle can be
         // minted for it; the write lock waits out the handles that still exist.
         Peer* peer = reinterpret_cast<Peer*>(peerPool_.WriteLock(slot));
+
+        // Every index entry is gone by now, so this is the moment the peer
+        // stops being reachable and the moment a name for it has to go stale.
+        // Under the slot's write lock, which is the half a lookup by slot does
+        // not hold, so the two can never read and advance it at once. Bumped
+        // here rather than at the Release below because the emitting branch
+        // defers that release, and a name must not survive the peer.
+        if (generation_ && slot < peerCapacity_)
+            generation_[slot].fetch_add(1, std::memory_order_relaxed);
 
         // An unread event about this peer is sitting in the slot's event entry.
         // Releasing now would let a later peer land on that entry and write

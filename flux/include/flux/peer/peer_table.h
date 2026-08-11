@@ -116,6 +116,20 @@ namespace bcp::flux
         common::collections::SlotPool peerPool_;
         uint32_t                      peerCapacity_ = 0;
 
+        /** One counter per slot, advanced every time a peer stops occupying
+            one, so that a (slot, generation) pair handed outside this library
+            can be told apart from the same slot's next tenant. A slot index
+            alone cannot: SlotPool recycles indexes and keeps no history, so a
+            holder of slot 7 would silently start naming whoever landed there
+            next.
+
+            The same idea as Flow::epoch, kept here rather than in SlotPool
+            because only peers are named from outside. Written under the slot's
+            write lock and read under its read lock, so the two never overlap;
+            atomic and relaxed only for GenerationOf, which reads it with no
+            lock to stamp a number onto a slot that was just registered. */
+        std::unique_ptr<std::atomic<uint32_t>[]> generation_;
+
         /** Table-wide seqlock over both indexes. Even = stable, odd = a writer
             is mutating. Monotonic so a reader can prove its probe raced nothing:
             any write cycle during the probe leaves the version different, where
@@ -230,6 +244,23 @@ namespace bcp::flux
             progress holds even under continuous mutation. */
         [[nodiscard]] PeerHandle GetPeer(const Address& addr);
         [[nodiscard]] PeerHandle GetPeer(const BcpId& id);
+
+        /** The peer in `slot`, but only if it is still the one `generation`
+            was taken for. Needs no index probe, because the slot is the answer
+            an index would give; what it does instead is prove the slot has not
+            been recycled since, which an address lookup gets for free by
+            comparing the key.
+
+            For naming a peer outside this library, where an Address is too
+            large to hand over and a bare slot index is unsafe. A stale pair
+            reports NotFound, the same answer every other lookup gives for
+            something that is not there. */
+        [[nodiscard]] PeerHandle GetPeer(uint32_t slot, uint32_t generation);
+
+        /** The generation currently on `slot`, to pair with it into a name.
+            Read with no lock, so it is only meaningful for a slot the caller
+            has just registered and knows nobody else can be removing. */
+        [[nodiscard]] uint32_t GenerationOf(uint32_t slot) const;
 
         /** Copies live peers' addresses into `out` (up to `max`), resuming from
             `cursor` and advancing it. Returns the count, 0 once the sweep is

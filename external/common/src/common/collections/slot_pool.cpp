@@ -93,6 +93,15 @@ namespace bcp::common::collections {
             new(&locks_[i]) SlotRWLock();
         }
 
+        generations_ = new (std::nothrow) std::atomic<uint32_t>[capacity_];
+        if (!generations_) {
+            Shutdown();
+            return false;
+        }
+        for (uint32_t i = 0; i < capacity_; i++) {
+            generations_[i].store(0, std::memory_order_relaxed);
+        }
+
         return true;
     }
 
@@ -120,6 +129,9 @@ namespace bcp::common::collections {
             ::operator delete(memory_, std::align_val_t(CACHE_LINE));
             memory_ = nullptr;
         }
+
+        delete[] generations_;
+        generations_ = nullptr;
 
         capacity_ = 0;
         stride_ = 0;
@@ -164,6 +176,39 @@ namespace bcp::common::collections {
     }
 
     void SlotPool::Release(uint32_t idx) {
+        // Void the ticket first, then free the memory: once the index is back
+        // in a ring another thread can acquire it, and a (index, generation)
+        // pair taken during THIS tenancy must already be stale by then. The
+        // ring math below masks idx and so tolerates a wild one; this array is
+        // a direct index and must not, so it is guarded to match.
+        if (generations_ && idx < capacity_)
+            generations_[idx].fetch_add(1, std::memory_order_relaxed);
+        PushFree(idx);
+    }
+
+    bool SlotPool::Release(uint32_t idx, uint32_t expectedGen) {
+        if (idx >= capacity_ || !generations_)
+            return false;
+
+        // The check and the advance are one atomic step, so two releases
+        // racing with the same pair cannot both pass: one wins the exchange
+        // and frees, the other reads the moved generation and is refused.
+        uint32_t expected = expectedGen;
+        if (!generations_[idx].compare_exchange_strong(expected, expectedGen + 1,
+                std::memory_order_acq_rel, std::memory_order_relaxed))
+            return false;
+
+        PushFree(idx);
+        return true;
+    }
+
+    uint32_t SlotPool::GenerationOf(uint32_t idx) const {
+        if (idx >= capacity_ || !generations_)
+            return 0;
+        return generations_[idx].load(std::memory_order_relaxed);
+    }
+
+    void SlotPool::PushFree(uint32_t idx) noexcept {
         // The index picks the ring, not the caller: its home holds only its
         // own residue class, so the ring can be exactly full but never
         // over-full, and the wait below is always short.

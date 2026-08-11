@@ -67,6 +67,11 @@ namespace bcp::common::collections
 
         SlotRWLock* locks_    = nullptr;
 
+        /** One counter per slot, advanced by every release. Not aligned per
+            entry like the locks: a release is rare next to the lock traffic a
+            slot sees, so sharing lines costs nothing that matters. */
+        std::atomic<uint32_t>* generations_ = nullptr;
+
     public:
         static constexpr uint32_t INVALID = UINT32_MAX;
 
@@ -82,6 +87,24 @@ namespace bcp::common::collections
         // Index management
         [[nodiscard]] uint32_t Acquire();
         void Release(uint32_t idx);
+
+        /** Release, guarded by the slot's generation. Frees the slot only when
+            `expectedGen` is the generation currently on it, advancing it in the
+            same atomic step, so of two racing releases carrying the same pair
+            exactly one frees and the other is refused. False refuses: the pair
+            is stale (the slot was already released, perhaps re-acquired) or the
+            index is out of range, and nothing was freed.
+
+            For indices that leave the process, where the caller's discipline
+            cannot be trusted the way a destructor can. A double release through
+            the plain overload does not merely corrupt: the home ring becomes
+            over-full and the next release on it spins forever. */
+        [[nodiscard]] bool Release(uint32_t idx, uint32_t expectedGen);
+
+        /** The generation currently on a slot: advanced by every release, so a
+            (index, generation) pair taken while holding the slot names this
+            tenancy and no other. 0 for an out-of-range index. */
+        [[nodiscard]] uint32_t GenerationOf(uint32_t idx) const;
 
         // Per-slot locking: readers can overlap, writer is exclusive
         const uint8_t* ReadLock(uint32_t idx);
@@ -101,5 +124,9 @@ namespace bcp::common::collections
         /** One Vyukov take on ring `ring`. INVALID means that ring is empty
             right now; the caller hops to the next. */
         [[nodiscard]] uint32_t TryAcquireFrom(uint32_t ring) noexcept;
+
+        /** Returns the index to its home ring. The generation is the caller's
+            business and must already be advanced. */
+        void PushFree(uint32_t idx) noexcept;
     };
 }
