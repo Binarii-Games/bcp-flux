@@ -5,6 +5,8 @@
 [![macos](https://github.com/Binarii-Games/bcp-flux/actions/workflows/macos.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/macos.yml)
 [![android](https://github.com/Binarii-Games/bcp-flux/actions/workflows/android.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/android.yml)
 [![ios](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ios.yml/badge.svg)](https://github.com/Binarii-Games/bcp-flux/actions/workflows/ios.yml)
+[![release](https://img.shields.io/github/v/release/Binarii-Games/bcp-flux?sort=semver)](https://github.com/Binarii-Games/bcp-flux/releases)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 A connectionless, encrypted UDP transport in C++20. There is no connection
 object, nothing allocates on the packet path, and one socket carries reliable
@@ -14,22 +16,130 @@ Flux builds on `common`, a standalone systems library that knows nothing about
 transports, vendored in `external/common` at a pinned version. Monocypher is
 vendored the same way. Both are Apache-2.0.
 
-Windows, Linux and macOS, on x86-64 and arm64. No exceptions.
+## Features
 
-## Build
+- **Connectionless.** No connection object. The first send to a new address runs
+  the handshake and parks the message until the session is up. Everything after
+  goes straight out.
+- **Zero allocation on the packet path.** Every buffer is pooled and sized at
+  `Init`. Nothing heap-allocates between socket receive and the handler callback.
+- **Mixed reliability on one socket.** Reliable ordered, reliable unordered,
+  unreliable, and bulk flows, each numbered and acknowledged, all at once.
+- **Whole-buffer transfers.** Move a run of bytes whose length is known up front
+  with no per-packet staging, so a gigabyte and a kilobyte cost the same state.
+- **Encrypted by default.** XChaCha20-Poly1305, X25519, and BLAKE2b, with a
+  mac-only level for public traffic and an explicit plaintext opt-out.
+- **Survives address changes.** A session follows the peer, not its address, so a
+  NAT rebind or a VPN reconnect continues with no re-handshake.
+- **Delay-aware congestion control.** It reads queue growth as well as loss, so it
+  holds its share beside BBR and leaves CUBIC the larger half almost without a
+  drop.
+- **Drivable from other languages.** A numbers-based C API hands out 64-bit
+  handles rather than pointers. See [flux/include/flux/c/](flux/include/flux/c/).
 
-CMake 3.25 or newer and a C++20 compiler (MSVC, GCC, or Clang). Ninja is used
-below, any generator works.
+## Table of contents
+
+- [Requirements](#requirements)
+- [Building](#building)
+- [Integrating](#integrating)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [Architecture](#architecture)
+- [Benchmarks](#benchmarks)
+- [Testing](#testing)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
+
+## Requirements
+
+CMake 3.25 or newer and a C++20 compiler (MSVC, GCC, or Clang).
+
+Supported platforms are Windows, Linux, and macOS, on x86-64 and arm64. iOS and
+Android are cross-compiled in CI to keep the code portable, but they are
+build-checked only and not yet exercised as runtime targets.
+
+## Building
+
+Ninja is used below, any generator works.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
-## Guide
+## Integrating
 
-Everything below is running code, and the same steps live as full programs in
-[examples/](examples/).
+Flux is a CMake project with two library targets, `flux` and `common`. Linking
+`flux` pulls in `common` and the vendored Monocypher automatically.
+
+Pull it in at configure time with FetchContent:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+  flux
+  GIT_REPOSITORY https://github.com/Binarii-Games/bcp-flux.git
+  GIT_TAG        v0.4.0
+)
+FetchContent_MakeAvailable(flux)
+
+target_link_libraries(your_target PRIVATE flux)
+```
+
+Or vendor the tree and add it directly:
+
+```cmake
+add_subdirectory(third_party/flux)
+target_link_libraries(your_target PRIVATE flux)
+```
+
+There is no `find_package` or system install before 1.0. Pin a tag, because the
+API and the wire format can still change between versions.
+
+## Quick start
+
+```cpp
+#include <flux/socket/socket.h>
+#include <flux/wire/packet_builder.h>
+
+namespace flux   = bcp::flux;
+namespace common = bcp::common;
+
+flux::Socket socket;
+
+flux::Socket::Config config;
+config.type = flux::Socket::BackendType::STD_UNX;   // STD_WIN on Windows
+config.port = 9500;
+socket.Init(config);
+
+// Send. The first packet to a new address runs the handshake underneath.
+const flux::Address addr = flux::Address::From("::1", 9501).Take();
+const uint8_t msg[] = "hello";
+socket.BuildPacket().NoFlow().PutBytes(msg, sizeof(msg) - 1).Send(addr);
+
+// Drive the socket and read what arrived.
+flux::PacketSlotHandle inbox[8];
+for (;;)
+{
+    socket.Flush();
+    socket.Update();
+
+    flux::PollCursor cursor = socket.Poll(inbox, 8);
+    while (cursor.Next())
+    {
+        const uint8_t* payload = cursor.Message().Content();
+        const uint16_t length  = cursor.Message().ContentLength();
+        // read the payload here
+    }
+}
+```
+
+The [Usage](#usage) section below walks each step, and the same programs live in
+full under [examples/](examples/).
+
+## Usage
 
 ```cpp
 #include <flux/socket/socket.h>
@@ -277,7 +387,7 @@ socket.BuildPacket().NoFlow().PutBytes(msg, len).SendSecured(addr);
 socket.BuildPacket().Unsecured().NoFlow().PutBytes(msg, len).Send(addr);
 ```
 
-## Underneath
+## Architecture
 
 A session belongs to the peer, not its address. When a peer moves (NAT rebind,
 VPN reconnect, network handoff) the session continues with no re-handshake:
@@ -297,81 +407,11 @@ Packets are little-endian and capped at 1200 bytes, under the IPv6 minimum MTU
 with margin for tunnels. Every secure packet is sealed with XChaCha20-Poly1305,
 and the nonce counter is masked so an observer cannot follow a peer by watching
 a serial number climb. Control packets are indistinguishable from data on the
-wire. The full layout is in [ARCHITECTURE.md](ARCHITECTURE.md), along with the
-entities, the ownership rules, and how many ways there are to do each thing.
+wire.
 
-The wire format is not frozen before 1.0. It can change between versions, and a
-security fix is allowed to change it.
-
-Not there yet: path MTU discovery, NAT traversal, and session resumption. There is no 0-RTT. A certificate authenticates
-a peer, it does not shorten the handshake.
-
-## Test
-
-Three categories, one executable per file:
-
-| Directory            | Runs                              | CTest label   |
-|----------------------|-----------------------------------|---------------|
-| `tests/unit/`        | data-structure integrity          | `unit`        |
-| `tests/integration/` | full processes and edge cases     | `integration` |
-| `tests/bench/`       | performance against a baseline    | `bench`       |
-
-Those cover Flux. The vendored `common` keeps its own under
-`external/common/tests/`, and they link `common` alone, so it is tested
-without the transport.
-
-```sh
-# Fast suite, unit plus integration. This is the commit gate:
-ctest --test-dir build -LE bench --output-on-failure
-
-# Benchmarks. Heavier, run on demand, build Release for meaningful numbers:
-ctest --test-dir build -L bench --output-on-failure
-```
-
-Non-release builds are instrumented with AddressSanitizer and
-UndefinedBehaviorSanitizer by default. To run the concurrency tests under
-ThreadSanitizer instead (mutually exclusive with ASan), configure a separate
-build:
-
-```sh
-cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBCP_SANITIZE=thread
-cmake --build build-tsan
-ctest --test-dir build-tsan --output-on-failure
-```
-
-Disable sanitizers with `-DBCP_SANITIZE=""`. Some toolchains, notably Apple's
-Command Line Tools clang, ship a broken ASan/TSan runtime. The build probes for
-that at configure time and falls back to UBSan only, rather than producing
-binaries that fail to start.
-
-## Layout
-
-```
-flux/      include/ + src/     the transport
-tests/     unit/ integration/ bench/ + shared harnesses
-examples/  runnable programs written against the public API
-external/  common/             standalone systems library, vendored, own tests
-           monocypher/         vendored crypto (BSD-2-Clause OR CC0-1.0)
-```
-
-## Examples
-
-One file each, running several sockets in one process, built with everything
-else:
-
-```sh
-./build/send_and_respond          # A sends, B answers
-./build/respond                   # B answers through the packet itself, no address named
-./build/simultaneous_handshake    # both send first, the handshake collision resolves itself
-./build/reliable_flow             # one RELIABLE_ORDERED flow, numbered burst to two peers
-./build/unreliable_flow           # the same burst on an UNRELIABLE flow
-./build/events                    # told what happened instead of asking every tick
-./build/mac_only                  # readable on the wire, not alterable
-./build/unsecured                 # the cheapest packet Flux sends
-./build/big_message               # a message bigger than a packet, as a run on one flow
-./build/bulk_transfer             # something large, chunked by hand over a bulk flow
-./build/transfer_flow             # the same job handed over as one transfer, no chunking
-```
+The full layout is in [ARCHITECTURE.md](ARCHITECTURE.md): the entities, the
+ownership rules, the wire format, and the sanctioned number of ways to perform
+each operation.
 
 ## Benchmarks
 
@@ -390,7 +430,7 @@ numbers and always exit 0.
 
 Every bench builds from this repo alone except one. The sharing bench races
 Flux against QUIC, and msquic is not vendored here, so it has to be installed
-before that bench exists. See below.
+before that bench exists. See [Sharing one queue with QUIC](#sharing-one-queue-with-quic).
 
 ### Send path
 
@@ -403,11 +443,11 @@ sends per variant, interleaved so all three see the same machine state:
 
 | payload | bare `sendto` | + Flux framing | + AEAD seal |
 |---|---|---|---|
-| 64 B | 2792 ns | +125 ns | +583 ns |
-| 1024 B | 2875 ns | +167 ns | +2875 ns |
+| 64 B | 2708 ns | +208 ns | +958 ns |
+| 1024 B | 2667 ns | +292 ns | +2958 ns |
 
-Framing costs about 5% over the raw syscall. Everything else is the
-encryption, which scales with payload and is the same cost any encrypted
+Framing adds a couple hundred nanoseconds over the raw syscall. Everything else
+is the encryption, which scales with payload and is the same cost any encrypted
 transport pays.
 
 ### Encryption
@@ -532,16 +572,103 @@ overflows, and both finish sooner than either does beside BBR. For scale,
 msquic BBR beside msquic CUBIC on this link measured 64/36: BBR takes more
 from CUBIC by force than Flux takes from anyone.
 
+## Testing
+
+Three categories, one executable per file:
+
+| Directory            | Runs                              | CTest label   |
+|----------------------|-----------------------------------|---------------|
+| `tests/unit/`        | data-structure integrity          | `unit`        |
+| `tests/integration/` | full processes and edge cases     | `integration` |
+| `tests/bench/`       | performance against a baseline    | `bench`       |
+
+Those cover Flux. The vendored `common` keeps its own under
+`external/common/tests/`, and they link `common` alone, so it is tested
+without the transport.
+
+```sh
+# Fast suite, unit plus integration. This is the commit gate:
+ctest --test-dir build -LE bench --output-on-failure
+
+# Benchmarks. Heavier, run on demand, build Release for meaningful numbers:
+ctest --test-dir build -L bench --output-on-failure
+```
+
+Non-release builds are instrumented with AddressSanitizer and
+UndefinedBehaviorSanitizer by default. To run the concurrency tests under
+ThreadSanitizer instead (mutually exclusive with ASan), configure a separate
+build:
+
+```sh
+cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBCP_SANITIZE=thread
+cmake --build build-tsan
+ctest --test-dir build-tsan --output-on-failure
+```
+
+Disable sanitizers with `-DBCP_SANITIZE=""`. Some toolchains, notably Apple's
+Command Line Tools clang, ship a broken ASan/TSan runtime. The build probes for
+that at configure time and falls back to UBSan only, rather than producing
+binaries that fail to start.
+
+### Layout
+
+```
+flux/      include/ + src/     the transport
+tests/     unit/ integration/ bench/ + shared harnesses
+examples/  runnable programs written against the public API
+external/  common/             standalone systems library, vendored, own tests
+           monocypher/         vendored crypto (BSD-2-Clause OR CC0-1.0)
+```
+
+### Examples
+
+One file each, running several sockets in one process, built with everything
+else:
+
+```sh
+./build/send_and_respond          # A sends, B answers
+./build/respond                   # B answers through the packet itself, no address named
+./build/simultaneous_handshake    # both send first, the handshake collision resolves itself
+./build/reliable_flow             # one RELIABLE_ORDERED flow, numbered burst to two peers
+./build/unreliable_flow           # the same burst on an UNRELIABLE flow
+./build/events                    # told what happened instead of asking every tick
+./build/mac_only                  # readable on the wire, not alterable
+./build/unsecured                 # the cheapest packet Flux sends
+./build/big_message               # a message bigger than a packet, as a run on one flow
+./build/bulk_transfer             # something large, chunked by hand over a bulk flow
+./build/transfer_flow             # the same job handed over as one transfer, no chunking
+```
+
+## Roadmap
+
+Not there yet: path MTU discovery, NAT traversal, and session resumption. There
+is no 0-RTT, so a certificate authenticates a peer but does not shorten the
+handshake.
+
+The wire format is not frozen before 1.0. It can change between versions, and a
+security fix is allowed to change it.
+
+Released versions are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+## Contributing
+
+Contributions are welcome under the Apache License 2.0. There is no CLA and no
+copyright assignment, only a Developer Certificate of Origin sign-off (`git
+commit -s`). Everything must build and test on Windows, Linux, and macOS from
+the same `CMakeLists.txt`, and a change is not done until its tests run clean
+under sanitizers. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+Report vulnerabilities privately through GitHub's "Report a vulnerability"
+button or the email in [SECURITY.md](SECURITY.md), not through a public issue.
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) covers conduct in the project's spaces.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Flux and `common` stay Apache-2.0. Binarii Games sells products built on these
 libraries. A paid tier means extra code in that tier, not features taken out of
-here.
-
-Contributions stay yours: no CLA, no copyright assignment, just a Developer
-Certificate of Origin sign-off. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Report security problems privately through [SECURITY.md](SECURITY.md) rather
-than an issue. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) covers the rest.
+here. Contributions stay yours: no CLA, no copyright assignment, just a DCO
+sign-off.

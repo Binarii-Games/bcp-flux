@@ -1,24 +1,88 @@
 # Architecture
 
-Flux is a connectionless encrypted UDP transport. It builds on `common`, a
+## Overview
+
+Flux is a connectionless, encrypted UDP transport. It builds on `common`, a
 standalone systems library vendored in `external/common` and developed on its
-own. `common` is meant to carry nothing that only makes sense to a transport,
-and three places currently break that: the error enum names transport
-conditions, `platform.h` pulls in the OS socket headers, and `BytesWriter`
-carries a pointer to a packet length field. They are listed here rather than
-quietly excepted, because a rule with unlisted exceptions is not a rule.
+own.
 
 This document describes each library's structure: its entities, its ownership
 graph, and the number of sanctioned ways to perform each core operation. Where
 a count appears below it is the whole count, and a path not described here does
 not exist.
 
+At the top sits the one entity the application holds, `flux::Socket`. It owns the
+tables that carry protocol state and a platform backend that does the sending and
+receiving:
+
+```
+application
+    |
+flux::Socket
+    |  owns
+    +-- FlowTable      flows, associations, retained reliable bodies
+    +-- PeerTable      peers, keyed by address, id and migration tag
+    +-- TransferTable  whole-buffer transfers in flight
+    +-- CertStore      pinned certificates
+    +-- ISocketKernel  the per-OS UDP backend
+    |
+operating system UDP
+```
+
 For how to build and test, see [README.md](README.md). For the conventions a
 change is held to, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
----
+## Table of contents
 
-## 1. The library set
+- [Goals and non-goals](#goals-and-non-goals)
+- [The library set](#the-library-set)
+- [The common library](#the-common-library)
+- [The flux library](#the-flux-library)
+  - [Entities](#entities)
+  - [Memory: the pools](#memory-the-pools)
+  - [Ownership: the handles](#ownership-the-handles)
+  - [Concurrency](#concurrency)
+  - [Wire format](#wire-format)
+  - [Source layout](#source-layout)
+  - [Operation paths](#operation-paths)
+  - [Lifecycles](#lifecycles)
+  - [Platform backends](#platform-backends)
+
+## Goals and non-goals
+
+Flux is a general-purpose transport in the same class as QUIC. What it commits to:
+
+- Connectionless with a handshake. There is no connection object, and the first
+  packet to a new address carries the session up underneath the send.
+- No heap allocation on the packet path. Every buffer is pooled and sized at
+  `Init`, so behaviour under load is deterministic and no allocator sits on a hot
+  path.
+- Mixed reliability on one socket. Reliable ordered, reliable unordered,
+  unreliable, and bulk flows run side by side, and a whole-buffer transfer runs
+  beside them.
+- A session that follows the peer rather than its address, so a NAT rebind or a
+  VPN reconnect continues with no re-handshake, and nothing on the wire relinks
+  the peer across the change.
+- Encryption by default, with the same framing whether a packet is encrypted,
+  authenticated only, or plaintext.
+- The same source building and running on Windows, Linux, and macOS, on x86-64
+  and arm64.
+- A C API, so a binding in another language can drive the transport.
+
+What it leaves to someone else:
+
+- Naming, routing, and service discovery. Flux knows peers, addresses, and
+  endpoints. It has no concept of a node, a route, or a service name, and a layer
+  above supplies those.
+- The run loop. Flux owns no thread. The application calls `Update`, `Poll`, and
+  `Flush` on whatever threads and cadence it chooses.
+- Certificate policy. Flux stores an opaque identity tag and proves possession of
+  the matching key. It never parses the tag, and where trust comes from is the
+  caller's decision.
+- A frozen wire format. Before 1.0 the format and the API can change between
+  versions.
+
+## The library set
 
 | Library | Namespace | What it is | Depends on |
 |---|---|---|---|
@@ -33,7 +97,14 @@ flux  --depends on--->  common  --depends on--->  monocypher
 A library may depend on another library in the set. It may never depend on a
 consumer of itself, and it may never carry a concept that only makes sense to
 one of its consumers. A type that only makes sense to a transport belongs in
-`flux`. The exceptions named above are the whole list, and nothing new joins it.
+`flux`.
+
+`common` is meant to carry nothing that only makes sense to a transport, and
+three places currently break that: the error enum names transport conditions,
+`platform.h` pulls in the OS socket headers, and `BytesWriter` carries a pointer
+to a packet length field. They are listed here rather than quietly excepted,
+because a rule with unlisted exceptions is not a rule. Those exceptions are the
+whole list, and nothing new joins it.
 
 ### Conventions every library obeys
 
@@ -52,9 +123,7 @@ one of its consumers. A type that only makes sense to a transport belongs in
   release on the destructor edge, move-only where ownership is unique, a
   moved-from object left unusable.
 
----
-
-## 2. `common`
+## The common library
 
 - **Error and result.** `Error` is an `enum class : uint8_t`, codes grouped by
   numeric range, every code mapped by `ErrorToString`. `Result<T>` pairs an
@@ -85,9 +154,7 @@ one of its consumers. A type that only makes sense to a transport belongs in
   declared but nothing installs one, so today both write to stdout under a mutex.
   Never `printf` directly, never iostreams.
 
----
-
-## 3. `flux`
+## The flux library
 
 A transport protocol: connectionless with a handshake, zero-allocation on the
 packet path, encrypted, endianness-explicit, with mixed-reliability flows and
@@ -114,7 +181,7 @@ slot.
 | `bcp::flux::platform` | per-OS `ISocketKernel` backends |
 | `bcp::flux::pending` | the parked-behind-handshake packet list |
 
-### 3.1 Entities
+### Entities
 
 #### Peer
 
@@ -229,7 +296,7 @@ loaded from config), and the handshake proves the peer owns the matching
 secret, so no signature is carried. Flux never parses an identity tag. It
 stores it, matches it, and surfaces it to the layer above.
 
-### 3.2 Memory: the pools
+### Memory: the pools
 
 Nothing on the packet path allocates. There are thirteen pools, each with one
 owner:
@@ -278,7 +345,7 @@ Staging is sized apart from the kernel send pool so a
 busy reliable flow can never starve handshakes, acks, or unreliable traffic of
 send slots. Staging running dry is backpressure.
 
-### 3.3 Ownership: the handles
+### Ownership: the handles
 
 | Handle | Owns | Released by |
 |---|---|---|
@@ -324,7 +391,7 @@ holds takes the handle, never an address or slot index:
   typically because it must release the lock before ending in a send.
   `FlushPeerAcks` and `UpdateOutFlow` are the model.
 
-### 3.4 Concurrency
+### Concurrency
 
 Flux owns no thread. Work happens on a caller's thread. Four entry points carry
 the packet path and all of them are safe to call concurrently:
@@ -382,7 +449,7 @@ wait on slot locks, and a handle holder calling back in closes a cycle.
 Changes here are validated under ThreadSanitizer. A green suite alone says
 nothing about race-freedom.
 
-### 3.5 The wire
+### Wire format
 
 Little-endian, every multi-byte access through `common`'s byte cursors.
 (`htons` in `address.h` is for OS `sockaddr` structures, a separate concern.)
@@ -447,7 +514,7 @@ epoch width in `flow.h`, and the controller bits in `socket.h`. `CTRL_BATCH` is
 the one controller bit taking its value from `constants.h`, because the batch
 packer sets it and has no business reaching into the socket's headers.
 
-### 3.5b Where the code lives
+### Source layout
 
 Six pieces sit in their own files rather than inside `Socket` or `FlowTable`,
 because each is one job and neither of those is:
@@ -467,7 +534,7 @@ are both larger than any of these and both stay where they are: each reaches
 most of `Socket`, so moving either would trade one large file for a large file
 plus a wide interface.
 
-### 3.6 The paths
+### Operation paths
 
 #### Reaching a peer: three keys, one sweep, one raw index
 
@@ -732,7 +799,7 @@ was measured against. A sequence that has been retransmitted is skipped. The
 reply cannot say which transmission it answers, and measuring from the most
 recent send would give a sample shorter than the path.
 
-### 3.7 Lifecycles
+### Lifecycles
 
 #### Handshake
 
@@ -1074,7 +1141,7 @@ monotonic microseconds shifted to roughly 1 ms units, wrapping in 32 bits about
 every 51 days, with wrapped subtraction, so a peer idle past a full wrap can
 only be evicted late.
 
-### 3.8 Platform backends
+### Platform backends
 
 All platform-specific code lives behind an `ISocketKernel` implementation, and
 nothing OS-specific leaks into `Socket` or above. Alongside the real backends
