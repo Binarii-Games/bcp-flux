@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a defect in flux or common
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Please do not use this form
+        for security problems. See the Security tab or SECURITY.md instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and how does it differ from what you expected?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem. A short program against the public API is ideal.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: A tag (for example v0.4.0) or the commit hash you built.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - x86-64
+        - arm64
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build configuration
+      options:
+        - Debug, ASan and UBSan
+        - Debug, TSan
+        - Release
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or sanitizer output
+      description: Any relevant output. Sanitizer reports are especially useful.
+      render: shell
