@@ -213,6 +213,22 @@ namespace bcp::flux
             opportunity. */
         uint64_t grantSentAtMicros;
 
+        /** Set while this peer still owes an acknowledgement for the
+            resumption note this side issued it. Raised when a session
+            commits, cleared by a TICKET_ACK naming issuedNoteId, resent by
+            the tick meanwhile, the grant contract exactly. */
+        bool     ticketSendPending;
+
+        /** When the pending note last went out, pacing the resend the same
+            way grantSentAtMicros does. Zero sends at the first opportunity. */
+        uint64_t ticketSentAtMicros;
+
+        /** The id of the note this side issued for this peer's session, what
+            a TICKET_ACK must name to clear the pending flag. Ids are drawn
+            from one socket-wide counter, so a stale ack from a session this
+            one replaced cannot clear a note it never acknowledged. */
+        uint64_t issuedNoteId;
+
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
                                           ///< at or above, the curve decides
 

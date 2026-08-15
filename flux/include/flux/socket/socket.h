@@ -33,6 +33,8 @@
 #include <flux/internal/replay_window.h>
 #include <flux/crypto/certificate.h>
 #include <flux/crypto/cert_store.h>
+#include <flux/ticket/ticket_table.h>
+#include <flux/util/ticket_store.h>
 #include <flux/crypto/identity.h>
 #include <flux/socket/i_socket_kernel.h>
 #include <flux/crypto/packet_seal.h>
@@ -209,6 +211,46 @@ namespace bcp::flux
                 itself, counted in full wire packets, so rotation may come
                 early and never late. Zero selects the default. */
             uint64_t    rotateAfterBytes   = 0;
+
+            /** Session resumption notes. Issuing costs nothing to configure:
+                every established session is offered one either way, sealed so
+                only this socket can ever read it back. This block governs the
+                other side of the exchange, what to do with notes RECEIVED,
+                and how notes this socket issues are stamped. */
+            struct Tickets
+            {
+                /** Notes from peers this socket keeps, sized at Init. Zero
+                    stores nothing and received notes are dropped, while notes
+                    this socket issues are unaffected. */
+                uint32_t    poolCount       = 0;
+
+                /** Built-in persistence: one file per issuer identity in this
+                    directory, written when a note arrives, loaded and purged
+                    at Init. Null means flux never touches a filesystem.
+                    Mutually exclusive with onSave; Init refuses both. */
+                const char* directory       = nullptr;
+
+                /** App-owned persistence, called with the bundle bytes when a
+                    note arrives or refreshes. The bundle contains secret
+                    material, so wherever it lands inherits the custody the
+                    identity key already needs. Runs on the thread driving
+                    Update, so a handler that must not block hands the bytes
+                    to its own machinery. */
+                void (*onSave)(void* context, const uint8_t issuerId[32],
+                               const uint8_t* bundle, size_t len) = nullptr;
+                void*       context         = nullptr;
+
+                /** Validity stamped into notes this socket issues. Zero
+                    selects the default of a week. */
+                uint32_t    lifetimeSeconds = 0;
+
+                /** Seal-key epoch for notes this socket issues. Bump it and
+                    every note issued before the bump fails to unseal, which
+                    is revocation of the whole outstanding population in one
+                    integer. */
+                uint16_t    sealEpoch       = 0;
+            };
+            Tickets     tickets;
 
             /** Address migration by rotating 4-byte tag: a connection survives
                 its peer's address changing without a re-handshake. Costs
@@ -416,6 +458,24 @@ namespace bcp::flux
             replaces its cert (key rotation). NotInitialized when the store is
             disabled, LimitReached when full. */
         [[nodiscard]] common::Error LoadCertificate(const Certificate& cert);
+
+        /** Stops trusting whatever key is pinned to this identity tag, at
+            runtime, under live traffic. The tag's entry stays and its key
+            becomes one nobody can own, so every later check against it is a
+            hard mismatch rather than an open question: strictly stronger
+            than never having pinned the tag. An authenticated peer keeps its
+            live session; everything that consults the store afresh refuses
+            from the next call on. NotFound when the tag was never pinned. */
+        common::Error RemoveCertificate(const Certificate::IdentityTag& tag);
+
+        /** Hands back a persisted resumption-note bundle, as the store hook
+            received it or as the file store wrote it. Verifies nothing
+            beyond the encoding: the cryptographic proof happens at resume,
+            where it always happens, so a stale or tampered bundle costs one
+            slow connection and never a wrong one. InvalidParam when the
+            bytes do not decode, NotInitialized when no ticket pool is
+            configured. */
+        [[nodiscard]] common::Error ImportTicket(const uint8_t* bundle, size_t len);
 
         wire::PacketBuilder BuildPacket();
 
@@ -733,6 +793,13 @@ namespace bcp::flux
         common::crypto::PublicKey      publicKey_;
         Certificate::IdentityTag       ownTag_{};   ///< announced in HS_FINISH; zero when anonymous
         CertStore                      certStore_;
+        TicketTable                    tickets_;
+        TicketFileStore                ticketStore_;
+        void (*ticketSaveHook_)(void*, const uint8_t[32], const uint8_t*, size_t) = nullptr;
+        void*                          ticketSaveContext_ = nullptr;
+        common::crypto::SessionKey     ticketSealKey_{};    ///< identity secret + epoch, set at Init
+        uint32_t                       ticketLifetime_ = 0; ///< seconds, resolved at Init
+        std::atomic<uint64_t>          nextNoteId_{1};      ///< socket-wide, seeded at Init
 
         // Peers, replay, and the pending-behind-handshake pool.
         PeerTable                      peers_;
@@ -976,6 +1043,22 @@ namespace bcp::flux
             retried until it lands. Takes the handle by value: the gather
             happens under it and the send after it is released. */
         void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
+
+        // --- Tickets (socket_ticket.cpp) ---
+        /** Everything ticket-shaped that Init owes: config validation, the
+            pool, the seal key, the persistence backend, and the load-purge
+            of what a previous run left on disk. */
+        [[nodiscard]] common::Error InitTickets(const Config& config);
+        /** Seals and sends the note this session owes its peer, paced like
+            the grant resend, until Ticket_Acked clears the flag. */
+        void SendPendingTicket(const Address& to, PeerHandle peerHandle, uint64_t now);
+        /** A note arrived: store it, persist it, tell the app. Answers with
+            TICKET_ACK either way, so a full pool does not turn the issuer
+            into a resender. */
+        void Ticket_Update(const Address& from, const uint8_t* payload, size_t len);
+        void Ticket_Acked(const Address& from, const uint8_t* payload, size_t len);
+        /** Runs a stored entry through the save hook or the file store. */
+        void PersistTicket(const TicketTable::Entry& entry);
 
         /** Starts a freshly registered slot on this socket's configured grant.
 

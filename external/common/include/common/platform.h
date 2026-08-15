@@ -64,4 +64,24 @@ namespace bcp::common
                  + static_cast<uint64_t>(ts.tv_nsec) / 1000ull;
         #endif
     }
+
+    /** Wall-clock time in seconds since the Unix epoch. Survives reboots,
+        which is what MonotonicMicros cannot do, so this is the clock for
+        anything whose lifetime crosses process lives. It can jump when the
+        host clock is adjusted, so it is only for coarse validity windows,
+        never for timeouts or measurement. */
+    inline uint64_t WallClockSeconds() {
+        #ifdef _WIN32
+            // 100 ns intervals since 1601, shifted to the Unix epoch.
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            const uint64_t intervals = (static_cast<uint64_t>(ft.dwHighDateTime) << 32)
+                                     | ft.dwLowDateTime;
+            return intervals / 10000000ull - 11644473600ull;
+        #else
+            timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            return static_cast<uint64_t>(ts.tv_sec);
+        #endif
+    }
 }

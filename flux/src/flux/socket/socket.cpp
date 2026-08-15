@@ -131,6 +131,7 @@ namespace bcp::flux
         peers_.Shutdown();
         flows_.Shutdown();
         transfers_.Shutdown();
+        tickets_.Shutdown();
         pendingPool_.Shutdown();
         readyLanes_.Shutdown();
         events_.Shutdown();
@@ -225,6 +226,11 @@ namespace bcp::flux
         if (config.trustedCertCount > 0 &&
             certStore_.Init(config.trustedCertCount) != common::Error::Ok)
             return common::Error::NotInitialized;
+
+        // After the identity, because the ticket seal key derives from it.
+        const common::Error tickets = InitTickets(config);
+        if (tickets != common::Error::Ok)
+            return tickets;
 
         return common::Error::Ok;
     }
@@ -414,6 +420,11 @@ namespace bcp::flux
     common::Error Socket::LoadCertificate(const Certificate& cert)
     {
         return certStore_.Add(cert);
+    }
+
+    common::Error Socket::RemoveCertificate(const Certificate::IdentityTag& tag)
+    {
+        return certStore_.Revoke(tag);
     }
 
     // --- Crypto / seal ---
@@ -1634,6 +1645,8 @@ namespace bcp::flux
             case internal::SECURE_CHANNEL_FLOW_REJECT:    Flow_Reject(from, buf, plen);    break;
             case internal::SECURE_CHANNEL_GRANT:          Grant_Update(from, buf, plen);   break;
             case internal::SECURE_CHANNEL_GRANT_ACK:      Grant_Acked(from, buf, plen);    break;
+            case internal::SECURE_CHANNEL_TICKET:         Ticket_Update(from, buf, plen);  break;
+            case internal::SECURE_CHANNEL_TICKET_ACK:     Ticket_Acked(from, buf, plen);   break;
             case internal::SECURE_CHANNEL_FLOW_ACK:       Flow_Ack(from, buf, plen);       break;
             case internal::SECURE_CHANNEL_TRANSFER:       Transfer_Data(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_TRANSFER_ACK:   Transfer_Ack(from, buf, plen);   break;
@@ -2537,6 +2550,13 @@ namespace bcp::flux
             peer.grantSendPending  = true;
             peer.grantSentAtMicros = 0;   // send at the next tick, not one RTO later
         }
+        // Every session is offered a resumption note the same way, and a
+        // fresh session owes a fresh note: the id resets so the first send
+        // draws a new one, and an ack for the old session's note cannot
+        // clear it.
+        peer.ticketSendPending  = true;
+        peer.ticketSentAtMicros = 0;
+        peer.issuedNoteId       = 0;
         peer.myTag        = DerivePeerTag(peer.session, LaneTo(theirPk), 0);
         peer.state        = HandshakeState::ESTABLISHED;
         // The acknowledgement silence clock starts here, so a peer that never
@@ -3322,6 +3342,12 @@ namespace bcp::flux
 
         (void)RetryHandshakes();
 
+        // Stored resumption notes age out by wall clock. A small budget per
+        // pass keeps the table honest without the tick ever paying a full
+        // scan's worth of lock traffic at once.
+        if (tickets_.Enabled())
+            (void)tickets_.SweepExpired(common::WallClockSeconds(), 8);
+
         // No flow gate on the sweep: idle eviction is mandatory, so the per-peer
         // pass runs even on a socket with no flows. An empty peer table makes
         // the loop below break at once.
@@ -3407,6 +3433,9 @@ namespace bcp::flux
                 // Retried every tick until the peer acknowledges it, so a lost
                 // announcement is not a peer that never learns its limit.
                 SendPendingGrant(addr, peers_.GetPeer(addr), Now(nowOverride));
+
+                // The resumption note this session owes, same contract.
+                SendPendingTicket(addr, peers_.GetPeer(addr), Now(nowOverride));
 
                 // Out-flows: open/close retries with give-up, and reliable
                 // retransmits / unreliable loss declarations past the RTO. Each

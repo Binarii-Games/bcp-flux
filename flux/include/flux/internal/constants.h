@@ -74,6 +74,13 @@ namespace bcp::flux::internal
     static constexpr uint8_t  SECURE_CHANNEL_TRANSFER_ACK    = 0x08;
     static constexpr uint8_t  SECURE_CHANNEL_TRANSFER_REJECT = 0x09;
 
+    /** A session-resumption note travelling to its holder. The issuer seals it
+        for its own future self: the holder stores the blob and can never read
+        it. TICKET_ACK answers with the note id so the issuer stops resending,
+        the same contract GRANT_ACK provides. */
+    static constexpr uint8_t  SECURE_CHANNEL_TICKET          = 0x0A;
+    static constexpr uint8_t  SECURE_CHANNEL_TICKET_ACK      = 0x0B;
+
     /** Grant payload: the receive slots the sender of this op will hold for the
         peer it is addressed to, and a generation so an op that overtakes an
         older one cannot be undone by it. */
@@ -108,6 +115,35 @@ namespace bcp::flux::internal
         limit), so the default only has to bound how much traffic one key
         ever covers. */
     static constexpr uint64_t KEY_ROTATE_AFTER_BYTES_DEFAULT = 1ull << 30;
+
+    // --- Tickets ---
+
+    /** The sealed body of a resumption note: the holder's public key, the
+        ticket secret, the issue wall-clock stamp, the note id, and the
+        validity seconds. Sealed under the issuer's own key, so the size is a
+        property of the issuer's layout and the holder never parses it. */
+    static constexpr size_t   TICKET_SEALED_SIZE =
+        common::crypto::KEY_SIZE + common::crypto::KEY_SIZE + 8 + 8 + 4;
+
+    /** The blob as it travels and as the holder stores it: nonce, sealed
+        body, tag. */
+    static constexpr size_t   TICKET_BLOB_SIZE =
+        common::crypto::NONCE_SIZE + TICKET_SEALED_SIZE + common::crypto::TAG_SIZE;
+
+    /** TICKET payload: note id, validity seconds, blob length, blob. */
+    static constexpr size_t   WIRE_TICKET_PAYLOAD_SIZE = 8 + 4 + 2 + TICKET_BLOB_SIZE;
+
+    /** TICKET_ACK payload: the note id being acknowledged, nothing else. */
+    static constexpr size_t   WIRE_TICKET_ACK_PAYLOAD_SIZE = 8;
+
+    /** Validity stamped into notes when Config leaves lifetimeSeconds at
+        zero: a week, long enough that a nightly-restarted fleet resumes for
+        months of ordinary operation, short enough that a stolen bundle is a
+        countdown rather than a credential. */
+    static constexpr uint32_t TICKET_LIFETIME_SECONDS_DEFAULT = 7u * 24u * 3600u;
+
+    /** How long an unacknowledged note waits before the tick resends it. */
+    static constexpr uint64_t TICKET_RESEND_MICROS = 500'000;
 
     // --- Flow ---
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
