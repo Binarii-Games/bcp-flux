@@ -179,6 +179,43 @@ namespace bcp::flux
         return common::Error::Ok;
     }
 
+    common::Error CertStore::Revoke(const Certificate::IdentityTag& tag)
+    {
+        if (!index_)
+            return common::Error::NotInitialized;
+
+        const uint64_t h = HashTag(tag);
+
+        LockWriter();
+
+        // The same writer-side probe Add runs for its replace-in-place path,
+        // and the same reason it needs no seqlock cycle: the index does not
+        // change, only the slot's bytes do, under that slot's write lock.
+        uint32_t pos = static_cast<uint32_t>(h) & idxMask_;
+        for (uint32_t dist = 0; ; ++dist)
+        {
+            const uint64_t eh = index_[pos].hash.load(std::memory_order_relaxed);
+            if (eh == 0)
+                break;
+            if (eh == h && index_[pos].key == tag)
+            {
+                const uint32_t slot = index_[pos].idx.load(std::memory_order_relaxed);
+                Certificate* c = reinterpret_cast<Certificate*>(certPool_.WriteLock(slot));
+                c->version = 0;   // no layout, so never again a valid pinning
+                common::crypto::Wipe(c->subjectKey.data(), c->subjectKey.size());
+                certPool_.UnlockWrite(slot);
+                UnlockWriter();
+                return common::Error::Ok;
+            }
+            if (Dist(eh, pos, idxMask_) < dist)
+                break;
+            pos = (pos + 1) & idxMask_;
+        }
+
+        UnlockWriter();
+        return common::Error::NotFound;
+    }
+
     CertStore::Match CertStore::Check(const Certificate::IdentityTag& tag,
                                       const common::crypto::PublicKey& presentedKey) const
     {
@@ -283,8 +320,13 @@ namespace bcp::flux
             std::memcmp(c->identityTag.data(), tag.data(), tag.size()) == 0;
         if (tagMatches)
         {
-            out = common::crypto::Equal(c->subjectKey.data(), presentedKey.data(),
-                                        presentedKey.size())
+            // A revoked entry has its version cleared, and it must fail before
+            // the key comparison runs: the wiped key is all zeros, and a peer
+            // could present all zeros, so the byte compare alone would turn a
+            // revocation into a skeleton key.
+            out = c->version == Certificate::VERSION_PINNED
+                  && common::crypto::Equal(c->subjectKey.data(), presentedKey.data(),
+                                           presentedKey.size())
                 ? Match::Trusted
                 : Match::Mismatch;
         }

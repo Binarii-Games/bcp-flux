@@ -75,6 +75,14 @@ namespace bcp::flux
         [[nodiscard]] Match Check(const Certificate::IdentityTag& tag,
                                   const common::crypto::PublicKey& presentedKey) const;
 
+        /** Stops trusting whatever key this tag pins. The entry stays (slots
+            are never recycled here, the design above) with its version
+            cleared and its key wiped, so every later Check on the tag is a
+            hard Mismatch whatever key is presented: revocation, in the shape
+            supersession already had. Loading a fresh certificate for the tag
+            re-trusts it. NotFound when the tag was never pinned. */
+        common::Error Revoke(const Certificate::IdentityTag& tag);
+
         uint32_t Count() const { return count_.load(std::memory_order_relaxed); }
         uint32_t GetCapacity() const { return capacity_; }
 
