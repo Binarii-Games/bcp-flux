@@ -438,6 +438,13 @@ namespace bcp::flux
         p->session     = {};
         p->headerKey   = {};
         p->macKey      = {};
+        p->resumeRoot    = {};
+        p->prevSession   = {};
+        p->prevHeaderKey = {};
+        p->prevMacKey    = {};
+        p->keyGeneration      = 0;
+        p->rotationConfirmed  = true;   // nothing rotated yet, so nothing owed
+        p->bytesSinceRotation = 0;
         p->sendCounter = 0;
         p->myTagStep    = 0;
         p->theirTagStep = 0;

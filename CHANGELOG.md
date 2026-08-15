@@ -9,6 +9,13 @@ security fix is allowed to change either.
 
 ## [Unreleased]
 
+### Added
+- Session key rotation. The key is now a chain: each rotation derives the next
+  link one-way from the current one and wipes the old, so a key stolen today
+  cannot read traffic recorded before the last rotation. Rotation is silent on
+  the wire, runs on a per-peer byte threshold (`Config::rotateAfterBytes`) or
+  on `RotateKeys`, and the peer discovers it by trial decryption.
+
 ## [0.4.0] - 2026-08-11
 
 ### Added

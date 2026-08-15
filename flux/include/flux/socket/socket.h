@@ -205,6 +205,11 @@ namespace bcp::flux
                 (bits/8 + 8) bytes per peer. */
             uint32_t    replayWindowBits   = 512;
 
+            /** Bytes sealed to one peer before its session key rotates
+                itself, counted in full wire packets, so rotation may come
+                early and never late. Zero selects the default. */
+            uint64_t    rotateAfterBytes   = 0;
+
             /** Address migration by rotating 4-byte tag: a connection survives
                 its peer's address changing without a re-handshake. Costs
                 WIRE_PEER_TAG_SIZE bytes per secure packet. */
@@ -683,6 +688,14 @@ namespace bcp::flux
             Returns peers rotated. */
         uint32_t RotateTags();
 
+        /** Advances the session key with this peer one step along the
+            rotation chain. Silent on the wire: the peer discovers the change
+            by opening. Refused for a peer that is unknown or not established
+            (NotFound) and while a previous rotation is still unconfirmed
+            (AlreadyPending). Runs unprompted when Config::rotateAfterBytes
+            is crossed. */
+        [[nodiscard]] common::Error RotateKeys(const Address& addr);
+
         /** Re-sends HS_INIT for every peer whose handshake has not completed,
             and drops the ones that have stopped answering. Update calls this,
             so an application driving only Poll and Update recovers a lost
@@ -739,6 +752,7 @@ namespace bcp::flux
         uint32_t recvBatch_ = 0;         ///< packets one tick takes off the socket
         std::unique_ptr<uint64_t[]>    replayState_;   ///< (1 + replayWords_) u64 per peer slot
         uint32_t                       replayWords_ = 0;
+        uint64_t                       rotateAfterBytes_ = internal::KEY_ROTATE_AFTER_BYTES_DEFAULT;
         common::collections::SlotPool  pendingPool_;
 
         // Migration, fixed at Init.
@@ -1080,14 +1094,24 @@ namespace bcp::flux
                            const common::crypto::PublicKey& theirEphPk,
                            const uint8_t* transcript, size_t transcriptLen) noexcept;
 
-        /** Combines the ephemeral exchange with the long-lived one. The caller
-            wipes its ephemeral secret as soon as this returns, which is what
-            makes the session unrecoverable once the handshake is over. */
-        void DeriveSessionInto(common::crypto::SessionKey& out,
+        /** Combines the ephemeral exchange with the long-lived one, producing
+            both per-session roots in one pass: the session key and the resume
+            root, derived under different contexts so neither reveals the
+            other. The caller wipes its ephemeral secret as soon as this
+            returns, which is what makes the session unrecoverable once the
+            handshake is over. */
+        void DeriveSessionInto(common::crypto::SessionKey& outSession,
+                               common::crypto::SessionKey& outResume,
                                const common::crypto::PublicKey& theirPk,
                                const common::crypto::SecretKey& myEphSk,
                                const common::crypto::PublicKey& theirEphPk,
                                const uint8_t* transcript, size_t transcriptLen) noexcept;
+
+        /** Moves the peer one link along the rotation chain: current keys to
+            the prev slots, next session derived from the current one, helper
+            keys and tags re-derived, counters restarted. The caller holds the
+            peer's write lock and has already checked the guards. */
+        void RotatePeerKeys(Peer& peer) noexcept;
 
 
         /** The kernel_->Write + CTRL_INTERNAL|CTRL_UNSECURE + opcode preamble,

@@ -666,7 +666,9 @@ be internal and secure at once is forged or corrupt, and is dropped.
 
 Everything else runs through `PreProcessIn` (known-peer check for unsecured
 traffic, decryption for secure, then replay and liveness), which routes what it
-admits to one of three sinks:
+admits to one of three sinks. The decryption tries the current key first and
+then the links a rotation could have put in play, which is how a silent
+rotation is discovered (see Key rotation under Lifecycles):
 
 1. `ProcessSecureControl`: path validation, flow reject, flow ack, transfer
    data, transfer ack, transfer reject
@@ -824,10 +826,48 @@ initiatorPk ‖ responderPk ‖ initiatorEph ‖ responderEph ‖ saltI ‖ salt
 Version and capabilities sit inside the MAC'd transcript, so a downgraded
 negotiation fails key confirmation instead of succeeding quietly.
 
+The derivation yields two independent roots, each from the same exchange
+under its own label: the session key, and a resume root reserved for session
+resumption. Neither reveals the other, and both come from material wiped
+before the handshake returns.
+
 Packets sent to a peer mid-handshake are parked in the pending pool as an
 intrusive list and flushed when the session completes. The two ends compare
 public keys and the lower takes nonce lane 0, so the two send counters under
 one shared key occupy distinct nonce spaces and cannot collide.
+
+#### Key rotation
+
+The session key is a chain. Rotating moves one link along it: the next key
+is a one-way derivation of the current one, the counter-masking and MAC-only
+keys re-derive from the new link, the send counter restarts, and the
+migration tags restart with it because they derive from the session. The
+resume root is untouched. Nothing about any of this travels on the wire, so
+an observer sees no boundary to correlate across an address change.
+
+A rotation happens when a byte threshold crosses or when `RotateKeys` is
+called, and the peer is not told. It discovers the change when a packet
+refuses to open under the current key and opens under the next link instead.
+That discovery is the commit: the discovering side walks its own state one
+link, resets the replay window because the sender's counters restarted, and
+drops whatever was still sealed under the old link. Reliable traffic loses
+nothing to the drop, because a retransmit seals fresh from staging under the
+current key.
+
+The initiator cannot drop the old link at once. The peer keeps sealing under
+it until a rotated packet crosses, up to a round trip, so the initiator
+holds the old keys beside the new ones and opens with either. The first
+packet that opens under the new link is the confirmation: the old keys are
+wiped and the replay window resets in the same locked step that accepts the
+packet. A straggler under the old link is refused from then on, because its
+counter belongs to a window that no longer exists and would poison the fresh
+one.
+
+One link may be unconfirmed at a time. A second rotation before the first is
+confirmed is refused, so the two ends never sit two links apart and the
+discovery is always a single derivation away. A corrupt packet costs two
+open attempts steady-state and three during the round trip after this
+side's own rotation, and never more.
 
 #### Address migration
 

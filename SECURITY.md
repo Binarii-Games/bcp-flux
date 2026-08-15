@@ -78,6 +78,3 @@ These are known and are not vulnerabilities:
 - Anonymous peers are not authenticated. Without a loaded certificate, a session
   is encrypted but the peer's identity is unverified. Use `SendSecured` when
   identity matters.
-- The session key is not rotated. It is derived once per handshake and kept for
-  the life of the session, so a compromised key exposes that session's whole
-  history. Tracked, not yet addressed.

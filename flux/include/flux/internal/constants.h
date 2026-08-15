@@ -102,6 +102,13 @@ namespace bcp::flux::internal
     static_assert(WIRE_HS_MAC_SIZE == common::crypto::MAC_SIZE,
                   "The wire confirmation field carries a ComputeMac output verbatim");
 
+    /** Bytes sealed to one peer before the session key rotates itself, when
+        Config::rotateAfterBytes is left at zero. Rotation is hygiene rather
+        than a cryptographic necessity (XChaCha20 has no practical volume
+        limit), so the default only has to bound how much traffic one key
+        ever covers. */
+    static constexpr uint64_t KEY_ROTATE_AFTER_BYTES_DEFAULT = 1ull << 30;
+
     // --- Flow ---
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
 

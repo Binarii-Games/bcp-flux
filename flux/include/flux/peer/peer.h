@@ -67,6 +67,38 @@ namespace bcp::flux
             session, discarded with it. */
         common::crypto::SessionKey macKey;
 
+        /** Second secret derived at the handshake beside the session key,
+            under its own label, so neither reveals the other. Reserved for
+            session resumption. Never used for traffic and never rotated.
+            Wiped with the peer. */
+        common::crypto::SessionKey resumeRoot;
+
+        /** Old talking keys, held only between our own rotation and the
+            peer's first packet under the new generation. The peer keeps
+            sealing under the old key until a rotated packet reaches it, so
+            the initiator must keep opening with these for up to a round
+            trip. Wiped when rotationConfirmed is set. */
+        common::crypto::SessionKey prevSession;
+        common::crypto::SessionKey prevHeaderKey;
+        common::crypto::SessionKey prevMacKey;
+
+        /** Which link of the rotation chain the session key is. Starts at
+            zero on every handshake. Never travels on the wire, so the two
+            ends agree on it only because the chain is deterministic. */
+        uint8_t keyGeneration;
+
+        /** Set once a packet from the peer has opened under the current
+            generation. While clear, the previous keys above are still live
+            and a further rotation is refused, so the two ends can never sit
+            two links apart. */
+        bool rotationConfirmed;
+
+        /** Bytes sealed to this peer under the current generation, counted
+            in full wire packets, so the configured threshold is a ceiling
+            the count may cross early and never late. Crossing it triggers
+            the automatic rotation. */
+        uint64_t bytesSinceRotation;
+
         /** Nonce counter for packets we encrypt to this peer. Travels in each
             packet, so the remote never tracks it.
 

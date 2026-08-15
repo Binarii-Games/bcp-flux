@@ -201,6 +201,9 @@ namespace bcp::flux
 
         migration_            = config.enableMigration;
         migrateBudgetPerPoll_ = config.migrateBudgetPerPoll;
+        rotateAfterBytes_ = config.rotateAfterBytes != 0
+            ? config.rotateAfterBytes
+            : internal::KEY_ROTATE_AFTER_BYTES_DEFAULT;
 
         initialized_.store(true, std::memory_order_release);
         return common::Error::Ok;
@@ -431,7 +434,24 @@ namespace bcp::flux
         return LaneTo(theirPk) == 0 ? 1 : 0;
     }
 
-    void Socket::DeriveSessionInto(common::crypto::SessionKey& out,
+    // The labels that split one secret into purpose-specific keys. Fixed and
+    // public; each only has to differ from every other input its source key
+    // is ever fed, so no two derivations share a domain.
+    static constexpr uint8_t HEADER_KEY_LABEL[16] = {
+        'f','l','u','x','-','h','d','r','-','m','a','s','k',0,0,0
+    };
+    static constexpr uint8_t MAC_KEY_LABEL[16] = {
+        'f','l','u','x','-','m','a','c','-','o','n','l','y',0,0,0
+    };
+    static constexpr uint8_t KEY_ROTATE_LABEL[16] = {
+        'f','l','u','x','-','k','e','y','-','r','o','t','a','t','e',0
+    };
+    static constexpr uint8_t RESUME_ROOT_LABEL[16] = {
+        'f','l','u','x','-','r','e','s','u','m','e',0,0,0,0,0
+    };
+
+    void Socket::DeriveSessionInto(common::crypto::SessionKey& outSession,
+                                    common::crypto::SessionKey& outResume,
                                     const common::crypto::PublicKey& theirPk,
                                     const common::crypto::SecretKey& myEphSk,
                                     const common::crypto::PublicKey& theirEphPk,
@@ -444,20 +464,32 @@ namespace bcp::flux
         // same answer, which is what the confirmation MAC then proves. Either
         // one alone loses the other property.
         //
-        // One KDF pass over both. The long-lived secret keys the hash and the
-        // ephemeral one leads the context, which keeps the derivation to a
-        // single call and leaves the vendored crypto floor untouched.
+        // One KDF pass per root. The long-lived secret keys the hash and the
+        // ephemeral one leads the context, which keeps each derivation to a
+        // single call and leaves the vendored crypto floor untouched. The
+        // resume root prefixes a label to the same context, so the two roots
+        // are independent: holding either tells nothing about the other, and
+        // both come from material wiped before this returns.
         common::crypto::SharedSecret staticShared;
         common::crypto::SharedSecret ephShared;
         common::crypto::ComputeSharedSecret(staticShared, secretKey_, theirPk);
         common::crypto::ComputeSharedSecret(ephShared, myEphSk, theirEphPk);
 
-        uint8_t context[common::crypto::SHARED_SIZE + internal::HS_TRANSCRIPT_SIZE];
+        uint8_t context[sizeof(RESUME_ROOT_LABEL) + common::crypto::SHARED_SIZE
+                        + internal::HS_TRANSCRIPT_SIZE];
         std::memcpy(context, ephShared.data(), ephShared.size());
         std::memcpy(context + ephShared.size(), transcript, transcriptLen);
 
-        common::crypto::DeriveSessionKey(out, staticShared, context,
+        common::crypto::DeriveSessionKey(outSession, staticShared, context,
                                          ephShared.size() + transcriptLen);
+
+        std::memmove(context + sizeof(RESUME_ROOT_LABEL), context,
+                     ephShared.size() + transcriptLen);
+        std::memcpy(context, RESUME_ROOT_LABEL, sizeof(RESUME_ROOT_LABEL));
+
+        common::crypto::DeriveSessionKey(outResume, staticShared, context,
+                                         sizeof(RESUME_ROOT_LABEL)
+                                         + ephShared.size() + transcriptLen);
 
         common::crypto::Wipe(context, sizeof(context));
         common::crypto::Wipe(ephShared.data(), ephShared.size());
@@ -466,6 +498,19 @@ namespace bcp::flux
 
     PeerSendMaterials Socket::GatherSendMaterials(Peer& peer) noexcept
     {
+        // The one choke point every seal passes, so the rotation threshold is
+        // checked here. Bytes are counted in full wire packets because the
+        // body is not sized yet when materials are gathered, so the threshold
+        // is a ceiling the count crosses early and never late. The gate on
+        // rotationConfirmed keeps a peer that has gone quiet from being walked
+        // several links ahead of what it can discover.
+        if (peer.state == HandshakeState::ESTABLISHED)
+        {
+            peer.bytesSinceRotation += internal::MAX_WIRE_PACKET_SIZE;
+            if (peer.rotationConfirmed && peer.bytesSinceRotation >= rotateAfterBytes_)
+                RotatePeerKeys(peer);
+        }
+
         // The one place a send bumps the counter. Caller holds the peer's write
         // lock; the returned key is a copy the caller Wipes after the send.
         PeerSendMaterials materials;
@@ -1339,6 +1384,11 @@ namespace bcp::flux
         common::crypto::SessionKey key;
         common::crypto::SessionKey headerKey;
         common::crypto::SessionKey macKey;
+        common::crypto::SessionKey prevKey;
+        common::crypto::SessionKey prevHeaderKey;
+        common::crypto::SessionKey prevMacKey;
+        bool    rotationPending = false;
+        uint8_t generationSeen  = 0;
         uint8_t senderLane = 0;
         {
             PeerHandle peerHandle = peers_.GetPeer(packet->address);
@@ -1354,6 +1404,14 @@ namespace bcp::flux
             key = peer->session;
             headerKey = peer->headerKey;
             macKey = peer->macKey;
+            rotationPending = !peer->rotationConfirmed;
+            generationSeen  = peer->keyGeneration;
+            if (rotationPending)
+            {
+                prevKey       = peer->prevSession;
+                prevHeaderKey = peer->prevHeaderKey;
+                prevMacKey    = peer->prevMacKey;
+            }
             senderLane = LaneFrom(peer->theirPk);
         }
 
@@ -1363,6 +1421,9 @@ namespace bcp::flux
             common::crypto::Wipe(key.data(), key.size());
             common::crypto::Wipe(headerKey.data(), headerKey.size());
             common::crypto::Wipe(macKey.data(), macKey.size());
+            common::crypto::Wipe(prevKey.data(), prevKey.size());
+            common::crypto::Wipe(prevHeaderKey.data(), prevHeaderKey.size());
+            common::crypto::Wipe(prevMacKey.data(), prevMacKey.size());
             return false;
         }
 
@@ -1370,13 +1431,59 @@ namespace bcp::flux
         // it then feeds the replay check below. A MAC-only packet is verified
         // rather than decrypted, and everything past this point is identical
         // because the two share a layout.
+        //
+        // A failed open leaves the packet byte for byte as it arrived, which
+        // is what makes the ladder below legal. Current first, because it is
+        // right for every packet outside a rotation window. Previous while our
+        // own rotation is unconfirmed, because the peer keeps sealing under
+        // the old link until a rotated packet reaches it. Next-in-chain last,
+        // because the peer may have rotated and this packet is how we find
+        // out. So a corrupt packet costs two opens steady-state and three
+        // during the round trip after our own rotation, and never more.
         uint64_t counter = 0;
-        const bool opened = writablePacket->IsMacOnly()
-            ? OpenMacOnlyPacket(*writablePacket, macKey, headerKey, counter)
-            : OpenSecurePacket(*writablePacket, key, headerKey, senderLane, counter);
+        const bool macOnly = writablePacket->IsMacOnly();
+        auto tryOpen = [&](const common::crypto::SessionKey& session,
+                           const common::crypto::SessionKey& mask,
+                           const common::crypto::SessionKey& mac) noexcept {
+            return macOnly
+                ? OpenMacOnlyPacket(*writablePacket, mac, mask, counter)
+                : OpenSecurePacket(*writablePacket, session, mask, senderLane, counter);
+        };
+
+        enum class OpenedWith : uint8_t { CURRENT, PREVIOUS, NEXT };
+        OpenedWith openedWith = OpenedWith::CURRENT;
+
+        bool opened = tryOpen(key, headerKey, macKey);
+        if (!opened && rotationPending && tryOpen(prevKey, prevHeaderKey, prevMacKey))
+        {
+            opened     = true;
+            openedWith = OpenedWith::PREVIOUS;
+        }
+        if (!opened)
+        {
+            common::crypto::SessionKey nextKey;
+            common::crypto::SessionKey nextHeaderKey;
+            common::crypto::SessionKey nextMacKey;
+            common::crypto::DeriveSubKey(nextKey.data(), key.data(), KEY_ROTATE_LABEL);
+            common::crypto::DeriveSubKey(nextHeaderKey.data(), nextKey.data(),
+                                         HEADER_KEY_LABEL);
+            common::crypto::DeriveSubKey(nextMacKey.data(), nextKey.data(),
+                                         MAC_KEY_LABEL);
+            if (tryOpen(nextKey, nextHeaderKey, nextMacKey))
+            {
+                opened     = true;
+                openedWith = OpenedWith::NEXT;
+            }
+            common::crypto::Wipe(nextKey.data(), nextKey.size());
+            common::crypto::Wipe(nextHeaderKey.data(), nextHeaderKey.size());
+            common::crypto::Wipe(nextMacKey.data(), nextMacKey.size());
+        }
         common::crypto::Wipe(key.data(), key.size());
         common::crypto::Wipe(headerKey.data(), headerKey.size());
         common::crypto::Wipe(macKey.data(), macKey.size());
+        common::crypto::Wipe(prevKey.data(), prevKey.size());
+        common::crypto::Wipe(prevHeaderKey.data(), prevHeaderKey.size());
+        common::crypto::Wipe(prevMacKey.data(), prevMacKey.size());
         if (!opened)
             return false;
 
@@ -1386,12 +1493,84 @@ namespace bcp::flux
         // free: an authenticated, replay-accepted packet is the strongest "the
         // peer is alive" evidence there is. The grain still gates the store to
         // keep the peer's cache line quiet at high packet rates.
+        //
+        // Everything below re-reads the peer's rotation state rather than
+        // trusting the copies from above, because another packet on another
+        // thread may have committed or confirmed a rotation in between. The
+        // generation is the referee: the chain is deterministic, so a
+        // generation one past the copy names exactly the key the ladder
+        // derived, and anything else means this packet answers a link that no
+        // longer exists.
         {
             PeerHandle peerHandle = peers_.GetPeer(writablePacket->address);
             if (peerHandle.Failed()) return false;
             Peer* peer = peerHandle.Write();
             if (!peer || !peer->IsValid()) return false;
-            if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
+            const uint32_t slot = peerHandle.GetSlotIndex();
+
+            switch (openedWith)
+            {
+            case OpenedWith::CURRENT:
+                if (peer->keyGeneration != generationSeen)
+                    return false;   // committed past this link while we opened
+                if (!peer->rotationConfirmed)
+                {
+                    // First packet under the link we rotated to: the peer has
+                    // caught up, its counters restarted with its adoption, and
+                    // the old link is dead. The window resets before the
+                    // accept, in this same locked step, so a late old-link
+                    // packet can never write its huge counter into the fresh
+                    // window (the PREVIOUS case below refuses it outright).
+                    ReplayFor(slot).Reset();
+                    common::crypto::Wipe(peer->prevSession.data(),
+                                         peer->prevSession.size());
+                    common::crypto::Wipe(peer->prevHeaderKey.data(),
+                                         peer->prevHeaderKey.size());
+                    common::crypto::Wipe(peer->prevMacKey.data(),
+                                         peer->prevMacKey.size());
+                    peer->rotationConfirmed = true;
+                }
+                break;
+
+            case OpenedWith::PREVIOUS:
+                // Legal only while the rotation is still unconfirmed. Once the
+                // confirm reset the window, an old-link counter accepted here
+                // would poison it, so a straggler past that point is dropped,
+                // which is the no-grace rule doing its job.
+                if (peer->rotationConfirmed || peer->keyGeneration != generationSeen)
+                    return false;
+                break;
+
+            case OpenedWith::NEXT:
+                if (peer->keyGeneration == generationSeen)
+                {
+                    // The peer rotated and this packet is the discovery. Walk
+                    // our own state one link, then undo the parts of that walk
+                    // that belong to an initiator: we are the follower here,
+                    // so the old link is dead now (stragglers drop) and there
+                    // is nothing left to confirm. The window resets because
+                    // the peer's counters restarted when it rotated.
+                    RotatePeerKeys(*peer);
+                    common::crypto::Wipe(peer->prevSession.data(),
+                                         peer->prevSession.size());
+                    common::crypto::Wipe(peer->prevHeaderKey.data(),
+                                         peer->prevHeaderKey.size());
+                    common::crypto::Wipe(peer->prevMacKey.data(),
+                                         peer->prevMacKey.size());
+                    peer->rotationConfirmed = true;
+                    ReplayFor(slot).Reset();
+                }
+                else if (peer->keyGeneration != static_cast<uint8_t>(generationSeen + 1))
+                {
+                    return false;   // not the link this packet was opened under
+                }
+                // generationSeen + 1 means another thread already committed
+                // the same deterministic link, so the plain accept below is
+                // exactly right.
+                break;
+            }
+
+            if (!ReplayFor(slot).Accept(counter))
                 return false;   // duplicate or too old, drop
 
             // The peer has now opened something under the session key, which is
@@ -2251,7 +2430,10 @@ namespace bcp::flux
         BuildTranscript(transcript, publicKey_, pk, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
 
         common::crypto::SessionKey session;
-        DeriveSessionInto(session, pk, ephSk, ephR, transcript, sizeof(transcript));
+        common::crypto::SessionKey scratchResume;   // proof needs the session alone
+        DeriveSessionInto(session, scratchResume, pk, ephSk, ephR, transcript,
+                          sizeof(transcript));
+        common::crypto::Wipe(scratchResume.data(), scratchResume.size());
 
         common::crypto::Mac expected;
         common::crypto::ComputeMac(expected, session, transcript, sizeof(transcript));
@@ -2310,25 +2492,27 @@ namespace bcp::flux
         // args: ReplayFor().Reset (needs the slot), and, in Complete, the
         // announced tag and authentication verdict.
         peer.theirPk = theirPk;
-        DeriveSessionInto(peer.session, theirPk, myEphSk, theirEphPk, transcript, transcriptLen);
-        // Split off the counter-masking key. The label is fixed and public; it
-        // only has to differ from every other input the session key is ever
-        // fed, so the two derivations cannot collide.
-        static constexpr uint8_t HEADER_KEY_LABEL[16] = {
-            'f','l','u','x','-','h','d','r','-','m','a','s','k',0,0,0
-        };
+        DeriveSessionInto(peer.session, peer.resumeRoot, theirPk, myEphSk, theirEphPk,
+                          transcript, transcriptLen);
+        // Split off the counter-masking key and the MAC-only key, under
+        // distinct labels so no two derivations share a domain.
         common::crypto::DeriveSubKey(peer.headerKey.data(), peer.session.data(),
                                      HEADER_KEY_LABEL);
-
-        // Same mechanism, different label, so the two never share a domain.
-        static constexpr uint8_t MAC_KEY_LABEL[16] = {
-            'f','l','u','x','-','m','a','c','-','o','n','l','y',0,0,0
-        };
         common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
                                      MAC_KEY_LABEL);
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
+        // A fresh handshake starts a fresh rotation chain. A re-handshake on
+        // a live peer may land mid-rotation, so the previous keys are dead
+        // either way: whatever was sealed under them answers to a session
+        // this one just replaced.
+        peer.keyGeneration      = 0;
+        peer.rotationConfirmed  = true;
+        peer.bytesSinceRotation = 0;
+        common::crypto::Wipe(peer.prevSession.data(),   peer.prevSession.size());
+        common::crypto::Wipe(peer.prevHeaderKey.data(), peer.prevHeaderKey.size());
+        common::crypto::Wipe(peer.prevMacKey.data(),    peer.prevMacKey.size());
 
         // The floor holds from the first send, not only after a loss trims
         // down to it. A fresh peer is registered at the initial window, which
@@ -2359,6 +2543,65 @@ namespace bcp::flux
         // acknowledges anything still has a defined death, measured from the
         // moment it could first have answered.
         peer.rtt.MarkAcked(common::MonotonicMicros());
+    }
+
+    void Socket::RotatePeerKeys(Peer& peer) noexcept
+    {
+        // The old keys move to the prev slots rather than dying, because the
+        // peer keeps sealing under them until one of our rotated packets
+        // reaches it, up to a round trip away. They are wiped when its first
+        // packet under the new generation arrives.
+        peer.prevSession   = peer.session;
+        peer.prevHeaderKey = peer.headerKey;
+        peer.prevMacKey    = peer.macKey;
+
+        // One link along the chain: a one-way derivation, so holding the new
+        // key tells nothing about the old one, which is the whole point of
+        // rotating. The helpers and the tag re-derive exactly as a handshake
+        // derives them, just fed from the new link.
+        common::crypto::SessionKey next;
+        common::crypto::DeriveSubKey(next.data(), peer.session.data(), KEY_ROTATE_LABEL);
+        peer.session = next;
+        common::crypto::Wipe(next.data(), next.size());
+        common::crypto::DeriveSubKey(peer.headerKey.data(), peer.session.data(),
+                                     HEADER_KEY_LABEL);
+        common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
+                                     MAC_KEY_LABEL);
+
+        // Our counter restarts with the key, so the nonce space is fresh and
+        // the peer's replay window resets when it adopts the new link. Tags
+        // derive from the session, so they restart with it too. The receive
+        // window here is untouched: the peer's counters only restart when it
+        // adopts, and that moment is what resets the window, not this one.
+        peer.sendCounter  = 0;
+        peer.myTagStep    = 0;
+        peer.theirTagStep = 0;
+        peer.myTag        = DerivePeerTag(peer.session, LaneTo(peer.theirPk), 0);
+
+        peer.keyGeneration      = static_cast<uint8_t>(peer.keyGeneration + 1);
+        peer.rotationConfirmed  = false;
+        peer.bytesSinceRotation = 0;
+    }
+
+    common::Error Socket::RotateKeys(const Address& addr)
+    {
+        if (!initialized_.load(std::memory_order_relaxed))
+            return common::Error::NotInitialized;
+
+        PeerHandle peerHandle = peers_.GetPeer(addr);
+        if (peerHandle.Failed()) return common::Error::NotFound;
+        Peer* peer = peerHandle.Write();
+        if (!peer || !peer->IsValid()) return common::Error::NotFound;
+
+        // One unconfirmed link at a time. The chain is deterministic, so the
+        // peer can only catch up by walking it, and it walks one step per
+        // discovery: a second rotation before the first is confirmed would
+        // put the two ends two links apart with nothing sealed under the
+        // middle one.
+        if (!peer->rotationConfirmed) return common::Error::AlreadyPending;
+
+        RotatePeerKeys(*peer);
+        return common::Error::Ok;
     }
 
     common::Result<PacketSlotWriter> Socket::BuildInternal(SocketOpCode op)
