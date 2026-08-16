@@ -385,42 +385,43 @@ static void traffic_survives_a_handover_that_moves_the_nonce_space()
 
     const uint8_t whileKnocking = NonceLaneTo(sender, addrReceiver);
 
-    // The first flight still lands, on a key the receiver keeps only because
-    // it was told to.
+    // Every packet is numbered and none is reliable, so nothing here is
+    // retransmitted and anything the handover cannot open is simply gone.
+    // The count and the order are the whole verdict.
     std::vector<uint32_t> delivered;
-    CHECK(sender.BuildPacket().NoFlow().PutU32(1).Send(addrReceiver) == common::Error::Ok);
+    uint32_t sent = 0;
+    CHECK(sender.BuildPacket().NoFlow().PutU32(++sent).Send(addrReceiver) == common::Error::Ok);
     PumpOnce(sender, receiver, delivered);
-    CHECK(delivered.size() == 1);
+    CHECK(delivered.size() == 1);   // the first flight, on the retained key
 
+    // Keep sending right across the handover, which is where packets sealed
+    // under the interim key meet a session that has already replaced it.
     CHECK(sender.LoadCertificate(after.ToCertificate()) == common::Error::Ok);
-    for (int round = 0; round < 400 && !HandshakeLanded(sender, addrReceiver); ++round)
+    for (int round = 0; round < 400; ++round)
+    {
+        CHECK(sender.BuildPacket().NoFlow().PutU32(++sent).Send(addrReceiver) == common::Error::Ok);
         PumpOnce(sender, receiver, delivered);
+        if (HandshakeLanded(sender, addrReceiver) && round > 40) break;
+    }
     CHECK(HandshakeLanded(sender, addrReceiver));
+
+    // Drain what is still on the wire before counting, or the last packets
+    // sent would read as lost when they are merely in flight.
+    for (int round = 0; round < 40 && delivered.size() < sent; ++round)
+        PumpOnce(sender, receiver, delivered);
 
     // The premise of the case: this rotation really did move the half of the
     // nonce space the sender writes in. Without that there is nothing here to
-    // survive, and the case would be passing for the wrong reason.
+    // survive and the case would be passing for the wrong reason.
     CHECK(whileKnocking != NonceLaneTo(sender, addrReceiver));
 
-    // And the session on the far side of that move carries traffic, in order,
-    // which is the property the move must not cost.
-    const size_t alreadyIn = delivered.size();
-    for (uint32_t value = 100; value < 120; ++value)
-    {
-        CHECK(sender.BuildPacket().NoFlow().PutU32(value).Send(addrReceiver) == common::Error::Ok);
-        PumpOnce(sender, receiver, delivered);
-    }
-    for (int round = 0; round < 100 && delivered.size() < alreadyIn + 20; ++round)
-        PumpOnce(sender, receiver, delivered);
-    CHECK(delivered.size() == alreadyIn + 20);
-    for (size_t i = 0; i < 20 && alreadyIn + i < delivered.size(); ++i)
-        CHECK(delivered[alreadyIn + i] == 100 + i);
-
-    // Not asserted here: that every packet sent DURING the handover arrives.
-    // Unreliable traffic loses one across a knock handover about half the time
-    // whether or not a rotation is involved, so a count over that window would
-    // be measuring the handover's own lossiness rather than anything this case
-    // is about.
+    // Every packet was sent to a peer holding a key that opens it, before the
+    // handover under the interim key and after it under the session. So every
+    // packet arrives, in order. One opened in the wrong half of the nonce
+    // space builds a different nonce and is dropped, which this would show.
+    CHECK(delivered.size() == sent);
+    for (size_t i = 0; i < delivered.size(); ++i)
+        CHECK(delivered[i] == i + 1);
 }
 
 int main()
