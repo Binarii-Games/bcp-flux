@@ -256,8 +256,13 @@ namespace bcp::flux
                     useCurrent ? peer->knockKey : peer->prevSession;
                 const common::crypto::SessionKey& openMask =
                     useCurrent ? peer->knockHeaderKey : peer->prevHeaderKey;
-                if (!OpenKnockPacket(*packet, openKey, openMask,
-                                     peer->TheirLane(), counter))
+                // The previous slot holds the interim key, and that key was
+                // agreed against whichever key the opener named, so it carries
+                // its own lane. Opening it with the committed one produces a
+                // different nonce and it never opens.
+                const uint8_t openLane =
+                    useCurrent ? peer->TheirLane() : peer->TheirPrevLane();
+                if (!OpenKnockPacket(*packet, openKey, openMask, openLane, counter))
                     return;
                 if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
                     return;

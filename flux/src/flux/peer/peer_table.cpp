@@ -437,6 +437,7 @@ namespace bcp::flux
         p->theirPk     = {};
         p->session     = {};
         p->lane        = 0;   // settled when a key is installed
+        p->prevLane    = 0;
         p->headerKey   = {};
         p->macKey      = {};
         p->resumeRoot    = {};

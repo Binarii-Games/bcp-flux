@@ -1426,6 +1426,7 @@ namespace bcp::flux
         bool    rotationPending = false;
         uint8_t generationSeen  = 0;
         uint8_t senderLane = 0;
+        uint8_t senderPrevLane = 0;
         {
             PeerHandle peerHandle = peers_.GetPeer(packet->address);
             if (peerHandle.Failed())
@@ -1448,7 +1449,8 @@ namespace bcp::flux
                 prevHeaderKey = peer->prevHeaderKey;
                 prevMacKey    = peer->prevMacKey;
             }
-            senderLane = peer->TheirLane();
+            senderLane     = peer->TheirLane();
+            senderPrevLane = peer->TheirPrevLane();
         }
 
         PacketSlot* writablePacket = pHandle.Write();
@@ -1480,17 +1482,19 @@ namespace bcp::flux
         const bool macOnly = writablePacket->IsMacOnly();
         auto tryOpen = [&](const common::crypto::SessionKey& session,
                            const common::crypto::SessionKey& mask,
-                           const common::crypto::SessionKey& mac) noexcept {
+                           const common::crypto::SessionKey& mac,
+                           uint8_t lane) noexcept {
             return macOnly
                 ? OpenMacOnlyPacket(*writablePacket, mac, mask, counter)
-                : OpenSecurePacket(*writablePacket, session, mask, senderLane, counter);
+                : OpenSecurePacket(*writablePacket, session, mask, lane, counter);
         };
 
         enum class OpenedWith : uint8_t { CURRENT, PREVIOUS, NEXT };
         OpenedWith openedWith = OpenedWith::CURRENT;
 
-        bool opened = tryOpen(key, headerKey, macKey);
-        if (!opened && rotationPending && tryOpen(prevKey, prevHeaderKey, prevMacKey))
+        bool opened = tryOpen(key, headerKey, macKey, senderLane);
+        if (!opened && rotationPending
+            && tryOpen(prevKey, prevHeaderKey, prevMacKey, senderPrevLane))
         {
             opened     = true;
             openedWith = OpenedWith::PREVIOUS;
@@ -1505,7 +1509,7 @@ namespace bcp::flux
                                          internal::HEADER_KEY_LABEL);
             common::crypto::DeriveSubKey(nextMacKey.data(), nextKey.data(),
                                          internal::MAC_KEY_LABEL);
-            if (tryOpen(nextKey, nextHeaderKey, nextMacKey))
+            if (tryOpen(nextKey, nextHeaderKey, nextMacKey, senderLane))
             {
                 opened     = true;
                 openedWith = OpenedWith::NEXT;
@@ -2603,6 +2607,7 @@ namespace bcp::flux
         // in flight under the interim key keep opening while the flows, their
         // sequences and the congestion state carry straight on.
         const bool fromKnock = peer.knockActive;
+        const uint8_t priorLane = peer.lane;
         common::crypto::SessionKey priorSession   = peer.session;
         common::crypto::SessionKey priorHeaderKey = peer.headerKey;
         common::crypto::SessionKey priorMacKey    = peer.macKey;
@@ -2631,6 +2636,7 @@ namespace bcp::flux
             // The interim key becomes the previous link, so the trial open
             // carries whatever the peer sealed before it learned of this one.
             peer.prevSession   = priorSession;
+            peer.prevLane      = priorLane;
             peer.prevHeaderKey = priorHeaderKey;
             peer.prevMacKey    = priorMacKey;
             peer.rotationConfirmed = false;
@@ -2692,6 +2698,7 @@ namespace bcp::flux
         // reaches it, up to a round trip away. They are wiped when its first
         // packet under the new generation arrives.
         peer.prevSession   = peer.session;
+        peer.prevLane      = peer.lane;
         peer.prevHeaderKey = peer.headerKey;
         peer.prevMacKey    = peer.macKey;
 

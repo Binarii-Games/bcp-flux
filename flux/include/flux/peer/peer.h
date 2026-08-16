@@ -59,8 +59,18 @@ namespace bcp::flux
             two counters under one key. */
         uint8_t                    lane;
 
+        /** The lane that went with prevSession. Usually the same as lane, and
+            a separate field for the one case where it is not: an interim
+            opener key is agreed against whichever of this socket's keys the
+            opener named, and the session that replaces it is agreed against
+            the key the handshake announced. When those differ, so do the two
+            lanes, and a packet still in flight under the interim key has to
+            be opened with the lane it was sealed under or not at all. */
+        uint8_t                    prevLane;
+
         /** The half the remote sends in, which is whichever this side is not. */
         [[nodiscard]] uint8_t TheirLane() const noexcept { return lane == 0 ? 1 : 0; }
+        [[nodiscard]] uint8_t TheirPrevLane() const noexcept { return prevLane == 0 ? 1 : 0; }
 
         /** Masks the counter field of every secure packet, so the counter is
             not readable on the wire. Split from `session` rather than reused:
