@@ -109,6 +109,91 @@ namespace bcp::flux::internal
         ever covers. */
     static constexpr uint64_t KEY_ROTATE_AFTER_BYTES_DEFAULT = 1ull << 30;
 
+    /** The labels that split one secret into purpose-specific keys. Fixed and
+        public; each only has to differ from every other input its source key
+        is ever fed, so no two derivations share a domain. Here rather than in
+        one translation unit because the handshake, the rotation and the knock
+        all derive with them. */
+    static constexpr uint8_t HEADER_KEY_LABEL[16] = {
+        'f','l','u','x','-','h','d','r','-','m','a','s','k',0,0,0
+    };
+    static constexpr uint8_t MAC_KEY_LABEL[16] = {
+        'f','l','u','x','-','m','a','c','-','o','n','l','y',0,0,0
+    };
+    static constexpr uint8_t KEY_ROTATE_LABEL[16] = {
+        'f','l','u','x','-','k','e','y','-','r','o','t','a','t','e',0
+    };
+    static constexpr uint8_t RESUME_ROOT_LABEL[16] = {
+        'f','l','u','x','-','r','e','s','u','m','e',0,0,0,0,0
+    };
+    static constexpr uint8_t KNOCK_KEY_LABEL[16] = {
+        'f','l','u','x','-','k','n','o','c','k',0,0,0,0,0,0
+    };
+    static constexpr uint8_t KNOCK_STATIC_LABEL[16] = {
+        'f','l','u','x','-','k','n','k','-','s','t','a','t','i','c',0
+    };
+
+    // --- Knock (the 0-RTT opener) ---
+
+    /** Cleartext knock header: controller, opcode, version, caps, masked
+        counter, sender ephemeral, salt, sender wall clock, and the identity
+        region. Every field is fixed width, so every offset is constant and
+        MaxPayload has one answer per state.
+
+        The identity region is the sender's own public key sealed under a key
+        only the named receiver can rebuild, plus its tag. Nothing in the
+        header is stable across two knocks from one sender, so an observer
+        cannot tell them apart or recognise a sender it has seen before. */
+    static constexpr size_t   KNOCK_IDENTITY_SIZE =
+        common::crypto::KEY_SIZE + common::crypto::TAG_SIZE;
+    static constexpr size_t   KNOCK_HEADER_SIZE   =
+        1 + 1 + VERSION_SIZE + VERSION_CAPS_SIZE + WIRE_NONCE_SIZE
+        + common::crypto::KEY_SIZE + WIRE_HS_SALT_SIZE + 8 + KNOCK_IDENTITY_SIZE;
+
+    /** Fixed field offsets inside the knock header. */
+    static constexpr size_t   KNOCK_OFF_VERSION  = 2;
+    static constexpr size_t   KNOCK_OFF_CAPS     = KNOCK_OFF_VERSION + VERSION_SIZE;
+    static constexpr size_t   KNOCK_OFF_COUNTER  = KNOCK_OFF_CAPS + VERSION_CAPS_SIZE;
+    static constexpr size_t   KNOCK_OFF_EPH      = KNOCK_OFF_COUNTER + WIRE_NONCE_SIZE;
+    static constexpr size_t   KNOCK_OFF_SALT     = KNOCK_OFF_EPH + common::crypto::KEY_SIZE;
+    static constexpr size_t   KNOCK_OFF_CLOCK    = KNOCK_OFF_SALT + WIRE_HS_SALT_SIZE;
+    static constexpr size_t   KNOCK_OFF_IDENTITY = KNOCK_OFF_CLOCK + 8;
+
+    /** The encrypted interior leads with the sender's real controller byte
+        and the payload length, then the payload, then zero padding out to
+        the fixed packet size. */
+    static constexpr size_t   KNOCK_INNER_PREFIX  = 1 + 2;
+    static constexpr size_t   KNOCK_INNER_SIZE    =
+        MAX_WIRE_PACKET_SIZE - KNOCK_HEADER_SIZE - WIRE_TAG_SIZE;
+    static constexpr size_t   KNOCK_PAYLOAD_MAX   = KNOCK_INNER_SIZE - KNOCK_INNER_PREFIX;
+
+    /** In-pool marker on a delivered packet that rode the first flight, so
+        the application's replay contract is per message. Never travels: set
+        after the open, on this socket's copy alone. */
+    static constexpr uint8_t  WIRE_CTRL_KNOCKED = 0x40;
+
+    /** Clock disagreement past which a knock is stale. Bounds what a replayed
+        first flight can achieve when the seen-ring was wiped by a restart. */
+    static constexpr uint32_t KNOCK_TTL_WINDOW_SECONDS_DEFAULT = 30;
+
+    /** Knock validations one tick pays for, each costing key agreement.
+        Excess knocks are dropped and the sender's retry covers them. */
+    static constexpr uint32_t KNOCK_BUDGET_PER_TICK_DEFAULT = 32;
+
+    /** Peers allowed to exist before their address is proven. */
+    static constexpr uint32_t KNOCK_MAX_UNPROVEN_DEFAULT = 64;
+
+    /** Packets accepted from one unproven peer before further ones are
+        ejected unbuffered until its cookie echo lands. */
+    static constexpr uint32_t KNOCK_UNPROVEN_PACKET_LIMIT_DEFAULT = 256;
+
+    /** Recently seen first-flight fingerprints the ring remembers. */
+    static constexpr uint32_t KNOCK_RING_SIZE_DEFAULT = 1024;
+
+    /** Round trips (of the estimate at knock time, with a floor) an unproven
+        peer may exist before the tick evicts it. */
+    static constexpr uint64_t KNOCK_PROVE_TIMEOUT_MICROS = 3'000'000;
+
     // --- Flow ---
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
 

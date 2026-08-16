@@ -213,6 +213,50 @@ namespace bcp::flux
             opportunity. */
         uint64_t grantSentAtMicros;
 
+        /** The knock window: the interim key material that lets data flow
+            from the first packet while the standard handshake completes
+            behind it. On the sender every outgoing packet is knock-framed
+            while this is active; on the receiver it opens the knocks that
+            keep arriving until the sender switches to the session. Wiped
+            when the first ordinary secure packet opens.
+
+            knockIdentity is what the header's identity region carries, which
+            is this side's own public key. */
+        bool     knockActive;
+
+        /** Whether outgoing packets still carry the opener. Separate from
+            knockActive, which says the interim key is the session key: the
+            opener only has to travel until the far side is known to hold that
+            key, and every packet after that spends its bytes on payload
+            instead. The first packet from the peer that opens is the proof,
+            because it could only have been sealed by a side that derived the
+            same interim key. The responder never sets this: its peer exists
+            already, so its replies have nothing to announce. */
+        bool     knockFramed;
+
+        common::crypto::SessionKey knockKey;
+        common::crypto::SessionKey knockHeaderKey;
+        common::crypto::PublicKey  knockEphPk;
+        uint8_t  knockSalt[internal::WIRE_HS_SALT_SIZE];
+        uint8_t  knockIdentity[internal::KNOCK_IDENTITY_SIZE];
+
+        /** Set on a receiver-side peer created by a knock, cleared when the
+            HS_RES cookie echo proves the address. While set, the peer counts
+            against the socket-wide unproven cap, its accepted packets count
+            against the limit below, and the tick evicts it if the proof
+            never lands. */
+        bool     awaitingAddressProof;
+        uint32_t unprovenPacketsSeen;
+        uint64_t knockStartedAtMicros;
+
+        /** Set on the initiating side from the moment its knock window opens
+            until the handshake behind it completes. A knocked peer is
+            established under the interim key, so without this the retry pass
+            would skip it and a lost opener would never be resent. The
+            responder leaves it clear: it answers handshakes, it does not
+            start them. */
+        bool     knockHandshakePending;
+
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
                                           ///< at or above, the curve decides
 
@@ -327,6 +371,14 @@ namespace bcp::flux
         bool freeWhenRead;
 
         bool IsValid() const { return state == HandshakeState::ESTABLISHED; }
+
+        /** Whether secure traffic can cross to and from this peer now. The
+            handshake state answers a different question: an initiator inside
+            its knock window is still AWAITING_CHALLENGE, because the exchange
+            it must answer has not arrived, while its interim key already
+            carries flows in both directions. Sending and receiving ask this;
+            only the handshake itself asks IsValid. */
+        bool CanCarryTraffic() const { return IsValid() || knockActive; }
     };
 
     static_assert(std::is_trivially_copyable_v<Peer>,

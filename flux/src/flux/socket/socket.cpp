@@ -226,6 +226,10 @@ namespace bcp::flux
             certStore_.Init(config.trustedCertCount) != common::Error::Ok)
             return common::Error::NotInitialized;
 
+        const common::Error knock = InitKnock(config);
+        if (knock != common::Error::Ok)
+            return knock;
+
         return common::Error::Ok;
     }
 
@@ -439,22 +443,6 @@ namespace bcp::flux
         return LaneTo(theirPk) == 0 ? 1 : 0;
     }
 
-    // The labels that split one secret into purpose-specific keys. Fixed and
-    // public; each only has to differ from every other input its source key
-    // is ever fed, so no two derivations share a domain.
-    static constexpr uint8_t HEADER_KEY_LABEL[16] = {
-        'f','l','u','x','-','h','d','r','-','m','a','s','k',0,0,0
-    };
-    static constexpr uint8_t MAC_KEY_LABEL[16] = {
-        'f','l','u','x','-','m','a','c','-','o','n','l','y',0,0,0
-    };
-    static constexpr uint8_t KEY_ROTATE_LABEL[16] = {
-        'f','l','u','x','-','k','e','y','-','r','o','t','a','t','e',0
-    };
-    static constexpr uint8_t RESUME_ROOT_LABEL[16] = {
-        'f','l','u','x','-','r','e','s','u','m','e',0,0,0,0,0
-    };
-
     void Socket::DeriveSessionInto(common::crypto::SessionKey& outSession,
                                     common::crypto::SessionKey& outResume,
                                     const common::crypto::PublicKey& theirPk,
@@ -480,7 +468,7 @@ namespace bcp::flux
         common::crypto::ComputeSharedSecret(staticShared, secretKey_, theirPk);
         common::crypto::ComputeSharedSecret(ephShared, myEphSk, theirEphPk);
 
-        uint8_t context[sizeof(RESUME_ROOT_LABEL) + common::crypto::SHARED_SIZE
+        uint8_t context[sizeof(internal::RESUME_ROOT_LABEL) + common::crypto::SHARED_SIZE
                         + internal::HS_TRANSCRIPT_SIZE];
         std::memcpy(context, ephShared.data(), ephShared.size());
         std::memcpy(context + ephShared.size(), transcript, transcriptLen);
@@ -488,12 +476,12 @@ namespace bcp::flux
         common::crypto::DeriveSessionKey(outSession, staticShared, context,
                                          ephShared.size() + transcriptLen);
 
-        std::memmove(context + sizeof(RESUME_ROOT_LABEL), context,
+        std::memmove(context + sizeof(internal::RESUME_ROOT_LABEL), context,
                      ephShared.size() + transcriptLen);
-        std::memcpy(context, RESUME_ROOT_LABEL, sizeof(RESUME_ROOT_LABEL));
+        std::memcpy(context, internal::RESUME_ROOT_LABEL, sizeof(internal::RESUME_ROOT_LABEL));
 
         common::crypto::DeriveSessionKey(outResume, staticShared, context,
-                                         sizeof(RESUME_ROOT_LABEL)
+                                         sizeof(internal::RESUME_ROOT_LABEL)
                                          + ephShared.size() + transcriptLen);
 
         common::crypto::Wipe(context, sizeof(context));
@@ -525,6 +513,17 @@ namespace bcp::flux
         materials.counter   = ++peer.sendCounter;
         materials.lane      = LaneTo(peer.theirPk);
         materials.tag       = peer.myTag;
+        // While the window is open every packet carries the opener, not only
+        // the first: reordering means any of them may be the one that arrives
+        // before the peer exists on the far side.
+        if (peer.knockFramed)
+        {
+            materials.knock      = true;
+            materials.knockEphPk = peer.knockEphPk;
+            std::memcpy(materials.knockSalt, peer.knockSalt, sizeof(materials.knockSalt));
+            std::memcpy(materials.knockIdentity, peer.knockIdentity,
+                        sizeof(materials.knockIdentity));
+        }
         return materials;
     }
 
@@ -603,12 +602,20 @@ namespace bcp::flux
         // packet then peer then flow.
         uint32_t assocSlot   = common::collections::SlotPool::INVALID;
         bool     gateRefused = false;
+        uint16_t batchLimit  = internal::MAX_WIRE_PACKET_SIZE;
         {
             PeerHandle peerHandle = peers_.GetPeer(to);
             if (peerHandle.Failed()) return false;
             const Peer* peer = peerHandle.Read();
-            if (!peer || !peer->IsValid()) return false;   // handshaking: the ordinary path parks it
+            if (!peer || !peer->CanCarryTraffic()) return false;   // handshaking: the ordinary path parks it
             if (requireAuth && !peer->authenticated) return false;   // and reports it
+            // The batch is sealed under whatever framing this peer has when
+            // the flush runs, and a knock's opener leaves less room. Bounding
+            // it here means a batch is never built too large to send, rather
+            // than discovering it at the seal with the messages already
+            // accepted.
+            if (peer->knockActive)
+                batchLimit = static_cast<uint16_t>(internal::KNOCK_PAYLOAD_MAX);
             assocSlot = flows_.FindOutAssoc(peerHandle.GetSlotIndex(), flowId);
 
             // The gate has to answer the caller, not the flush. A batched send
@@ -634,14 +641,14 @@ namespace bcp::flux
 
 
         FlowTable::BatchAdmit admitted =
-            flows_.AppendToBatch(assocSlot, *packet, internal::MAX_WIRE_PACKET_SIZE);
+            flows_.AppendToBatch(assocSlot, *packet, batchLimit);
 
         if (admitted == FlowTable::BatchAdmit::Sealed)
         {
             // Full. Send what is there, then this message opens the next batch.
             status = FlushOneBatch(to, assocSlot);
             if (status != common::Error::Ok) return true;
-            admitted = flows_.AppendToBatch(assocSlot, *packet, internal::MAX_WIRE_PACKET_SIZE);
+            admitted = flows_.AppendToBatch(assocSlot, *packet, batchLimit);
         }
 
         if (admitted != FlowTable::BatchAdmit::Appended)
@@ -888,7 +895,7 @@ namespace bcp::flux
                 // flow either way, so the flow counts it as sent from here on
                 // and the congestion gate answers the caller now rather than
                 // the packet being refused later with nobody left to tell.
-                const bool sessionUp = peer->IsValid();
+                const bool sessionUp = peer->CanCarryTraffic();
 
                 // Authentication is a property of an established session, so a
                 // packet waiting on a handshake carries the requirement and is
@@ -915,6 +922,20 @@ namespace bcp::flux
                 if (packet->dataSize < minSize)
                 {
                     status = common::Error::Malformed;
+                    return PacketSlotHandle::Invalid();
+                }
+
+                // A knock spends most of its packet on the opener, so less
+                // payload fits than a session packet carries. Refused here,
+                // before the flow admission stamps anything, so the caller is
+                // told rather than the packet being dropped at the seal with
+                // an Ok already returned. MaxPayload is how a caller sizes
+                // for this without guessing.
+                if (peer->knockActive
+                    && static_cast<size_t>(packet->dataSize - minSize)
+                         > internal::KNOCK_PAYLOAD_MAX)
+                {
+                    status = common::Error::TooLarge;
                     return PacketSlotHandle::Invalid();
                 }
 
@@ -1405,7 +1426,7 @@ namespace bcp::flux
                 return false;
             }
             const Peer* peer = peerHandle.Read();
-            if (!peer || !peer->IsValid()) return false;
+            if (!peer || !peer->CanCarryTraffic()) return false;
             key = peer->session;
             headerKey = peer->headerKey;
             macKey = peer->macKey;
@@ -1469,11 +1490,11 @@ namespace bcp::flux
             common::crypto::SessionKey nextKey;
             common::crypto::SessionKey nextHeaderKey;
             common::crypto::SessionKey nextMacKey;
-            common::crypto::DeriveSubKey(nextKey.data(), key.data(), KEY_ROTATE_LABEL);
+            common::crypto::DeriveSubKey(nextKey.data(), key.data(), internal::KEY_ROTATE_LABEL);
             common::crypto::DeriveSubKey(nextHeaderKey.data(), nextKey.data(),
-                                         HEADER_KEY_LABEL);
+                                         internal::HEADER_KEY_LABEL);
             common::crypto::DeriveSubKey(nextMacKey.data(), nextKey.data(),
-                                         MAC_KEY_LABEL);
+                                         internal::MAC_KEY_LABEL);
             if (tryOpen(nextKey, nextHeaderKey, nextMacKey))
             {
                 opened     = true;
@@ -1510,7 +1531,7 @@ namespace bcp::flux
             PeerHandle peerHandle = peers_.GetPeer(writablePacket->address);
             if (peerHandle.Failed()) return false;
             Peer* peer = peerHandle.Write();
-            if (!peer || !peer->IsValid()) return false;
+            if (!peer || !peer->CanCarryTraffic()) return false;
             const uint32_t slot = peerHandle.GetSlotIndex();
 
             switch (openedWith)
@@ -1578,11 +1599,24 @@ namespace bcp::flux
             if (!ReplayFor(slot).Accept(counter))
                 return false;   // duplicate or too old, drop
 
-            // The peer has now opened something under the session key, which is
-            // the first proof that the identity bound to this slot is the one
-            // that holds the key. Handshake_Validate refuses to disturb a peer
-            // past this point.
-            peer->confirmed = true;
+            // A packet from this peer opened, so it holds the key this side is
+            // sealing with and there is nothing left to announce. The opener
+            // stops riding along, which is most of a knock's bytes. The key
+            // itself is untouched: during the window it is the session key,
+            // and only the handshake replaces it.
+            peer->knockFramed = false;
+
+            // The peer has now opened something under the session key, which
+            // is the first proof that the identity bound to this slot is the
+            // one that holds the key. Handshake_Validate refuses to disturb a
+            // peer past this point.
+            //
+            // Not during the knock window. What opened there is the interim
+            // key, which the handshake is on its way to replace, so counting
+            // it as proof would make Validate refuse the very exchange that
+            // finishes the session and the peer would knock forever.
+            if (!peer->knockActive)
+                peer->confirmed = true;
 
             const uint32_t nowStamp = SeenStamp(common::MonotonicMicros());
             if (static_cast<uint32_t>(nowStamp - peer->lastSeenAt) >= seenGrainStamp_)
@@ -1597,6 +1631,15 @@ namespace bcp::flux
         if (!packet) return;
         const Address from = packet->address;
 
+        // The knock is read by its own fixed offsets, not by a message cursor,
+        // so it forks before the reader is built.
+        if (packet->dataSize > 1
+            && static_cast<SocketOpCode>(packet->data[1]) == SocketOpCode::HS_KNOCK)
+        {
+            Handshake_Knock(std::move(pHandle));
+            return;
+        }
+
         PacketSlotReader reader{pHandle};
         uint8_t opcode;
         if (!reader.TakeU8(opcode)) return;
@@ -1607,6 +1650,7 @@ namespace bcp::flux
             case SocketOpCode::HS_CHLG:   Handshake_Respond(from, reader);  break;
             case SocketOpCode::HS_RES:    Handshake_Validate(from, reader); break;
             case SocketOpCode::HS_FINISH: Handshake_Complete(from, reader); break;
+            case SocketOpCode::HS_KNOCK:  break;   // handled before the reader, below
             default: break;   // unknown opcode from the network: drop
         }
     }
@@ -1697,7 +1741,7 @@ namespace bcp::flux
             // Write, not read: registration mutates the peer's directory, and
             // the lock has to cover the lookup that decided it was absent.
             Peer* peer = peerHandle.Write();
-            if (!peer || !peer->IsValid()) return 0;
+            if (!peer || !peer->CanCarryTraffic()) return 0;
 
             const uint32_t peerSlot = peerHandle.GetSlotIndex();
             const FlowAdmit admit = flows_.AdmitIn(peerSlot, from, peer->id, flowId,
@@ -2196,6 +2240,19 @@ namespace bcp::flux
 
         const BcpId id = BcpId::Derive(pk);
 
+        // The cookie verified above, which is the whole of what proves an
+        // address: this echo came back to a challenge sent there. A peer that
+        // knocked its way in stops counting against the unproven cap here,
+        // whatever the rest of this function decides about its session.
+        {
+            PeerHandle provenHandle = peers_.GetPeer(from);
+            if (!provenHandle.Failed())
+            {
+                Peer* proven = provenHandle.Write();
+                if (proven) MarkAddressProven(*proven);
+            }
+        }
+
         bool established = false;   // answering a duplicate, not building anew
         bool repeat      = false;
         bool needBind    = false;
@@ -2496,15 +2553,24 @@ namespace bcp::flux
         // lock (the Peer is lent in) and owns the parts that need more than these
         // args: ReplayFor().Reset (needs the slot), and, in Complete, the
         // announced tag and authentication verdict.
+        // A knocked peer has been running under the interim key. The real one
+        // replaces it through the same slots a rotation uses, so packets still
+        // in flight under the interim key keep opening while the flows, their
+        // sequences and the congestion state carry straight on.
+        const bool fromKnock = peer.knockActive;
+        common::crypto::SessionKey priorSession   = peer.session;
+        common::crypto::SessionKey priorHeaderKey = peer.headerKey;
+        common::crypto::SessionKey priorMacKey    = peer.macKey;
+
         peer.theirPk = theirPk;
         DeriveSessionInto(peer.session, peer.resumeRoot, theirPk, myEphSk, theirEphPk,
                           transcript, transcriptLen);
         // Split off the counter-masking key and the MAC-only key, under
         // distinct labels so no two derivations share a domain.
         common::crypto::DeriveSubKey(peer.headerKey.data(), peer.session.data(),
-                                     HEADER_KEY_LABEL);
+                                     internal::HEADER_KEY_LABEL);
         common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
-                                     MAC_KEY_LABEL);
+                                     internal::MAC_KEY_LABEL);
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
@@ -2513,11 +2579,34 @@ namespace bcp::flux
         // either way: whatever was sealed under them answers to a session
         // this one just replaced.
         peer.keyGeneration      = 0;
-        peer.rotationConfirmed  = true;
         peer.bytesSinceRotation = 0;
-        common::crypto::Wipe(peer.prevSession.data(),   peer.prevSession.size());
-        common::crypto::Wipe(peer.prevHeaderKey.data(), peer.prevHeaderKey.size());
-        common::crypto::Wipe(peer.prevMacKey.data(),    peer.prevMacKey.size());
+        if (fromKnock)
+        {
+            // The interim key becomes the previous link, so the trial open
+            // carries whatever the peer sealed before it learned of this one.
+            peer.prevSession   = priorSession;
+            peer.prevHeaderKey = priorHeaderKey;
+            peer.prevMacKey    = priorMacKey;
+            peer.rotationConfirmed = false;
+            // The knock framing stops here on this side. The far side may keep
+            // using it for up to a round trip, which is what knockKey is for,
+            // and it is wiped when a packet opens under this key.
+            peer.knockActive = false;
+            peer.knockFramed = false;
+            peer.knockHandshakePending = false;
+            common::crypto::Wipe(peer.knockKey.data(), peer.knockKey.size());
+            common::crypto::Wipe(peer.knockHeaderKey.data(), peer.knockHeaderKey.size());
+        }
+        else
+        {
+            peer.rotationConfirmed  = true;
+            common::crypto::Wipe(peer.prevSession.data(),   peer.prevSession.size());
+            common::crypto::Wipe(peer.prevHeaderKey.data(), peer.prevHeaderKey.size());
+            common::crypto::Wipe(peer.prevMacKey.data(),    peer.prevMacKey.size());
+        }
+        common::crypto::Wipe(priorSession.data(),   priorSession.size());
+        common::crypto::Wipe(priorHeaderKey.data(), priorHeaderKey.size());
+        common::crypto::Wipe(priorMacKey.data(),    priorMacKey.size());
 
         // The floor holds from the first send, not only after a loss trims
         // down to it. A fresh peer is registered at the initial window, which
@@ -2565,13 +2654,13 @@ namespace bcp::flux
         // rotating. The helpers and the tag re-derive exactly as a handshake
         // derives them, just fed from the new link.
         common::crypto::SessionKey next;
-        common::crypto::DeriveSubKey(next.data(), peer.session.data(), KEY_ROTATE_LABEL);
+        common::crypto::DeriveSubKey(next.data(), peer.session.data(), internal::KEY_ROTATE_LABEL);
         peer.session = next;
         common::crypto::Wipe(next.data(), next.size());
         common::crypto::DeriveSubKey(peer.headerKey.data(), peer.session.data(),
-                                     HEADER_KEY_LABEL);
+                                     internal::HEADER_KEY_LABEL);
         common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
-                                     MAC_KEY_LABEL);
+                                     internal::MAC_KEY_LABEL);
 
         // Our counter restarts with the key, so the nonce space is fresh and
         // the peer's replay window resets when it adopts the new link. Tags
@@ -3103,7 +3192,7 @@ namespace bcp::flux
             // upgrade drops the read lock before taking write, so the peer is
             // revalidated on the other side of the gap.
             Peer* peerState = peerHandle.Write();
-            if (!peerState || !peerState->IsValid()) return;
+            if (!peerState || !peerState->CanCarryTraffic()) return;
             materials = GatherSendMaterials(*peerState);
         }
 
@@ -3146,6 +3235,9 @@ namespace bcp::flux
                 // that stopped answering both reach here too, so this one site
                 // covers every way a peer goes away.
                 RecordPeerEvent(*dying, peer.GetSlotIndex(), SocketEvent::PEER_LOST);
+                // Every way a peer goes away passes through here, so this is
+                // where an unproven one gives its slot in the cap back.
+                MarkAddressProven(*dying);
                 if (flows_.SendEnabled() || flows_.ReceiveEnabled())
                     flows_.SweepPeer(peer.GetSlotIndex());
                     transfers_.SweepPeer(peer.GetSlotIndex());
@@ -3184,6 +3276,67 @@ namespace bcp::flux
         }
         SendHandshakeInit(addr);
         return common::Error::Ok;
+    }
+
+    common::Error Socket::Connect(const Address& addr,
+                                 const Certificate::IdentityTag& expect)
+    {
+        if (!initialized_.load(std::memory_order_acquire))
+            return common::Error::NotInitialized;
+        if (!knockEnabled_) return common::Error::NotInitialized;
+
+        common::crypto::PublicKey pinned;
+        if (!certStore_.PinnedKey(expect, pinned))
+            return common::Error::NotFound;   // nothing to encrypt toward
+
+        {
+            PeerHandle peerHandle = peers_.GetPeer(addr);
+            if (!peerHandle.Failed())
+                return common::Error::Ok;   // already knows this address
+        }
+
+        uint32_t slot = 0;
+        const common::Error registration = peers_.RegisterPeer(addr, nullptr, slot);
+        if (registration == common::Error::AlreadyPending) return common::Error::Ok;
+        if (registration != common::Error::Ok) return registration;
+        SeedPeerRecvState(slot);
+
+        bool knocking = false;
+        {
+            PeerHandle peerHandle = peers_.GetPeer(addr);
+            if (!peerHandle.Failed())
+            {
+                Peer* peer = peerHandle.Write();
+                peer->attempts = 1;
+                knocking = ArmKnock(*peer, pinned);
+            }
+        }
+        // The knock is the opener, so it replaces HS_INIT rather than joining
+        // it. With nothing to deliver it carries no payload, which is what a
+        // Connect the application asked for looks like on the wire.
+        if (knocking) SendKnockOpener(addr);
+        else          SendHandshakeInit(addr);
+        return common::Error::Ok;
+    }
+
+    uint32_t Socket::MaxPayload(const Address& addr)
+    {
+        // Both figures are what a caller may put, so both subtract the channel
+        // byte the seal writes in front of the content. A flow packet spends
+        // WIRE_FLOW_HEADER_SIZE more than this, which the caller knows because
+        // it chose the flow.
+        static constexpr uint32_t KNOCKING = static_cast<uint32_t>(
+            internal::KNOCK_PAYLOAD_MAX - internal::WIRE_SECURE_CHANNEL_SIZE);
+        static constexpr uint32_t SESSION = static_cast<uint32_t>(
+            internal::MAX_WIRE_PACKET_SIZE - internal::WIRE_SECURE_HEAD_SIZE
+            - internal::WIRE_TAG_SIZE - internal::WIRE_SECURE_CHANNEL_SIZE);
+
+        if (!initialized_.load(std::memory_order_acquire)) return 0;
+        PeerHandle peerHandle = peers_.GetPeer(addr);
+        // An address with no peer yet is one a knock would open, so the
+        // opener's ceiling is the honest answer.
+        if (peerHandle.Failed() || !peerHandle.Read()) return KNOCKING;
+        return peerHandle.Read()->knockFramed ? KNOCKING : SESSION;
     }
 
     uint32_t Socket::RotateTags()
@@ -3326,6 +3479,11 @@ namespace bcp::flux
         ReceiveIntoPool();
 
         (void)RetryHandshakes();
+
+        // The knock validation budget is per pass, so a flood costs a bounded
+        // number of key agreements per tick and slows early opening rather
+        // than the socket.
+        knockBudgetThisTick_ = knockBudgetPerTick_;
 
         // No flow gate on the sweep: idle eviction is mandatory, so the per-peer
         // pass runs even on a socket with no flows. An empty peer table makes
@@ -3491,7 +3649,7 @@ namespace bcp::flux
             // an association with no session to seal it. Retransmits wait for
             // the session rather than burning attempts on a key that does not
             // exist yet.
-            if (!peerState || !peerState->IsValid()) return;
+            if (!peerState || !peerState->CanCarryTraffic()) return;
             flowSlot = flows_.OutAssocAt(peerHandle.GetSlotIndex(), dirIndex);
             if (flowSlot == common::collections::SlotPool::INVALID) return;
 

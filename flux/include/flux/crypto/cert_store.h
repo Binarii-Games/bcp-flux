@@ -75,6 +75,12 @@ namespace bcp::flux
         [[nodiscard]] Match Check(const Certificate::IdentityTag& tag,
                                   const common::crypto::PublicKey& presentedKey) const;
 
+        /** Copies the key currently pinned to a tag into out. False when the
+            tag is not stored or has been revoked. For the knock sender, which
+            must encrypt toward a named identity before any contact. */
+        [[nodiscard]] bool PinnedKey(const Certificate::IdentityTag& tag,
+                                     common::crypto::PublicKey& out) const;
+
         /** Stops trusting whatever key this tag pins. The entry stays (slots
             are never recycled here, the design above) with its version
             cleared and its key wiped, so every later Check on the tag is a

@@ -99,6 +99,7 @@ namespace bcp::flux
         HS_CHLG   = 0x01,
         HS_RES    = 0x02,
         HS_FINISH = 0x03,
+        HS_KNOCK  = 0x04,   ///< HS_INIT that carries data under an interim key
     };
 
     /** The lane a thread last drained, handed back to Poll so it returns to the
@@ -126,6 +127,36 @@ namespace bcp::flux
 
     public:
         static constexpr uint32_t MAX_PACKET_SLOTS = 2048;
+
+        /** Payload bytes that always fit, whatever the target's state and
+            whichever way the packet is sent. A caller that does not want to
+            track what a peer is doing can size everything to this and never
+            be refused: it is the smallest ceiling the transport has, the one
+            an opener carrying a flow packet leaves.
+
+            MaxPayload reports what this particular target can take right now,
+            which is larger in every case but that one, and larger again once
+            the session replaces the opener. Prefer it when the extra room is
+            worth a call, and use this when it is not. */
+        static constexpr uint32_t SAFE_PAYLOAD_BYTES =
+            static_cast<uint32_t>(internal::KNOCK_PAYLOAD_MAX
+                                  - internal::WIRE_SECURE_CHANNEL_SIZE
+                                  - internal::WIRE_FLOW_HEADER_SIZE);
+
+        // The claim above, held to the two framings that bound it: an opener
+        // carrying a flow packet, and an established session carrying one with
+        // a migration tag. If either ever drops below this, the constant is
+        // lying and the build says so.
+        static_assert(SAFE_PAYLOAD_BYTES
+                      <= internal::MAX_WIRE_PACKET_SIZE
+                         - internal::WIRE_SECURE_HEAD_SIZE
+                         - internal::WIRE_PEER_TAG_SIZE
+                         - internal::WIRE_TAG_SIZE
+                         - internal::WIRE_SECURE_CHANNEL_SIZE
+                         - internal::WIRE_FLOW_HEADER_SIZE,
+                      "A session packet must carry at least the always-safe payload");
+        static_assert(SAFE_PAYLOAD_BYTES > 0,
+                      "The opener must leave room for a payload");
 
         enum class BackendType : uint8_t
         {
@@ -209,6 +240,44 @@ namespace bcp::flux
                 itself, counted in full wire packets, so rotation may come
                 early and never late. Zero selects the default. */
             uint64_t    rotateAfterBytes   = 0;
+
+            /** The 0-RTT opener. A send to a peer whose identity this socket
+                holds a certificate for goes as a knock: data rides the first
+                packet under an interim key while the ordinary handshake
+                completes behind it. All zero disables nothing that already
+                worked, it only declines to open early. */
+            struct Knock
+            {
+                /** Master switch for sending knocks. Off means a fresh
+                    connection always takes the plain handshake, even with
+                    material in hand. Receiving is always on: a knock that
+                    arrives is handled whatever this says, because refusing to
+                    understand one would just strand a peer. */
+                bool        enable            = false;
+
+                /** Peers that may exist before their address is proven by the
+                    handshake cookie echo. Zero selects the default. */
+                uint32_t    maxUnprovenPeers  = 0;
+
+                /** Packets accepted from one unproven peer before further ones
+                    are ejected unbuffered until its echo lands. Zero selects
+                    the default. */
+                uint32_t    unprovenPacketLimit = 0;
+
+                /** Knock validations one tick pays for, each a key agreement.
+                    Zero selects the default. */
+                uint32_t    budgetPerTick     = 0;
+
+                /** Recently seen first-flight fingerprints remembered against
+                    replay. Rounded up to a power of two. Zero selects the
+                    default. */
+                uint32_t    ringSize          = 0;
+
+                /** Seconds of clock disagreement past which a knock is stale.
+                    Zero selects the default. */
+                uint32_t    ttlWindowSeconds  = 0;
+            };
+            Knock       knock;
 
             /** Address migration by rotating 4-byte tag: a connection survives
                 its peer's address changing without a re-handshake. Costs
@@ -552,6 +621,27 @@ namespace bcp::flux
             or complete. Progress is observable via GetPeer. */
         [[nodiscard]] common::Error Connect(const Address& addr);
 
+        /** Names the identity expected at an address before any contact, so a
+            first send can knock: encrypt toward that identity's pinned
+            certificate and carry data from the first packet. The certificate
+            must already be loaded. Without this, a first send takes the plain
+            handshake. NotFound when no loaded certificate carries the tag,
+            NotInitialized when knocking is disabled. */
+        [[nodiscard]] common::Error Connect(const Address& addr,
+                                            const Certificate::IdentityTag& expect);
+
+        /** Payload bytes the next packet to this target can carry, as a
+            caller may put them: the channel byte the seal writes is already
+            subtracted, and a packet sent on a flow spends
+            internal::WIRE_FLOW_HEADER_SIZE more than this.
+
+            Full when a session is established, less the opener overhead while
+            the first packet must still open one. An address with no peer yet
+            reports the opener's figure, because that is what a send to it
+            would produce. A send past this is refused with TooLarge rather
+            than truncated or dropped. */
+        [[nodiscard]] uint32_t MaxPayload(const Address& addr);
+
         /** Opens a flow. Local, immediate, and NOT bound to a peer: send on it
             to any address and the per-target state is created on first use, so
             one flow serves many peers with an independent sequence for each.
@@ -743,6 +833,22 @@ namespace bcp::flux
         common::crypto::PublicKey      publicKey_;
         Certificate::IdentityTag       ownTag_{};   ///< announced in HS_FINISH; zero when anonymous
         CertStore                      certStore_;
+
+        // Knock: the 0-RTT opener. The ring is a fixed array of recent
+        // first-flight fingerprints, guarded by its own spinlock because it is
+        // touched from the receive path under no peer lock. The unproven count
+        // is the approved socket-wide cap, relaxed because it decides policy
+        // and never ownership, the PeerRecvState pattern.
+        bool                           knockEnabled_ = false;
+        uint32_t                       knockMaxUnproven_ = 0;
+        uint32_t                       knockUnprovenPacketLimit_ = 0;
+        uint32_t                       knockBudgetPerTick_ = 0;
+        uint32_t                       knockTtlWindowSeconds_ = 0;
+        std::unique_ptr<uint64_t[]>    knockRing_;          ///< fingerprints, 0 = empty
+        uint32_t                       knockRingMask_ = 0;
+        std::atomic_flag               knockRingLock_ = ATOMIC_FLAG_INIT;
+        std::atomic<uint32_t>          unprovenPeers_{0};
+        uint32_t                       knockBudgetThisTick_ = 0;   ///< refilled by the tick
 
         // Peers, replay, and the pending-behind-handshake pool.
         PeerTable                      peers_;
@@ -986,6 +1092,43 @@ namespace bcp::flux
             retried until it lands. Takes the handle by value: the gather
             happens under it and the send after it is released. */
         void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
+
+        // --- Knock (socket_knock.cpp) ---
+        /** Config validation, the seen-ring, and the resolved knock limits. */
+        [[nodiscard]] common::Error InitKnock(const Config& config);
+        /** Arms a peer's knock window toward a pinned certificate key, so
+            PreProcessOut seals its sends as knocks. Returns false when the
+            window could not be armed, which is the caller's cue to fall back
+            to a plain handshake. Caller holds the peer write lock. */
+        bool ArmKnock(Peer& peer, const common::crypto::PublicKey& certKey);
+        /** Combines the two knock DH results into the interim key and its
+            header key. The two shared secrets are computed by the caller
+            because their roles differ by side (the sender pairs its ephemeral
+            with the receiver's static, the receiver its static with the
+            sender's ephemeral), but they come out equal, so this half of the
+            derivation is one function. */
+        void CombineKnockKey(common::crypto::SessionKey& outKey,
+                             common::crypto::SessionKey& outHeaderKey,
+                             const common::crypto::SharedSecret& staticShared,
+                             const common::crypto::SharedSecret& ephShared,
+                             const uint8_t salt[internal::WIRE_HS_SALT_SIZE]) noexcept;
+        /** The whole receiver pipeline for one HS_KNOCK: budget, TTL, ring,
+            key rebuild, open, peer create-or-find under the unproven caps,
+            deliver the carried packet, then let the ordinary handshake run
+            by sending the challenge. */
+        void Handshake_Knock(PacketSlotHandle pHandle);
+        /** True and consumes a slot if this fingerprint is new, false if the
+            ring has seen it (a replay). */
+        bool KnockRingAdmit(uint64_t fingerprint) noexcept;
+        /** Sends a knock carrying no payload, which is what a Connect with no
+            data attached puts on the wire when material is in hand: the
+            opener and the interim key in one packet, with nothing to deliver
+            on the far side. */
+        void SendKnockOpener(const Address& addr);
+        /** Clears the unproven flag and releases its slot in the cap. Called
+            where the cookie echo proves the address. Caller holds the peer
+            write lock. */
+        void MarkAddressProven(Peer& peer) noexcept;
 
         /** Starts a freshly registered slot on this socket's configured grant.
 

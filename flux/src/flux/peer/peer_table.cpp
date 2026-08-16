@@ -477,6 +477,17 @@ namespace bcp::flux
         p->freeWhenRead         = false;
         p->grantSendPending     = false;   // raised when a session commits
         p->grantSentAtMicros    = 0;
+        p->knockActive          = false;
+        p->knockFramed          = false;
+        p->knockKey             = {};
+        p->knockHeaderKey       = {};
+        p->knockEphPk           = {};
+        std::memset(p->knockSalt, 0, sizeof(p->knockSalt));
+        std::memset(p->knockIdentity, 0, sizeof(p->knockIdentity));
+        p->awaitingAddressProof = false;
+        p->unprovenPacketsSeen  = 0;
+        p->knockStartedAtMicros = 0;
+        p->knockHandshakePending = false;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
         p->slowStartQueueSinceMicros = 0;
         p->rtt.Reset();

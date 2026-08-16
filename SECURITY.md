@@ -78,3 +78,14 @@ These are known and are not vulnerabilities:
 - Anonymous peers are not authenticated. Without a loaded certificate, a session
   is encrypted but the peer's identity is unverified. Use `SendSecured` when
   identity matters.
+- First-flight data has weaker forward secrecy than the rest of a session. The
+  interim key that carries a knock is derived without any contribution from the
+  receiver, so a later theft of the receiver's long-term key opens a recorded
+  first flight. Everything from the handshake's completion onward mixes both
+  ephemerals and is unaffected. This is inherent to sending data before the
+  other end has spoken.
+- A replayed first flight can be delivered twice in one case. Each opener is
+  refused on its second presentation and one older than the clock window is
+  refused outright, so the gap is a receiver restart that wiped the ring paired
+  with a copy arriving inside that window. Messages that rode a first flight are
+  marked as such, so an application can decide what may travel there.

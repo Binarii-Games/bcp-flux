@@ -179,6 +179,43 @@ namespace bcp::flux
         return common::Error::Ok;
     }
 
+    bool CertStore::PinnedKey(const Certificate::IdentityTag& tag,
+                              common::crypto::PublicKey& out) const
+    {
+        if (!index_) return false;
+
+        // The slow, always-correct path: probe under the writer lock, which
+        // excludes every index mutation. This runs at connection setup, not on
+        // a packet, so the simplicity is worth more than the optimistic dance
+        // Check uses.
+        LockWriter();
+        bool found = false;
+        const uint64_t h = HashTag(tag);
+        uint32_t pos = static_cast<uint32_t>(h) & idxMask_;
+        for (uint32_t dist = 0; ; ++dist)
+        {
+            const uint64_t eh = index_[pos].hash.load(std::memory_order_relaxed);
+            if (eh == 0) break;
+            if (eh == h && index_[pos].key == tag)
+            {
+                const uint32_t slot = index_[pos].idx.load(std::memory_order_relaxed);
+                const Certificate* c =
+                    reinterpret_cast<const Certificate*>(certPool_.ReadLock(slot));
+                if (c->version == Certificate::VERSION_PINNED)
+                {
+                    out   = c->subjectKey;
+                    found = true;
+                }
+                certPool_.UnlockRead(slot);
+                break;
+            }
+            if (Dist(eh, pos, idxMask_) < dist) break;
+            pos = (pos + 1) & idxMask_;
+        }
+        UnlockWriter();
+        return found;
+    }
+
     common::Error CertStore::Revoke(const Certificate::IdentityTag& tag)
     {
         if (!index_)

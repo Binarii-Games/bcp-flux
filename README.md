@@ -29,6 +29,9 @@ vendored the same way. Both are Apache-2.0.
   with no per-packet staging, so a gigabyte and a kilobyte cost the same state.
 - **Encrypted by default.** XChaCha20-Poly1305, X25519, and BLAKE2b, with a
   mac-only level for public traffic and an explicit plaintext opt-out.
+- **0-RTT to a known identity.** Hold a peer's certificate and the first packet
+  to it already carries application data, encrypted toward that identity, while
+  the handshake completes behind it.
 - **Survives address changes.** A session follows the peer, not its address, so a
   NAT rebind or a VPN reconnect continues with no re-handshake.
 - **Delay-aware congestion control.** It reads queue growth as well as loss, so it
@@ -641,9 +644,7 @@ else:
 
 ## Roadmap
 
-Not there yet: path MTU discovery, NAT traversal, and session resumption. There
-is no 0-RTT, so a certificate authenticates a peer but does not shorten the
-handshake.
+Not there yet: path MTU discovery, NAT traversal, and session resumption.
 
 The wire format is not frozen before 1.0. It can change between versions, and a
 security fix is allowed to change it.

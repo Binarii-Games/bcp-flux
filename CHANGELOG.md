@@ -15,6 +15,15 @@ security fix is allowed to change either.
   cannot read traffic recorded before the last rotation. Rotation is silent on
   the wire, runs on a per-peer byte threshold (`Config::rotateAfterBytes`) or
   on `RotateKeys`, and the peer discovers it by trial decryption.
+- A 0-RTT opener. A send to a peer whose certificate is loaded, named through
+  `Connect(addr, tag)`, carries application data in its first packet, under an
+  interim key the sender derives alone, while the ordinary handshake completes
+  behind it and replaces that key. Flows run across the handover. Off by
+  default (`Config::knock`), with a per-tick validation budget, a replay ring,
+  a clock window, an unproven-peer cap and a per-peer packet allowance.
+  `MaxPayload` reports the payload the next packet to a target can carry, and
+  a send past it is refused with `TooLarge` rather than truncated or silently
+  dropped.
 - `RemoveCertificate` revokes a pinned identity at runtime. The tag's entry
   is kept with its key wiped and version cleared, so every later check
   against it fails hard rather than falling open.

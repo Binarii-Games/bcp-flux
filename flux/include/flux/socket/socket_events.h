@@ -100,6 +100,13 @@ namespace bcp::flux
             answers with neither leaves the transfer pending until the flow
             stall timeout takes it. */
         TRANSFER_INCOMING      = (1u << 10),
+
+        /** This peer arrived through a first-flight opener: its data was
+            delivered before its address was proven, under the interim key.
+            Every message that rode that flight also answers WasKnock() on
+            its packet, so the replay contract is per message. This event is
+            the per-peer heads-up. */
+        PEER_KNOCKED           = (1u << 11),
     };
 
     constexpr uint32_t ToBits(SocketEvent e) noexcept { return static_cast<uint32_t>(e); }

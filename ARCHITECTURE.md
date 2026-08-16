@@ -128,9 +128,11 @@ whole list, and nothing new joins it.
 - **Error and result.** `Error` is an `enum class : uint8_t`, codes grouped by
   numeric range, every code mapped by `ErrorToString`. `Result<T>` pairs an
   `Error` with a value. Callers check `isErr()` before `Take()`.
-- **Platform.** `CACHE_LINE` (128 on arm64, 64 elsewhere), `CpuPause()`, and
+- **Platform.** `CACHE_LINE` (128 on arm64, 64 elsewhere), `CpuPause()`,
   `MonotonicMicros()`, which is meaningful only as a difference between two
-  calls.
+  calls, and `WallClockSeconds()`, which survives reboots and can jump when
+  the host clock is adjusted, so it serves coarse validity windows and never
+  timeouts or measurement.
 - **Collections.** Two structures, and they are the whole set. `SlotPool` is an
   index free-list over one contiguous block plus a per-slot reader/writer lock.
   The free-list is lock-free; the per-slot lock is a blocking spin with no try
@@ -483,8 +485,10 @@ byte-identical to an unbatched one and a caller sending one message at a time
 pays nothing. The lengths must account for the content exactly, and a chain that
 overruns or leaves a tail is refused whole.
 
-The controller bits: `CTRL_INTERNAL` marks handshake traffic, consumed and
-never delivered. `CTRL_HAS_FLOW` says the flow header sits inside the seal.
+The controller bits: `CTRL_INTERNAL` marks session-opening traffic, which is
+consumed rather than delivered in every case but one. The knock is the
+exception: it opens a session and carries application data in the same packet,
+so it is consumed as an opener and what it carried is delivered. `CTRL_HAS_FLOW` says the flow header sits inside the seal.
 `CTRL_UNSECURE` marks the plaintext opt-out, which carries no tag, no nonce,
 and no integrity. `CTRL_TAGGED` says the peer tag follows the nonce.
 `CTRL_MACONLY` marks a packet authenticated but not encrypted, framed exactly
@@ -528,6 +532,7 @@ because each is one job and neither of those is:
 | `internal/congestion_curve.h` | the growth arithmetic that policy consults: the queue a path tolerates, CUBIC's window over time, the straight line under it |
 | `transfer/transfer_table.cpp` | every transfer this socket runs: the window rings, the placement arithmetic, the overdue scan |
 | `socket/socket_transfer.cpp` | the transfer entry points and the tick's transfer pass, which reach most of the socket's sending machinery but none of the flow tables |
+| `socket/socket_knock.cpp` | the first-flight opener: arming a window, the receiver pipeline, and the caps that bound what an unproven peer costs |
 
 The split is by job, not by size. The handshake and the migration receive path
 are both larger than any of these and both stay where they are: each reaches
@@ -556,6 +561,19 @@ lookups above. And a bare slot index, handed out by `RegisterPeer`, is what the
 handshake carries between its steps: every binding call (`BindId`, `BindTag`,
 `UnbindTags`, `UpdateAddress`) is keyed on that index rather than on a handle.
 Reads go through a verified key; those mutations do not.
+
+#### Opening a session: two triggers, one handshake
+
+| Trigger | When | What it carries |
+|---|---|---|
+| `HS_INIT` | nothing is known about the target | nothing, it only asks to be challenged |
+| `HS_KNOCK` | a certificate is named for the target | an interim key and application data |
+
+Both end in the same place: the receiver answers with the ordinary stateless
+challenge, and the `HS_CHLG` / `HS_RES` / `HS_FINISH` exchange that follows is
+one path with no knowledge of which trigger started it. The cookie echo in
+`HS_RES` proves the address either way, and the session it derives is the same
+session. There is no second handshake and no second way to prove an address.
 
 #### Three security levels
 
@@ -657,12 +675,20 @@ seat the newest, so an unreliable send is never refused for capacity. The ring
 is strict FIFO: while anything waits, a new packet joins the back, otherwise
 its sequence would outrun older data.
 
-#### Receiving: one gate, three sinks, one bypass, two passes
+#### Receiving: one gate, three sinks, two bypasses, two passes
 
-Handshake traffic goes to `ProcessInternal` before the gate runs at all. It is
-unauthenticated by construction, so a known-peer check, a decrypt and a replay
-window have nothing to apply to it. The bypass is narrow: a packet claiming to
-be internal and secure at once is forged or corrupt, and is dropped.
+Session-opening traffic goes to `ProcessInternal` before the gate runs at all.
+The handshake messages are unauthenticated by construction, so a known-peer
+check, a decrypt and a replay window have nothing to apply to them. The bypass
+is narrow: a packet claiming to be internal and secure at once is forged or
+corrupt, and is dropped.
+
+A knock takes the same bypass and then does the gate's work itself, because
+what it needs is not what the gate does: the key it opens under is derived from
+the packet's own header rather than looked up on a peer, and there may be no
+peer yet. Having opened, it applies the same replay window and hands what it
+carried to the same three sinks below, so a knock's payload reaches the
+application through exactly the path any other packet's does.
 
 Everything else runs through `PreProcessIn` (known-peer check for unsecured
 traffic, decryption for secure, then replay and liveness), which routes what it
@@ -1087,6 +1113,93 @@ Completion surfaces through `PollTransfers` on both ends as a `TransferView`
 naming the buffer, the length and the outcome, and `CompleteTransfer`
 releases the receiving half. Sweeping a peer drops its transfers, so a slot
 recycled to a later peer can never inherit one.
+
+#### The knock: an opener that carries data
+
+A send to a peer whose identity this socket holds a certificate for does not
+wait for a handshake. The first packet is a knock: an opener carrying the
+sender's ephemeral, a salt, a clock stamp and the sender's own public key,
+with application data encrypted behind it under an interim key the sender
+derives alone. Two exchanges go into that key, the two long-term identities
+and the sender's fresh ephemeral, so only the named receiver can open it and
+every attempt derives a different one.
+
+The sender's public key is sealed rather than carried in the clear, under a
+key derived from its ephemeral against the receiver's certificate key. That
+is the one exchange a receiver can run before it knows who is knocking, so it
+unseals the name and then runs the second exchange against it. In the clear
+the key would identify the sender to anyone on the path, which is the linkage
+the rotating peer tags and the masked counter exist to prevent, and nothing
+else in the header is stable across two knocks from the same sender. The seal
+also gates the work: a forgery fails its tag after one key agreement rather
+than two.
+
+The receiver rebuilds the same key from the header, and the open is the
+identity proof: only the holder of the secret behind the presented public key
+produces a packet that opens, so the peer's id is bound rather than claimed.
+From that moment the peer carries traffic. Flows open on it, number their
+packets, acknowledge and retransmit as they always do, because the peer has a
+key. What it does not have is a proven address, and that is a separate
+question with its own answer below.
+
+The opener rides on every packet until the far side is known to hold the
+interim key, not merely on the first: reordering means any of them could be
+the one that arrives before the peer exists. The first packet back that opens
+is the proof, because only a side that derived the same key could have sealed
+it, and from there the opener stops and its bytes go to payload instead. The
+key does not change at that moment and neither does anything else, so the
+switch costs nothing to recover from if it never happens: the handshake ends
+the framing in any case.
+
+The handshake runs behind all of this, unchanged. The knock replaces HS_INIT
+and nothing else: the receiver answers it with the ordinary stateless
+challenge, the sender echoes the cookie in HS_RES, and that echo is what
+proves the address, exactly as it does for a peer that never knocked. The
+session it derives then replaces the interim key through the slots a key
+rotation uses, so packets still in flight under the interim key keep opening
+while the flows, their sequences and the congestion state carry straight on.
+The handshake state machine is untouched, which is why an initiator inside its
+knock window still reads as awaiting a challenge: `CanCarryTraffic` answers
+whether a key exists, `IsValid` answers where the handshake stands, and only
+the knock makes the two disagree.
+
+The interim key is weaker than the session key by construction, and that is
+the whole price of speaking first. Nothing in it comes from the receiver, so a
+later theft of the receiver's long-term key reopens a recorded first flight.
+The session key mixes both ephemerals and both are wiped, so nothing reopens
+what follows. The window is one round trip, and every message that rode it is
+marked, so an application can hold first-flight data to a different standard
+than the rest.
+
+What a refused opener costs the sender follows one rule: whatever is retained
+survives, and nothing else does. A reliable body sits in staging until its
+sequence resolves, so the retransmit re-seals it under whatever framing the
+peer has by then and it arrives late rather than never. Nothing keeps a copy of
+an unreliable flow packet, a non-flow packet, or a mac-only one, so a flight
+nobody opened is where those end. That is the ordinary contract of each kind
+rather than anything the opener introduces.
+
+Every way the receiver declines an opener ends the same way: with the ordinary
+challenge. A sender aimed at a key this socket does not hold, one whose clock
+has drifted, one that arrives when the budget is spent, one that repeats an
+opener already seen, and one that finds the cap full all get the same answer,
+and it is the answer that helps: the handshake starts on the next pass rather
+than after a retry interval. The challenge holds no state and is never larger
+than the opener that provoked it, so answering can neither be made to cost
+memory nor turned into amplification. A peer that already has a session gets
+silence instead, because a packet that fails to open for it is noise rather
+than a sender asking for a way in.
+
+Four limits keep an opener that anyone can send from costing more than it
+should. A per-tick budget bounds the key agreements one pass will attempt, so
+a flood slows early opening rather than the socket. A ring of recent
+fingerprints refuses a replayed opener outright, and the clock stamp bounds
+what a replay achieves in the one case the ring cannot cover, its own loss to
+a restart. A cap bounds how many peers may exist with unproven addresses, and
+past it a knock creates nothing and gets the plain handshake instead, which
+holds no state until its echo arrives. Under that cap, each unproven peer has
+a packet allowance, and past it its packets are dropped unbuffered until the
+echo lands, which reliable flows recover from by retransmitting.
 
 #### Revoking a pinned identity
 

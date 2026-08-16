@@ -34,6 +34,16 @@ namespace bcp::flux
         uint64_t                   counter = 0;   ///< a fresh ++sendCounter per send
         uint8_t                    lane    = 0;
         PeerTag                    tag{};
+
+        /** The knock window. While a peer has no session yet but holds knock
+            material, every packet to it is knock-framed: the seal moves the
+            built payload up to the knock offsets and wraps it with the opener
+            header, so no call site changes. `key` and `headerKey` above carry
+            the knock keys in that state. */
+        bool                       knock = false;
+        common::crypto::PublicKey  knockEphPk{};
+        uint8_t                    knockSalt[internal::WIRE_HS_SALT_SIZE]{};
+        uint8_t                    knockIdentity[internal::KNOCK_IDENTITY_SIZE]{};
     };
 
     /** Encrypts the body in place and appends the authentication tag.
@@ -75,4 +85,19 @@ namespace bcp::flux
                                          const common::crypto::SessionKey& macKey,
                                          const common::crypto::SessionKey& headerKey,
                                          uint64_t& outCounter) noexcept;
+
+    /** Opens a knock packet with the given knock keys, verifying the whole
+        cleartext header as associated data, and rewrites the slot in place
+        into the shape of an already-opened ordinary secure packet with
+        WIRE_CTRL_KNOCKED set, so everything downstream of the open treats it
+        like any other delivered packet. On failure the bytes are untouched.
+
+        The header fields (mode, ephemeral, salt, clock, identity region) are
+        the caller's to parse before deriving the keys; this only judges and
+        unwraps. */
+    [[nodiscard]] bool OpenKnockPacket(PacketSlot& packet,
+                                       const common::crypto::SessionKey& knockKey,
+                                       const common::crypto::SessionKey& knockHeaderKey,
+                                       uint8_t senderLane,
+                                       uint64_t& outCounter) noexcept;
 }
