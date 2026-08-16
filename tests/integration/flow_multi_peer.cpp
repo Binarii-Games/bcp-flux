@@ -66,7 +66,7 @@ static void Drive(flux::Socket& client,
 }
 
 // One flow, three peers, independent sequences.
-static void OneFlowManyPeers()
+static void one_flow_many_peers()
 {
     flux::Socket client, b, c, d;
     CHECK(client.Init(MakeConfig(PORT_CLIENT)) == common::Error::Ok);
@@ -133,7 +133,7 @@ static void OneFlowManyPeers()
 }
 
 // A target that refuses the flow fails alone; the others keep working.
-static void FailureIsPerTarget()
+static void failure_is_per_target()
 {
     flux::Socket client, b, c;
     CHECK(client.Init(MakeConfig(PORT_CLIENT)) == common::Error::Ok);
@@ -183,7 +183,7 @@ static void FailureIsPerTarget()
 }
 
 // The id space is the socket's, not the peer's.
-static void FlowIdsAreSocketWide()
+static void flow_ids_are_socket_wide()
 {
     flux::Socket client;
     CHECK(client.Init(MakeConfig(PORT_CLIENT)) == common::Error::Ok);
@@ -221,9 +221,9 @@ static void FlowIdsAreSocketWide()
 
 int main()
 {
-    OneFlowManyPeers();
-    FailureIsPerTarget();
-    FlowIdsAreSocketWide();
+    one_flow_many_peers();
+    failure_is_per_target();
+    flow_ids_are_socket_wide();
 
     return test::report();
 }

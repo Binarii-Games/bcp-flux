@@ -63,7 +63,7 @@ static flux::Socket::Config MakeConfig(uint16_t port, uint32_t maxInPerPeer)
 
 // A flow is sendable the moment it exists, and the receiver builds its half
 // from the traffic itself.
-static void RegistersFromFirstPacket()
+static void registers_from_first_packet()
 {
     flux::Socket client, server;
     CHECK(client.Init(MakeConfig(PORT_A, 4)) == common::Error::Ok);
@@ -98,7 +98,7 @@ static void RegistersFromFirstPacket()
 
 // A receiver at its per-peer flow cap refuses, and the sender's flow dies
 // rather than retransmitting forever.
-static void RejectedWhenTheReceiverIsFull()
+static void rejected_when_the_receiver_is_full()
 {
     flux::Socket client, server;
     CHECK(client.Init(MakeConfig(PORT_A, 4)) == common::Error::Ok);
@@ -150,8 +150,8 @@ static void RejectedWhenTheReceiverIsFull()
 
 int main()
 {
-    RegistersFromFirstPacket();
-    RejectedWhenTheReceiverIsFull();
+    registers_from_first_packet();
+    rejected_when_the_receiver_is_full();
 
     return test::report();
 }

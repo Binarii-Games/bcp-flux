@@ -25,7 +25,7 @@ namespace
 }
 
 // One message is stored bare, with no length in front of it.
-static void SingleMessageIsBare()
+static void single_message_is_bare()
 {
     uint8_t buffer[CAP];
     wire::BatchCursor cursor = Fresh(buffer);
@@ -44,7 +44,7 @@ static void SingleMessageIsBare()
 // shift is over a region that overlaps itself, so every byte of the moved
 // payload is checked rather than just its ends: a copy that reads a source byte
 // after already overwriting it corrupts the middle and leaves the edges right.
-static void SecondMessageInsertsTheFirstLength()
+static void second_message_inserts_the_first_length()
 {
     constexpr uint16_t BIG = 40;
     uint8_t buffer[CAP];
@@ -75,7 +75,7 @@ static void SecondMessageInsertsTheFirstLength()
 }
 
 // A third and beyond is an ordinary entry, no further shifting.
-static void ThirdMessageAppendsPlainly()
+static void third_message_appends_plainly()
 {
     uint8_t buffer[CAP];
     wire::BatchCursor cursor = Fresh(buffer);
@@ -91,7 +91,7 @@ static void ThirdMessageAppendsPlainly()
 }
 
 // A refused append leaves the batch exactly as it was, never half written.
-static void RefusedAppendLeavesBatchIntact()
+static void refused_append_leaves_batch_intact()
 {
     uint8_t buffer[CAP];
     wire::BatchCursor cursor = Fresh(buffer, 8);
@@ -111,7 +111,7 @@ static void RefusedAppendLeavesBatchIntact()
 
 // The second message must account for the prefix the first one grows, so a
 // message that would fit without that hidden cost is still refused.
-static void SecondMessageCountsTheRetroactivePrefix()
+static void second_message_counts_the_retroactive_prefix()
 {
     uint8_t buffer[CAP];
     wire::BatchCursor cursor = Fresh(buffer, 10);
@@ -136,7 +136,7 @@ static void SecondMessageCountsTheRetroactivePrefix()
 }
 
 // A validated chain walks back out as the same messages, in order.
-static void ValidateAndWalkRoundTrip()
+static void validate_and_walk_round_trip()
 {
     uint8_t buffer[CAP];
     wire::BatchCursor cursor = Fresh(buffer);
@@ -166,7 +166,7 @@ static void ValidateAndWalkRoundTrip()
 }
 
 // Damaged framing is refused rather than partly trusted.
-static void MalformedChainsAreRefused()
+static void malformed_chains_are_refused()
 {
     uint8_t buffer[CAP];
 
@@ -195,12 +195,12 @@ static void MalformedChainsAreRefused()
 
 int main()
 {
-    SingleMessageIsBare();
-    SecondMessageInsertsTheFirstLength();
-    ThirdMessageAppendsPlainly();
-    RefusedAppendLeavesBatchIntact();
-    SecondMessageCountsTheRetroactivePrefix();
-    ValidateAndWalkRoundTrip();
-    MalformedChainsAreRefused();
+    single_message_is_bare();
+    second_message_inserts_the_first_length();
+    third_message_appends_plainly();
+    refused_append_leaves_batch_intact();
+    second_message_counts_the_retroactive_prefix();
+    validate_and_walk_round_trip();
+    malformed_chains_are_refused();
     return test::report();
 }
