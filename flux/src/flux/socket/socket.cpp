@@ -211,16 +211,21 @@ namespace bcp::flux
 
     common::Error Socket::InitIdentity(const Config& config) noexcept
     {
+        Identity first;
         if (config.identity)
         {
-            secretKey_ = config.identity->secretKey;
-            publicKey_ = config.identity->publicKey;
-            ownTag_    = config.identity->tag;
+            first = *config.identity;
         }
-        else if (!GenerateKeypair())
+        else if (!common::crypto::GenerateKeypair(first.secretKey, first.publicKey))
         {
-            return common::Error::NotInitialized;
+            return common::Error::NotInitialized;   // anonymous, tag stays zero
         }
+        ownTag_ = first.tag;
+
+        const common::Error identity = identities_.Init(first, config.identityHistory);
+        common::crypto::Wipe(first.secretKey.data(), first.secretKey.size());
+        if (identity != common::Error::Ok)
+            return identity;
 
         if (config.trustedCertCount > 0 &&
             certStore_.Init(config.trustedCertCount) != common::Error::Ok)
@@ -410,11 +415,6 @@ namespace bcp::flux
         }
     }
 
-    bool Socket::GenerateKeypair() noexcept
-    {
-        return common::crypto::GenerateKeypair(secretKey_, publicKey_);
-    }
-
     common::Error Socket::LoadCertificate(const Certificate& cert)
     {
         return certStore_.Add(cert);
@@ -425,6 +425,18 @@ namespace bcp::flux
         return certStore_.Revoke(tag);
     }
 
+    common::Error Socket::RotateIdentity(const Identity& next)
+    {
+        if (!initialized_.load(std::memory_order_acquire))
+            return common::Error::NotInitialized;
+        return identities_.Rotate(next);
+    }
+
+    void Socket::ForgetPreviousIdentities()
+    {
+        identities_.ForgetPrevious();
+    }
+
     // --- Crypto / seal ---
 
     ReplayWindow Socket::ReplayFor(uint32_t slot) noexcept
@@ -433,18 +445,15 @@ namespace bcp::flux
         return ReplayWindow{ replayState_.get() + block, replayWords_ };
     }
 
-    uint8_t Socket::LaneTo(const common::crypto::PublicKey& theirPk) const noexcept
+    uint8_t Socket::LaneBetween(const common::crypto::PublicKey& myPk,
+                                const common::crypto::PublicKey& theirPk) noexcept
     {
-        return std::memcmp(publicKey_.data(), theirPk.data(), publicKey_.size()) < 0 ? 0 : 1;
-    }
-
-    uint8_t Socket::LaneFrom(const common::crypto::PublicKey& theirPk) const noexcept
-    {
-        return LaneTo(theirPk) == 0 ? 1 : 0;
+        return std::memcmp(myPk.data(), theirPk.data(), myPk.size()) < 0 ? 0 : 1;
     }
 
     void Socket::DeriveSessionInto(common::crypto::SessionKey& outSession,
                                     common::crypto::SessionKey& outResume,
+                                    const common::crypto::SecretKey& mySk,
                                     const common::crypto::PublicKey& theirPk,
                                     const common::crypto::SecretKey& myEphSk,
                                     const common::crypto::PublicKey& theirEphPk,
@@ -465,7 +474,7 @@ namespace bcp::flux
         // both come from material wiped before this returns.
         common::crypto::SharedSecret staticShared;
         common::crypto::SharedSecret ephShared;
-        common::crypto::ComputeSharedSecret(staticShared, secretKey_, theirPk);
+        common::crypto::ComputeSharedSecret(staticShared, mySk, theirPk);
         common::crypto::ComputeSharedSecret(ephShared, myEphSk, theirEphPk);
 
         uint8_t context[sizeof(internal::RESUME_ROOT_LABEL) + common::crypto::SHARED_SIZE
@@ -511,7 +520,7 @@ namespace bcp::flux
         materials.headerKey = peer.headerKey;
         materials.macKey    = peer.macKey;
         materials.counter   = ++peer.sendCounter;
-        materials.lane      = LaneTo(peer.theirPk);
+        materials.lane      = peer.lane;
         materials.tag       = peer.myTag;
         // While the window is open every packet carries the opener, not only
         // the first: reordering means any of them may be the one that arrives
@@ -519,6 +528,7 @@ namespace bcp::flux
         if (peer.knockFramed)
         {
             materials.knock      = true;
+            materials.knockKeyId = peer.knockKeyId;
             materials.knockEphPk = peer.knockEphPk;
             std::memcpy(materials.knockSalt, peer.knockSalt, sizeof(materials.knockSalt));
             std::memcpy(materials.knockIdentity, peer.knockIdentity,
@@ -1438,7 +1448,7 @@ namespace bcp::flux
                 prevHeaderKey = peer->prevHeaderKey;
                 prevMacKey    = peer->prevMacKey;
             }
-            senderLane = LaneFrom(peer->theirPk);
+            senderLane = peer->TheirLane();
         }
 
         PacketSlot* writablePacket = pHandle.Write();
@@ -1846,7 +1856,7 @@ namespace bcp::flux
                 const Peer* candidate = candidates[i].Read();
                 if (!candidate || !candidate->IsValid()) continue;
 
-                const uint8_t theirLane = LaneFrom(candidate->theirPk);
+                const uint8_t theirLane = candidate->TheirLane();
                 common::crypto::SessionKey key       = candidate->session;
                 common::crypto::SessionKey headerKey = candidate->headerKey;
 
@@ -2022,7 +2032,7 @@ namespace bcp::flux
                 slot      = candidates[i].GetSlotIndex();
                 oldBase   = peer->theirTagStep;
                 newBase   = peer->pathStep;
-                theirLane = LaneFrom(peer->theirPk);
+                theirLane = peer->TheirLane();
                 session   = peer->session;
                 peer->theirTagStep = newBase;
                 rebind = true;
@@ -2169,9 +2179,16 @@ namespace bcp::flux
         uint32_t initiatorCaps;
         BuildCapsBitmap(initiatorCaps);
 
+        // The key this socket presents now. A handshake always announces the
+        // current one, so a peer whose certificate has not caught up refuses
+        // it and is told to fetch a fresh one. Only the opener answers on a
+        // retained key, and only to deliver what it already carried.
+        IdentityTable::Entry mine;
+        (void)identities_.Find(IdentityTable::CURRENT, mine);
+
         writer.WriteAddress(from);
         writer.PutU64(challenge);
-        writer.PutBytes(publicKey_.data(), publicKey_.size());
+        writer.PutBytes(mine.publicKey.data(), mine.publicKey.size());
         writer.PutBytes(ephPk.data(), ephPk.size());
         writer.PutBytes(saltI, sizeof(saltI));
         writer.PutU16(internal::VERSION);
@@ -2239,6 +2256,12 @@ namespace bcp::flux
         if (!reader.TakeU32(initiatorCaps)) return;
 
         const BcpId id = BcpId::Derive(pk);
+
+        // Read once and used for every identity decision below, so the whole
+        // exchange settles against one keypair even if a rotation lands
+        // partway through it.
+        IdentityTable::Entry mine;
+        (void)identities_.Find(IdentityTable::CURRENT, mine);
 
         // The cookie verified above, which is the whole of what proves an
         // address: this echo came back to a challenge sent there. A peer that
@@ -2315,7 +2338,7 @@ namespace bcp::flux
                     // remote is that initiator; otherwise its HS_RES is dropped
                     // and this side's own exchange finishes via HS_FINISH,
                     // landing both on the same salts.
-                    if (std::memcmp(pk.data(), publicKey_.data(), pk.size()) >= 0)
+                    if (std::memcmp(pk.data(), mine.publicKey.data(), pk.size()) >= 0)
                         return;
                     needBind = !peer->hasId;
                 }
@@ -2357,7 +2380,7 @@ namespace bcp::flux
             if (!common::crypto::RandomBytes(saltR, sizeof(saltR))) return;
             if (!common::crypto::GenerateKeypair(ephSk, ephR)) return;
 
-            BuildTranscript(transcript, pk, publicKey_, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
+            BuildTranscript(transcript, pk, mine.publicKey, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, initiatorVersion, internal::VERSION, ownTag_);
 
             PeerHandle peerHandle = peers_.GetPeer(from);
             if (peerHandle.Failed())
@@ -2366,7 +2389,7 @@ namespace bcp::flux
                 return;
             }
             Peer* peer = peerHandle.Write();
-            CommitSession(*peer, pk, ephSk, ephI, transcript, sizeof(transcript));
+            CommitSession(*peer, mine, pk, ephSk, ephI, transcript, sizeof(transcript));
             RecordPeerEvent(*peer, peerHandle.GetSlotIndex(), SocketEvent::PEER_ESTABLISHED);
             common::crypto::Wipe(ephSk.data(), ephSk.size());   // the whole point
 
@@ -2407,7 +2430,7 @@ namespace bcp::flux
             // bound, they pile up in the shared tag index and eventually starve
             // every peer's migration.
             (void)peers_.UnbindTags(slot);
-            BindTagWindow(slot, tagSession, LaneFrom(pk), 0);
+            BindTagWindow(slot, tagSession, LaneBetween(pk, mine.publicKey), 0);
         }
         common::crypto::Wipe(tagSession.data(), tagSession.size());
 
@@ -2416,7 +2439,7 @@ namespace bcp::flux
         PacketSlotWriter writer = result.Take();
 
         writer.WriteAddress(from);
-        writer.PutBytes(publicKey_.data(), publicKey_.size());
+        writer.PutBytes(mine.publicKey.data(), mine.publicKey.size());
         writer.PutBytes(ephR.data(), ephR.size());
         writer.PutBytes(saltR, sizeof(saltR));
         writer.PutBytes(ownTag_.data(), ownTag_.size());
@@ -2451,6 +2474,11 @@ namespace bcp::flux
 
         const BcpId id = BcpId::Derive(pk);
 
+        // One read for the whole exchange, as in Validate: the transcript, the
+        // derivation and the lane all have to settle against the same keypair.
+        IdentityTable::Entry mine;
+        (void)identities_.Find(IdentityTable::CURRENT, mine);
+
         uint8_t saltI[internal::WIRE_HS_SALT_SIZE];
         common::crypto::SecretKey ephSk;
         common::crypto::PublicKey ephI;
@@ -2480,7 +2508,23 @@ namespace bcp::flux
         // plain Send stays opportunistic, SendSecured refuses the peer.
         const CertStore::Match match = certStore_.Check(tag, pk);
         if (match == CertStore::Match::Mismatch)
+        {
+            // Reported rather than only refused, because the application is
+            // the only side that can resolve it: this is what a peer that has
+            // rotated its identity looks like from here, and fetching a fresh
+            // certificate for the tag is what unblocks it. An impersonator
+            // produces the same report and gains nothing from it, since the
+            // fresh certificate still will not match.
+            PeerHandle peerHandle = peers_.GetPeer(from);
+            if (!peerHandle.Failed())
+            {
+                Peer* peer = peerHandle.Write();
+                if (peer)
+                    RecordPeerEvent(*peer, peerHandle.GetSlotIndex(),
+                                    SocketEvent::PEER_CERT_MISMATCH);
+            }
             return;
+        }
 
         uint32_t initiatorCaps;
         BuildCapsBitmap(initiatorCaps);
@@ -2489,12 +2533,12 @@ namespace bcp::flux
         // holds the private half of the key it presented, and nothing in the
         // exchange was tampered with. Checked before anything establishes.
         uint8_t transcript[internal::HS_TRANSCRIPT_SIZE];
-        BuildTranscript(transcript, publicKey_, pk, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
+        BuildTranscript(transcript, mine.publicKey, pk, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
 
         common::crypto::SessionKey session;
         common::crypto::SessionKey scratchResume;   // proof needs the session alone
-        DeriveSessionInto(session, scratchResume, pk, ephSk, ephR, transcript,
-                          sizeof(transcript));
+        DeriveSessionInto(session, scratchResume, mine.secretKey, pk, ephSk, ephR,
+                          transcript, sizeof(transcript));
         common::crypto::Wipe(scratchResume.data(), scratchResume.size());
 
         common::crypto::Mac expected;
@@ -2519,7 +2563,7 @@ namespace bcp::flux
                 return;
             }
             Peer* peer = peerHandle.Write();
-            CommitSession(*peer, pk, ephSk, ephR, transcript, sizeof(transcript));
+            CommitSession(*peer, mine, pk, ephSk, ephR, transcript, sizeof(transcript));
             RecordPeerEvent(*peer, peerHandle.GetSlotIndex(), SocketEvent::PEER_ESTABLISHED);
             std::memcpy(peer->announcedTag, tag.data(), tag.size());
             peer->authenticated = (match == CertStore::Match::Trusted);
@@ -2536,13 +2580,14 @@ namespace bcp::flux
         // Handle scope closed: bind the responder's tag window so its future
         // moves are recognizable from the first packet off a new address.
         if (migration_)
-            BindTagWindow(slot, session, LaneFrom(pk), 0);
+            BindTagWindow(slot, session, LaneBetween(pk, mine.publicKey), 0);
         common::crypto::Wipe(session.data(), session.size());
 
         FlushPending(from);
     }
 
-    void Socket::CommitSession(Peer& peer, const common::crypto::PublicKey& theirPk,
+    void Socket::CommitSession(Peer& peer, const IdentityTable::Entry& mine,
+                                const common::crypto::PublicKey& theirPk,
                                 const common::crypto::SecretKey& myEphSk,
                                 const common::crypto::PublicKey& theirEphPk,
                                 const uint8_t* transcript, size_t transcriptLen) noexcept
@@ -2563,8 +2608,9 @@ namespace bcp::flux
         common::crypto::SessionKey priorMacKey    = peer.macKey;
 
         peer.theirPk = theirPk;
-        DeriveSessionInto(peer.session, peer.resumeRoot, theirPk, myEphSk, theirEphPk,
-                          transcript, transcriptLen);
+        peer.lane    = LaneBetween(mine.publicKey, theirPk);
+        DeriveSessionInto(peer.session, peer.resumeRoot, mine.secretKey, theirPk,
+                          myEphSk, theirEphPk, transcript, transcriptLen);
         // Split off the counter-masking key and the MAC-only key, under
         // distinct labels so no two derivations share a domain.
         common::crypto::DeriveSubKey(peer.headerKey.data(), peer.session.data(),
@@ -2631,7 +2677,7 @@ namespace bcp::flux
             peer.grantSendPending  = true;
             peer.grantSentAtMicros = 0;   // send at the next tick, not one RTO later
         }
-        peer.myTag        = DerivePeerTag(peer.session, LaneTo(theirPk), 0);
+        peer.myTag        = DerivePeerTag(peer.session, peer.lane, 0);
         peer.state        = HandshakeState::ESTABLISHED;
         // The acknowledgement silence clock starts here, so a peer that never
         // acknowledges anything still has a defined death, measured from the
@@ -2670,7 +2716,7 @@ namespace bcp::flux
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
-        peer.myTag        = DerivePeerTag(peer.session, LaneTo(peer.theirPk), 0);
+        peer.myTag        = DerivePeerTag(peer.session, peer.lane, 0);
 
         peer.keyGeneration      = static_cast<uint8_t>(peer.keyGeneration + 1);
         peer.rotationConfirmed  = false;
@@ -3361,7 +3407,7 @@ namespace bcp::flux
                 if (!peer || !peer->IsValid()) continue;
 
                 ++peer->myTagStep;
-                peer->myTag = DerivePeerTag(peer->session, LaneTo(peer->theirPk), peer->myTagStep);
+                peer->myTag = DerivePeerTag(peer->session, peer->lane, peer->myTagStep);
                 ++rotated;
             }
         }

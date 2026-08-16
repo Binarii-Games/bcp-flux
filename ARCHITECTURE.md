@@ -172,8 +172,8 @@ to a packet path.
 `Socket` also owns five smaller pieces the sections below refer to without
 introducing: `SocketListener` and `SocketSender`, thin wrappers over the kernel's
 receive and send; `ChallengeGenerator`, the stateless handshake cookie source;
-`Identity`, this socket's long-term keypair; and `ReplayWindow`, one per peer
-slot.
+`IdentityTable`, the keypairs this socket answers on; and `ReplayWindow`, one
+per peer slot.
 
 | Sub-namespace | Holds |
 |---|---|
@@ -297,6 +297,20 @@ is trusted because of how it was delivered (embedded in a client, provisioned,
 loaded from config), and the handshake proves the peer owns the matching
 secret, so no signature is carried. Flux never parses an identity tag. It
 stores it, matches it, and surfaces it to the layer above.
+
+#### Identity
+
+The keypair a socket proves its own tag with, and the ones it proved it with
+before. The tag is the durable half and never moves: a rotation replaces the
+key that currently proves it, so peer relationships survive one and only the
+proof is new. A socket that never rotates holds exactly one keypair, which is
+what every socket held before rotation existed.
+
+Each keypair is named by a four-byte id derived from its public half, so a
+first-flight opener can say which key it was encrypted toward. Anyone holding
+the certificate can compute that id, which is exactly who needs to, and it
+says nothing about how often the socket rotates because it comes from the key
+rather than from a counter.
 
 ### Memory: the pools
 
@@ -533,6 +547,7 @@ because each is one job and neither of those is:
 | `transfer/transfer_table.cpp` | every transfer this socket runs: the window rings, the placement arithmetic, the overdue scan |
 | `socket/socket_transfer.cpp` | the transfer entry points and the tick's transfer pass, which reach most of the socket's sending machinery but none of the flow tables |
 | `socket/socket_knock.cpp` | the first-flight opener: arming a window, the receiver pipeline, and the caps that bound what an unproven peer costs |
+| `crypto/identity_table.cpp` | the keypairs this socket answers on, and the lock that lets one be replaced under live traffic |
 
 The split is by job, not by size. The handshake and the migration receive path
 are both larger than any of these and both stay where they are: each reaches
@@ -1134,6 +1149,14 @@ else in the header is stable across two knocks from the same sender. The seal
 also gates the work: a forgery fails its tag after one key agreement rather
 than two.
 
+The header also names which of the receiver's keys all of that was aimed at,
+in four bytes, so a receiver holding more than one picks it directly. Without
+that name it would have to attempt an agreement against each key it holds,
+which would let one unauthenticated packet cost as much work as the receiver
+keeps history. The name comes from the key rather than from a counter, so it
+reveals nothing about how often that socket rotates, and a receiver that never
+rotates simply always sees the same one.
+
 The receiver rebuilds the same key from the header, and the open is the
 identity proof: only the holder of the secret behind the presented public key
 produces a packet that opens, so the peer's id is bound rather than claimed.
@@ -1211,6 +1234,40 @@ before the key comparison, because the wiped key is all zeros and a forged
 handshake could present exactly that. A peer already authenticated keeps its
 live session, and everything that consults the store afresh refuses from the
 next call on.
+
+#### Rotating this socket's own identity
+
+`RotateIdentity` installs a new keypair under the same tag, under live
+traffic. Sessions already running are untouched, because their keys came from
+the handshake ephemerals rather than from this one. What changes is what a new
+handshake announces and what a new opener can be encrypted toward.
+
+Everything a rotation has to answer follows from one asymmetry. A handshake
+carries public keys in band, so it always announces the key held now and needs
+nothing. An opener does not: it is encrypted toward a key the sender read out
+of a certificate, possibly long ago, and a sender whose copy has not caught up
+would otherwise be sending into a key nobody holds.
+
+So the previous keypairs are kept, as many as `Config::identityHistory` allows,
+and an opener naming one of them is opened on it. The data it carried arrives,
+which is the whole reason for keeping the key. The handshake behind it still
+announces the current key, the sender's pinned certificate refuses that, and
+the two events between them say what to do about it: `PEER_STALE_IDENTITY` on
+the receiver, naming a peer working from an old certificate, and
+`PEER_CERT_MISMATCH` on the sender, which is its cue to fetch a fresh one. Once
+it has, the handshake completes on its own retry. Distributing certificates is
+the application's, exactly as it was for the first one.
+
+An opener naming a key that was never held, or one `ForgetPreviousIdentities`
+has wiped, meets the same uniform decline as an opener that cannot be read: the
+ordinary challenge, and the plain handshake carries the sender instead. That is
+what makes forgetting a real answer to a leaked key rather than a hint.
+
+One thing a rotation must never do is move a running session between nonce
+lanes, since the two counters under one key would then collide. The lane is
+settled from the two public keys when the session key is installed and stored
+on the peer, so it is a property of the session and not a lookup that could
+answer differently later.
 
 #### Congestion control
 

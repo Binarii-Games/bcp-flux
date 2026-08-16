@@ -27,6 +27,16 @@ security fix is allowed to change either.
 - `RemoveCertificate` revokes a pinned identity at runtime. The tag's entry
   is kept with its key wiped and version cleared, so every later check
   against it fails hard rather than falling open.
+- Identity rotation. `RotateIdentity` replaces the keypair a socket proves its
+  tag with, under live traffic, without changing the tag, so running sessions
+  and peer relationships are untouched. Previous keypairs are kept as
+  `Config::identityHistory` allows, and a first-flight opener naming one is
+  still opened, so its data arrives while the sender's certificate catches up.
+  The opener names the key it was aimed at in four bytes, so a receiver holding
+  several picks one rather than trying each. Two events carry the news:
+  `PEER_STALE_IDENTITY` on the receiver, and `PEER_CERT_MISMATCH` on a sender
+  whose pinned certificate no longer matches, which is its cue to fetch a fresh
+  one. `ForgetPreviousIdentities` wipes the retained keys outright, for a leak.
 
 ## [0.4.0] - 2026-08-11
 

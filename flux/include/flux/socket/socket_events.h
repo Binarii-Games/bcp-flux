@@ -107,6 +107,22 @@ namespace bcp::flux
             its packet, so the replay contract is per message. This event is
             the per-peer heads-up. */
         PEER_KNOCKED           = (1u << 11),
+
+        /** This peer's first-flight opener named a key this socket has since
+            replaced, so its certificate for us is out of date. Its data was
+            delivered, because the key it named is still held, but the
+            handshake behind it announces the current key and this peer will
+            refuse that until it fetches a fresh certificate. Nothing to do
+            here beyond noting that it should. */
+        PEER_STALE_IDENTITY    = (1u << 12),
+
+        /** A peer completed a handshake announcing a tag this socket trusts,
+            but presented a key that tag is not pinned to, so the session was
+            refused. Either the peer rotated its identity and the certificate
+            held here is stale, or something is impersonating it. Fetching a
+            fresh certificate is the right answer to both: a real rotation
+            then works, and an impersonator still does not match. */
+        PEER_CERT_MISMATCH     = (1u << 13),
     };
 
     constexpr uint32_t ToBits(SocketEvent e) noexcept { return static_cast<uint32_t>(e); }

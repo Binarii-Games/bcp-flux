@@ -34,6 +34,7 @@
 #include <flux/crypto/certificate.h>
 #include <flux/crypto/cert_store.h>
 #include <flux/crypto/identity.h>
+#include <flux/crypto/identity_table.h>
 #include <flux/socket/i_socket_kernel.h>
 #include <flux/crypto/packet_seal.h>
 #include <flux/socket/packet_slot.h>
@@ -225,6 +226,14 @@ namespace bcp::flux
                 caller may Wipe its own copy after. Null = anonymous (fresh
                 keypair, zero tag). */
             const Identity* identity       = nullptr;
+
+            /** Previous keypairs kept past a RotateIdentity, so a peer whose
+                certificate has not caught up can still open toward this
+                socket. Zero is a socket that never rotates, which is what
+                every socket did before rotation existed. Each costs one
+                keypair of memory and one more entry an arriving opener may
+                name. Init refuses more than internal::MAX_IDENTITY_HISTORY. */
+            uint8_t     identityHistory    = 0;
 
             /** Trusted-cert store capacity. 0 disables it: LoadCertificate
                 fails, every peer stays unauthenticated, SendSecured never
@@ -495,6 +504,36 @@ namespace bcp::flux
             afresh refuses from the next call on. NotFound when the tag was
             never pinned. */
         common::Error RemoveCertificate(const Certificate::IdentityTag& tag);
+
+        /** Replaces the keypair this socket proves its identity with, under
+            live traffic. The tag does not change, so every peer relationship
+            survives and only the proof is new: sessions already running are
+            untouched, because their keys came from the handshake ephemerals
+            and never from this one.
+
+            The previous keypair is retained if Config::identityHistory made
+            room, so a peer still holding the old certificate can open toward
+            this socket while its copy catches up. Its handshake is answered
+            with the new key, which its pinned certificate will refuse until
+            it fetches a fresh one, and the CERT_MISMATCH event is what tells
+            it to. Distributing the new certificate is the application's, the
+            same way the first one got there.
+
+            InvalidParam when next carries a different tag. */
+        common::Error RotateIdentity(const Identity& next);
+
+        /** Wipes every retained keypair, leaving only the current one. An
+            opener aimed at any of them stops being answerable and its sender
+            falls back to the plain handshake. For a leaked key, where cutting
+            off the peers still using it is the point. */
+        void ForgetPreviousIdentities();
+
+        /** The identity tag this socket announces, zero when anonymous. Fixed
+            at Init: a rotation changes the key, never the tag. */
+        [[nodiscard]] const Certificate::IdentityTag& IdentityTag() const noexcept
+        {
+            return ownTag_;
+        }
 
         wire::PacketBuilder BuildPacket();
 
@@ -829,8 +868,7 @@ namespace bcp::flux
         SocketListener                 listener_;
         SocketSender                   sender_;
         ChallengeGenerator             challengeGenerator_;
-        common::crypto::SecretKey      secretKey_;
-        common::crypto::PublicKey      publicKey_;
+        IdentityTable                  identities_;
         Certificate::IdentityTag       ownTag_{};   ///< announced in HS_FINISH; zero when anonymous
         CertStore                      certStore_;
 
@@ -938,16 +976,19 @@ namespace bcp::flux
 
 
         /** Copies a peer's send materials and bumps its counter, the one place
-            ++sendCounter happens for a send. Non-static because it derives the
-            lane from this socket's own public key.
+            ++sendCounter happens for a send.
 
             @pre Caller holds the peer's write lock. */
         [[nodiscard]] PeerSendMaterials GatherSendMaterials(Peer& peer) noexcept;
 
         /** Nonce lanes: the lower public key is lane 0, the other lane 1, so the
-            two independent send counters never collide under the shared key. */
-        [[nodiscard]] uint8_t LaneTo(const common::crypto::PublicKey& theirPk) const noexcept;
-        [[nodiscard]] uint8_t LaneFrom(const common::crypto::PublicKey& theirPk) const noexcept;
+            two independent send counters never collide under the shared key.
+            Both sides must agree, so the comparison uses the key that peer
+            knows this socket by. It is settled once when the session key is
+            installed and then read off Peer::lane, because a rotation must
+            never move a running session from one lane to the other. */
+        [[nodiscard]] static uint8_t LaneBetween(const common::crypto::PublicKey& myPk,
+                                                 const common::crypto::PublicKey& theirPk) noexcept;
         [[nodiscard]] ReplayWindow ReplayFor(uint32_t slot) noexcept;
 
         /** Rotating migration tag: keyed MAC of (lane, step) folded to 4 bytes,
@@ -1242,7 +1283,8 @@ namespace bcp::flux
         void Handshake_Complete(const Address& from, PacketSlotReader& reader);
         /** The key-derive, MAC, and peer-commit block shared by Validate's
             establish branch and Complete. */
-        void CommitSession(Peer& peer, const common::crypto::PublicKey& theirPk,
+        void CommitSession(Peer& peer, const IdentityTable::Entry& mine,
+                           const common::crypto::PublicKey& theirPk,
                            const common::crypto::SecretKey& myEphSk,
                            const common::crypto::PublicKey& theirEphPk,
                            const uint8_t* transcript, size_t transcriptLen) noexcept;
@@ -1255,6 +1297,7 @@ namespace bcp::flux
             handshake is over. */
         void DeriveSessionInto(common::crypto::SessionKey& outSession,
                                common::crypto::SessionKey& outResume,
+                               const common::crypto::SecretKey& mySk,
                                const common::crypto::PublicKey& theirPk,
                                const common::crypto::SecretKey& myEphSk,
                                const common::crypto::PublicKey& theirEphPk,

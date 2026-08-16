@@ -134,6 +134,9 @@ namespace bcp::flux
             const uint64_t clock = common::WallClockSeconds();
             for (size_t i = 0; i < 8; ++i)
                 header[internal::KNOCK_OFF_CLOCK + i] = static_cast<uint8_t>(clock >> (8 * i));
+            for (size_t i = 0; i < internal::WIRE_KEY_ID_SIZE; ++i)
+                header[internal::KNOCK_OFF_KEYID + i] =
+                    static_cast<uint8_t>(materials.knockKeyId >> (8 * i));
             std::memcpy(header + internal::KNOCK_OFF_IDENTITY, materials.knockIdentity,
                         sizeof(materials.knockIdentity));
 

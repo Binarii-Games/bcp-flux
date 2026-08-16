@@ -133,12 +133,30 @@ namespace bcp::flux::internal
         'f','l','u','x','-','k','n','k','-','s','t','a','t','i','c',0
     };
 
+    // --- Identity ---
+
+    /** Previous keypairs a socket may keep past a rotation. The bound exists
+        because a retained key is one more an opener can name, and the table
+        is searched linearly. Config leaves it at zero, which is a socket that
+        never rotates. */
+    static constexpr uint8_t  MAX_IDENTITY_HISTORY = 8;
+
+    /** Bytes naming which of a receiver's keys an opener was encrypted
+        toward. Four is enough that two keys one socket holds at once are not
+        going to collide, and short enough to cost nothing on the wire. */
+    static constexpr size_t   WIRE_KEY_ID_SIZE = 4;
+
     // --- Knock (the 0-RTT opener) ---
 
     /** Cleartext knock header: controller, opcode, version, caps, masked
-        counter, sender ephemeral, salt, sender wall clock, and the identity
-        region. Every field is fixed width, so every offset is constant and
-        MaxPayload has one answer per state.
+        counter, sender ephemeral, salt, sender wall clock, the receiver key
+        id, and the identity region. Every field is fixed width, so every
+        offset is constant and MaxPayload has one answer per state.
+
+        The key id says which of the receiver's keys the rest was encrypted
+        toward. It is present whatever either end has configured, because a
+        header whose size depended on that would leave two differently
+        configured peers unable to read each other.
 
         The identity region is the sender's own public key sealed under a key
         only the named receiver can rebuild, plus its tag. Nothing in the
@@ -148,7 +166,8 @@ namespace bcp::flux::internal
         common::crypto::KEY_SIZE + common::crypto::TAG_SIZE;
     static constexpr size_t   KNOCK_HEADER_SIZE   =
         1 + 1 + VERSION_SIZE + VERSION_CAPS_SIZE + WIRE_NONCE_SIZE
-        + common::crypto::KEY_SIZE + WIRE_HS_SALT_SIZE + 8 + KNOCK_IDENTITY_SIZE;
+        + common::crypto::KEY_SIZE + WIRE_HS_SALT_SIZE + 8 + WIRE_KEY_ID_SIZE
+        + KNOCK_IDENTITY_SIZE;
 
     /** Fixed field offsets inside the knock header. */
     static constexpr size_t   KNOCK_OFF_VERSION  = 2;
@@ -157,7 +176,8 @@ namespace bcp::flux::internal
     static constexpr size_t   KNOCK_OFF_EPH      = KNOCK_OFF_COUNTER + WIRE_NONCE_SIZE;
     static constexpr size_t   KNOCK_OFF_SALT     = KNOCK_OFF_EPH + common::crypto::KEY_SIZE;
     static constexpr size_t   KNOCK_OFF_CLOCK    = KNOCK_OFF_SALT + WIRE_HS_SALT_SIZE;
-    static constexpr size_t   KNOCK_OFF_IDENTITY = KNOCK_OFF_CLOCK + 8;
+    static constexpr size_t   KNOCK_OFF_KEYID    = KNOCK_OFF_CLOCK + 8;
+    static constexpr size_t   KNOCK_OFF_IDENTITY = KNOCK_OFF_KEYID + WIRE_KEY_ID_SIZE;
 
     /** The encrypted interior leads with the sender's real controller byte
         and the payload length, then the payload, then zero padding out to

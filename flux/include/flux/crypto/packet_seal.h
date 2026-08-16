@@ -41,6 +41,7 @@ namespace bcp::flux
             header, so no call site changes. `key` and `headerKey` above carry
             the knock keys in that state. */
         bool                       knock = false;
+        uint32_t                   knockKeyId = 0;
         common::crypto::PublicKey  knockEphPk{};
         uint8_t                    knockSalt[internal::WIRE_HS_SALT_SIZE]{};
         uint8_t                    knockIdentity[internal::KNOCK_IDENTITY_SIZE]{};

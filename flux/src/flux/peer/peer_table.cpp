@@ -436,6 +436,7 @@ namespace bcp::flux
         p->id          = id ? *id : BcpId{};
         p->theirPk     = {};
         p->session     = {};
+        p->lane        = 0;   // settled when a key is installed
         p->headerKey   = {};
         p->macKey      = {};
         p->resumeRoot    = {};
@@ -479,6 +480,7 @@ namespace bcp::flux
         p->grantSentAtMicros    = 0;
         p->knockActive          = false;
         p->knockFramed          = false;
+        p->knockKeyId           = 0;
         p->knockKey             = {};
         p->knockHeaderKey       = {};
         p->knockEphPk           = {};

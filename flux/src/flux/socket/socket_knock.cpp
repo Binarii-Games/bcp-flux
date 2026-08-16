@@ -105,9 +105,12 @@ namespace bcp::flux
             return false;
         }
 
+        IdentityTable::Entry mine;
+        (void)identities_.Find(IdentityTable::CURRENT, mine);
+
         common::crypto::SharedSecret staticShared;
         common::crypto::SharedSecret ephShared;
-        common::crypto::ComputeSharedSecret(staticShared, secretKey_, certKey);
+        common::crypto::ComputeSharedSecret(staticShared, mine.secretKey, certKey);
         common::crypto::ComputeSharedSecret(ephShared, ephSk, certKey);
         CombineKnockKey(peer.knockKey, peer.knockHeaderKey, staticShared, ephShared, salt);
 
@@ -125,7 +128,7 @@ namespace bcp::flux
         const common::crypto::Nonce sealNonce{};
         common::crypto::Tag sealTag;
         common::crypto::Encrypt(peer.knockIdentity, sealTag, staticSealKey, sealNonce,
-                                publicKey_.data(), publicKey_.size());
+                                mine.publicKey.data(), mine.publicKey.size());
         std::memcpy(peer.knockIdentity + common::crypto::KEY_SIZE,
                     sealTag.data(), sealTag.size());
         common::crypto::Wipe(staticSealKey.data(), staticSealKey.size());
@@ -141,12 +144,18 @@ namespace bcp::flux
         peer.knockFramed = true;   // until the far side answers, or the handshake lands
         peer.knockEphPk  = ephPk;
         std::memcpy(peer.knockSalt, salt, sizeof(salt));
+        // Which of the receiver's keys this was encrypted toward, so it can
+        // pick that one rather than attempting an agreement against each key
+        // it holds. Computed from the certificate, which is all the sender has
+        // and all it needs.
+        peer.knockKeyId = IdentityTable::KeyIdOf(certKey);
 
         // A working session under the interim key: flows admit, packets number
         // and acknowledge, and the peer's replies open. The handshake is still
         // owed, which knockHandshakePending says, so the retry pass keeps
         // covering this peer even though it reads as established.
         peer.theirPk    = certKey;
+        peer.lane       = LaneBetween(mine.publicKey, certKey);
         peer.session    = peer.knockKey;
         peer.headerKey  = peer.knockHeaderKey;
         common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
@@ -204,6 +213,10 @@ namespace bcp::flux
         common::crypto::PublicKey ephPk;
         std::memcpy(ephPk.data(), packet->data + internal::KNOCK_OFF_EPH, ephPk.size());
 
+        uint32_t keyId = 0;
+        for (size_t i = 0; i < internal::WIRE_KEY_ID_SIZE; ++i)
+            keyId |= static_cast<uint32_t>(packet->data[internal::KNOCK_OFF_KEYID + i]) << (8 * i);
+
         // The claimed age, against this socket's own clock. A replayed opener
         // carries the stamp of the original, so it ages out of the window even
         // when the ring that would have refused it outright has been wiped by a
@@ -244,7 +257,7 @@ namespace bcp::flux
                 const common::crypto::SessionKey& openMask =
                     useCurrent ? peer->knockHeaderKey : peer->prevHeaderKey;
                 if (!OpenKnockPacket(*packet, openKey, openMask,
-                                     LaneFrom(peer->theirPk), counter))
+                                     peer->TheirLane(), counter))
                     return;
                 if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
                     return;
@@ -274,13 +287,26 @@ namespace bcp::flux
                     fingerprint |= static_cast<uint64_t>(ephPk[i]) << (8 * i);
                 if (!KnockRingAdmit(fingerprint)) { Handshake_Challenge(from); return; }
 
-                // The sender's ephemeral against this socket's own secret is
-                // the one exchange available before the sender is known, and
-                // it unseals the name. Its tag is also the cheap gate: a
-                // forgery fails here, on one key agreement, rather than after
-                // the second one.
+                // Which of this socket's keys the opener was aimed at. A
+                // named key it no longer holds declines exactly as an opener
+                // it cannot read does, so a sender working from a certificate
+                // this socket has forgotten learns nothing from the shape of
+                // the answer and simply falls back to the handshake.
+                IdentityTable::Entry mine;
+                const IdentityTable::Which which = identities_.Find(keyId, mine);
+                if (which == IdentityTable::Which::None)
+                {
+                    Handshake_Challenge(from);
+                    return;
+                }
+
+                // The sender's ephemeral against the named secret is the one
+                // exchange available before the sender is known, and it
+                // unseals the name. Its tag is also the cheap gate: a forgery
+                // fails here, on one key agreement, rather than after the
+                // second one.
                 common::crypto::SharedSecret ephShared;
-                common::crypto::ComputeSharedSecret(ephShared, secretKey_, ephPk);
+                common::crypto::ComputeSharedSecret(ephShared, mine.secretKey, ephPk);
                 common::crypto::SessionKey staticSealKey;
                 DeriveKnockStaticKey(staticSealKey, ephShared, saltField);
                 const common::crypto::Nonce sealNonce{};
@@ -303,7 +329,7 @@ namespace bcp::flux
                 }
 
                 common::crypto::SharedSecret staticShared;
-                common::crypto::ComputeSharedSecret(staticShared, secretKey_, theirStatic);
+                common::crypto::ComputeSharedSecret(staticShared, mine.secretKey, theirStatic);
                 common::crypto::SessionKey knockKey;
                 common::crypto::SessionKey knockHeaderKey;
                 CombineKnockKey(knockKey, knockHeaderKey, staticShared, ephShared, saltField);
@@ -311,8 +337,9 @@ namespace bcp::flux
                 common::crypto::Wipe(ephShared.data(), ephShared.size());
 
                 uint64_t counter = 0;
+                const uint8_t theirLane = LaneBetween(theirStatic, mine.publicKey);
                 const bool opened = OpenKnockPacket(*packet, knockKey, knockHeaderKey,
-                                                    LaneFrom(theirStatic), counter);
+                                                    theirLane, counter);
                 if (!opened)
                 {
                     common::crypto::Wipe(knockKey.data(), knockKey.size());
@@ -353,6 +380,7 @@ namespace bcp::flux
                     Peer* peer = fresh.Write();
                     if (!peer) return;
                     peer->theirPk        = theirStatic;
+                    peer->lane           = theirLane == 0 ? 1 : 0;
                     peer->id             = id;
                     peer->hasId          = true;
                     peer->knockActive    = true;
@@ -378,6 +406,13 @@ namespace bcp::flux
                     ReplayFor(slot).Reset();
                     (void)ReplayFor(slot).Accept(counter);
                     RecordPeerEvent(*peer, slot, SocketEvent::PEER_KNOCKED);
+                    // Opened on a key this socket has replaced, so the sender
+                    // is working from a certificate that has not caught up.
+                    // Its data still arrives, which is what keeping the key
+                    // bought, but its handshake will be answered with the
+                    // current key and refused until it holds a fresh one.
+                    if (which == IdentityTable::Which::Previous)
+                        RecordPeerEvent(*peer, slot, SocketEvent::PEER_STALE_IDENTITY);
                 }
                 common::crypto::Wipe(knockKey.data(), knockKey.size());
                 common::crypto::Wipe(knockHeaderKey.data(), knockHeaderKey.size());

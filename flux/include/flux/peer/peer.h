@@ -51,6 +51,17 @@ namespace bcp::flux
         common::crypto::SessionKey session;   ///< DH(our secret, theirPk) through the KDF,
                                               ///< salted per handshake
 
+        /** Which half of the nonce space this side sends in, 0 or 1. Settled
+            when the session key is installed, by comparing the two public
+            keys, and then never recomputed: both ends must agree for the
+            lifetime of the key, and rotating this socket's identity would
+            otherwise move a running session to the other lane and collide
+            two counters under one key. */
+        uint8_t                    lane;
+
+        /** The half the remote sends in, which is whichever this side is not. */
+        [[nodiscard]] uint8_t TheirLane() const noexcept { return lane == 0 ? 1 : 0; }
+
         /** Masks the counter field of every secure packet, so the counter is
             not readable on the wire. Split from `session` rather than reused:
             XChaCha20 derives its own internal subkey the same way, and a
@@ -234,6 +245,7 @@ namespace bcp::flux
             already, so its replies have nothing to announce. */
         bool     knockFramed;
 
+        uint32_t knockKeyId;   ///< which of the receiver's keys the opener names
         common::crypto::SessionKey knockKey;
         common::crypto::SessionKey knockHeaderKey;
         common::crypto::PublicKey  knockEphPk;
