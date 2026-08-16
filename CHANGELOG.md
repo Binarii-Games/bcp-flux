@@ -15,12 +15,6 @@ security fix is allowed to change either.
   cannot read traffic recorded before the last rotation. Rotation is silent on
   the wire, runs on a per-peer byte threshold (`Config::rotateAfterBytes`) or
   on `RotateKeys`, and the peer discovers it by trial decryption.
-- Session resumption notes. After a session proves itself, each side issues
-  the other a sealed note carrying everything the issuer needs to restore the
-  relationship later while storing nothing itself. Notes live in a new fixed
-  pool, expire on a wall clock, and can persist across restarts through a
-  save hook or the built-in file store (`Config::tickets`). Nothing consumes
-  them yet: the resume path arrives in a later release step.
 - `RemoveCertificate` revokes a pinned identity at runtime. The tag's entry
   is kept with its key wiped and version cleared, so every later check
   against it fails hard rather than falling open.

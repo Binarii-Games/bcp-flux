@@ -477,9 +477,6 @@ namespace bcp::flux
         p->freeWhenRead         = false;
         p->grantSendPending     = false;   // raised when a session commits
         p->grantSentAtMicros    = 0;
-        p->ticketSendPending    = false;   // raised when a session commits
-        p->ticketSentAtMicros   = 0;
-        p->issuedNoteId         = 0;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
         p->slowStartQueueSinceMicros = 0;
         p->rtt.Reset();

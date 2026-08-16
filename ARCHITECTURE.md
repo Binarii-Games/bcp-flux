@@ -128,11 +128,9 @@ whole list, and nothing new joins it.
 - **Error and result.** `Error` is an `enum class : uint8_t`, codes grouped by
   numeric range, every code mapped by `ErrorToString`. `Result<T>` pairs an
   `Error` with a value. Callers check `isErr()` before `Take()`.
-- **Platform.** `CACHE_LINE` (128 on arm64, 64 elsewhere), `CpuPause()`,
+- **Platform.** `CACHE_LINE` (128 on arm64, 64 elsewhere), `CpuPause()`, and
   `MonotonicMicros()`, which is meaningful only as a difference between two
-  calls, and `WallClockSeconds()`, which survives reboots and can jump when
-  the host clock is adjusted, so it serves coarse validity windows and never
-  timeouts or measurement.
+  calls.
 - **Collections.** Two structures, and they are the whole set. `SlotPool` is an
   index free-list over one contiguous block plus a per-slot reader/writer lock.
   The free-list is lock-free; the per-slot lock is a blocking spin with no try
@@ -300,7 +298,7 @@ stores it, matches it, and surfaces it to the layer above.
 
 ### Memory: the pools
 
-Nothing on the packet path allocates. There are fourteen pools, each with one
+Nothing on the packet path allocates. There are thirteen pools, each with one
 owner:
 
 | Pool | Owner | Holds |
@@ -318,7 +316,6 @@ owner:
 | in-transfer | `TransferTable` | `InTransfer` slots, likewise |
 | peer | `PeerTable` | `Peer` slots |
 | certificate | `CertStore` | trusted `Certificate` slots |
-| ticket | `TicketTable` | resumption notes received, one per issuer identity |
 
 Each association pool is really two, a standard one and a deep one for bulk,
 behind a single index space. `SplitAssocPool` maps an index below the standard
@@ -531,9 +528,6 @@ because each is one job and neither of those is:
 | `internal/congestion_curve.h` | the growth arithmetic that policy consults: the queue a path tolerates, CUBIC's window over time, the straight line under it |
 | `transfer/transfer_table.cpp` | every transfer this socket runs: the window rings, the placement arithmetic, the overdue scan |
 | `socket/socket_transfer.cpp` | the transfer entry points and the tick's transfer pass, which reach most of the socket's sending machinery but none of the flow tables |
-| `ticket/ticket_table.cpp` | the notes this socket holds: storage, expiry, the bundle encoding |
-| `socket/socket_ticket.cpp` | issuing notes, receiving them, and the persistence glue, the same split the transfer pair has |
-| `util/ticket_store.cpp` | the built-in file persistence, the only filesystem code in flux, active only when configured |
 
 The split is by job, not by size. The handshake and the migration receive path
 are both larger than any of these and both stay where they are: each reaches
@@ -1094,38 +1088,16 @@ naming the buffer, the length and the outcome, and `CompleteTransfer`
 releases the receiving half. Sweeping a peer drops its transfers, so a slot
 recycled to a later peer can never inherit one.
 
-#### Resumption notes
+#### Revoking a pinned identity
 
-Once a session commits and the peer has opened something under its key, each
-side seals a note for the other over the secure channel: the holder's public
-key, a secret derived from the session's resume root, the issue time, an id,
-and a validity window, encrypted under a key only the issuer can ever
-re-derive (its identity secret plus a configured epoch). The holder stores
-the blob without being able to read it, and the issuer keeps nothing, which
-is the point: the memory of the session travels with the side that will want
-it back. The announcement is resent from the tick until an ack names its id,
-the contract grants already use.
-
-Notes this socket receives live in the ticket pool, one per issuer identity,
-newest wins. When persistence is configured, a note is written through as it
-arrives (a save hook the application owns, or the built-in file store, one
-file per issuer, written atomically and loaded back at Init) so recovery
-survives the process. Expiry is wall-clock: enforced lazily on lookup, by a
-budgeted sweep on the tick, by eviction preference when the pool is full,
-and by the purge at load. A wrong clock can only cost speed, because the
-issuer re-checks everything when a note comes back.
-
-Revocation has two shapes. The issuer's epoch is the mass one: bumping it
-changes the seal key, and every note sealed before the bump stops opening.
-`RemoveCertificate` is the targeted one: the certificate entry stays, its
-version cleared and its key wiped, so any key presented against that tag
-afterwards is a hard mismatch. It has to fail before the key comparison,
-because the wiped key is all zeros and a forged handshake could present
-exactly that.
-
-Nothing consumes a note yet. The resume path that spends them is the next
-piece of this design, and until it lands the notes are inert state with an
-expiry.
+`RemoveCertificate` stops trusting whatever key a tag names, at runtime, under
+live traffic. The certificate entry stays and its version is cleared and its
+key wiped, so any key presented against that tag afterwards is a hard
+mismatch. The cleared version is what the check reads, and it has to fail
+before the key comparison, because the wiped key is all zeros and a forged
+handshake could present exactly that. A peer already authenticated keeps its
+live session, and everything that consults the store afresh refuses from the
+next call on.
 
 #### Congestion control
 

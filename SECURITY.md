@@ -78,10 +78,3 @@ These are known and are not vulnerabilities:
 - Anonymous peers are not authenticated. Without a loaded certificate, a session
   is encrypted but the peer's identity is unverified. Use `SendSecured` when
   identity matters.
-- Persisted resumption notes contain secret material. A note bundle written to
-  disk, by the built-in store or the application's save hook, lets whoever
-  reads it attempt a resume against the peer that issued it once resumption
-  exists on the wire. Custody of those bytes is the embedder's, exactly as it
-  already is for the identity key the same storage typically holds. The
-  issuer's seal key is derived from its identity secret, so stealing that
-  secret was already a full compromise before notes existed.

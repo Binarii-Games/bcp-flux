@@ -100,12 +100,6 @@ namespace bcp::flux
             answers with neither leaves the transfer pending until the flow
             stall timeout takes it. */
         TRANSFER_INCOMING      = (1u << 10),
-
-        /** A resumption note from this peer arrived and was stored. The note
-            itself stays inside the socket (and, when persistence is
-            configured, whatever the store hook wrote), so there is nothing to
-            fetch: the event only says the fast path to this peer is armed. */
-        TICKET_RECEIVED        = (1u << 11),
     };
 
     constexpr uint32_t ToBits(SocketEvent e) noexcept { return static_cast<uint32_t>(e); }
