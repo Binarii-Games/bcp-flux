@@ -155,7 +155,7 @@ namespace bcp::flux
         // owed, which knockHandshakePending says, so the retry pass keeps
         // covering this peer even though it reads as established.
         peer.theirPk    = certKey;
-        peer.lane       = LaneBetween(mine.publicKey, certKey);
+        peer.nonceLane       = NonceLaneBetween(mine.publicKey, certKey);
         peer.session    = peer.knockKey;
         peer.headerKey  = peer.knockHeaderKey;
         common::crypto::DeriveSubKey(peer.macKey.data(), peer.session.data(),
@@ -260,9 +260,9 @@ namespace bcp::flux
                 // agreed against whichever key the opener named, so it carries
                 // its own lane. Opening it with the committed one produces a
                 // different nonce and it never opens.
-                const uint8_t openLane =
-                    useCurrent ? peer->TheirLane() : peer->TheirPrevLane();
-                if (!OpenKnockPacket(*packet, openKey, openMask, openLane, counter))
+                const uint8_t openNonceLane =
+                    useCurrent ? peer->TheirNonceLane() : peer->TheirPrevNonceLane();
+                if (!OpenKnockPacket(*packet, openKey, openMask, openNonceLane, counter))
                     return;
                 if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
                     return;
@@ -342,9 +342,9 @@ namespace bcp::flux
                 common::crypto::Wipe(ephShared.data(), ephShared.size());
 
                 uint64_t counter = 0;
-                const uint8_t theirLane = LaneBetween(theirStatic, mine.publicKey);
+                const uint8_t theirNonceLane = NonceLaneBetween(theirStatic, mine.publicKey);
                 const bool opened = OpenKnockPacket(*packet, knockKey, knockHeaderKey,
-                                                    theirLane, counter);
+                                                    theirNonceLane, counter);
                 if (!opened)
                 {
                     common::crypto::Wipe(knockKey.data(), knockKey.size());
@@ -385,7 +385,7 @@ namespace bcp::flux
                     Peer* peer = fresh.Write();
                     if (!peer) return;
                     peer->theirPk        = theirStatic;
-                    peer->lane           = theirLane == 0 ? 1 : 0;
+                    peer->nonceLane           = theirNonceLane == 0 ? 1 : 0;
                     peer->id             = id;
                     peer->hasId          = true;
                     peer->knockActive    = true;

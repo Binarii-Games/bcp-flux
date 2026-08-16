@@ -76,7 +76,7 @@ namespace bcp::flux
     [[nodiscard]] bool OpenSecurePacket(PacketSlot& packet,
                                         const common::crypto::SessionKey& key,
                                         const common::crypto::SessionKey& headerKey,
-                                        uint8_t senderLane,
+                                        uint8_t senderNonceLane,
                                         uint64_t& outCounter) noexcept;
 
     /** Verifies a MAC-only packet and reports the sender's counter. Same
@@ -99,6 +99,6 @@ namespace bcp::flux
     [[nodiscard]] bool OpenKnockPacket(PacketSlot& packet,
                                        const common::crypto::SessionKey& knockKey,
                                        const common::crypto::SessionKey& knockHeaderKey,
-                                       uint8_t senderLane,
+                                       uint8_t senderNonceLane,
                                        uint64_t& outCounter) noexcept;
 }

@@ -987,7 +987,7 @@ namespace bcp::flux
             knows this socket by. It is settled once when the session key is
             installed and then read off Peer::lane, because a rotation must
             never move a running session from one lane to the other. */
-        [[nodiscard]] static uint8_t LaneBetween(const common::crypto::PublicKey& myPk,
+        [[nodiscard]] static uint8_t NonceLaneBetween(const common::crypto::PublicKey& myPk,
                                                  const common::crypto::PublicKey& theirPk) noexcept;
         [[nodiscard]] ReplayWindow ReplayFor(uint32_t slot) noexcept;
 
@@ -997,9 +997,9 @@ namespace bcp::flux
         [[nodiscard]] static PeerTag DerivePeerTag(const common::crypto::SessionKey& session,
                                                    uint8_t lane, uint32_t step) noexcept;
         void BindTagWindow(uint32_t slot, const common::crypto::SessionKey& session,
-                           uint8_t theirLane, uint32_t baseStep) noexcept;
+                           uint8_t theirNonceLane, uint32_t baseStep) noexcept;
         void SlideTagWindow(uint32_t slot, const common::crypto::SessionKey& session,
-                            uint8_t theirLane, uint32_t oldBase, uint32_t newBase) noexcept;
+                            uint8_t theirNonceLane, uint32_t oldBase, uint32_t newBase) noexcept;
 
         // --- Send path ---
         // Writer sources for PacketBuilder: kernel slot for transient packets,

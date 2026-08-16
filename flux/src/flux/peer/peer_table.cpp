@@ -436,8 +436,8 @@ namespace bcp::flux
         p->id          = id ? *id : BcpId{};
         p->theirPk     = {};
         p->session     = {};
-        p->lane        = 0;   // settled when a key is installed
-        p->prevLane    = 0;
+        p->nonceLane        = 0;   // settled when a key is installed
+        p->prevNonceLane    = 0;
         p->headerKey   = {};
         p->macKey      = {};
         p->resumeRoot    = {};

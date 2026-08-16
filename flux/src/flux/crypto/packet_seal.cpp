@@ -164,7 +164,7 @@ namespace bcp::flux
     bool OpenKnockPacket(PacketSlot& packet,
                          const common::crypto::SessionKey& knockKey,
                          const common::crypto::SessionKey& knockHeaderKey,
-                         uint8_t senderLane,
+                         uint8_t senderNonceLane,
                          uint64_t& outCounter) noexcept
     {
         if (packet.dataSize < internal::KNOCK_HEADER_SIZE + internal::WIRE_TAG_SIZE)
@@ -186,7 +186,7 @@ namespace bcp::flux
         const uint64_t counter = ReadNonceCounter(aad + internal::KNOCK_OFF_COUNTER);
 
         common::crypto::Nonce nonce;
-        ExpandNonce(nonce, counter, senderLane);
+        ExpandNonce(nonce, counter, senderNonceLane);
 
         if (!common::crypto::Decrypt(packet.data + internal::KNOCK_HEADER_SIZE,
                                      knockKey, nonce,
@@ -346,7 +346,7 @@ namespace bcp::flux
     bool OpenSecurePacket(PacketSlot& packet,
                                    const common::crypto::SessionKey& key,
                                    const common::crypto::SessionKey& headerKey,
-                                   uint8_t senderLane,
+                                   uint8_t senderNonceLane,
                                    uint64_t& outCounter) noexcept
     {
         const bool tagged = packet.IsTagged();
@@ -372,7 +372,7 @@ namespace bcp::flux
         const uint64_t counter = ReadNonceCounter(nonceField);
 
         common::crypto::Nonce nonce;
-        ExpandNonce(nonce, counter, senderLane);
+        ExpandNonce(nonce, counter, senderNonceLane);
 
         uint8_t aad[internal::WIRE_CONTROLLER_SIZE + internal::WIRE_PEER_TAG_SIZE];
         const size_t aadLen = BuildSecureAad(

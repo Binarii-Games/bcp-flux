@@ -445,7 +445,7 @@ namespace bcp::flux
         return ReplayWindow{ replayState_.get() + block, replayWords_ };
     }
 
-    uint8_t Socket::LaneBetween(const common::crypto::PublicKey& myPk,
+    uint8_t Socket::NonceLaneBetween(const common::crypto::PublicKey& myPk,
                                 const common::crypto::PublicKey& theirPk) noexcept
     {
         return std::memcmp(myPk.data(), theirPk.data(), myPk.size()) < 0 ? 0 : 1;
@@ -520,7 +520,7 @@ namespace bcp::flux
         materials.headerKey = peer.headerKey;
         materials.macKey    = peer.macKey;
         materials.counter   = ++peer.sendCounter;
-        materials.lane      = peer.lane;
+        materials.lane      = peer.nonceLane;
         materials.tag       = peer.myTag;
         // While the window is open every packet carries the opener, not only
         // the first: reordering means any of them may be the one that arrives
@@ -1425,8 +1425,8 @@ namespace bcp::flux
         common::crypto::SessionKey prevMacKey;
         bool    rotationPending = false;
         uint8_t generationSeen  = 0;
-        uint8_t senderLane = 0;
-        uint8_t senderPrevLane = 0;
+        uint8_t senderNonceLane = 0;
+        uint8_t senderPrevNonceLane = 0;
         {
             PeerHandle peerHandle = peers_.GetPeer(packet->address);
             if (peerHandle.Failed())
@@ -1449,8 +1449,8 @@ namespace bcp::flux
                 prevHeaderKey = peer->prevHeaderKey;
                 prevMacKey    = peer->prevMacKey;
             }
-            senderLane     = peer->TheirLane();
-            senderPrevLane = peer->TheirPrevLane();
+            senderNonceLane     = peer->TheirNonceLane();
+            senderPrevNonceLane = peer->TheirPrevNonceLane();
         }
 
         PacketSlot* writablePacket = pHandle.Write();
@@ -1492,9 +1492,9 @@ namespace bcp::flux
         enum class OpenedWith : uint8_t { CURRENT, PREVIOUS, NEXT };
         OpenedWith openedWith = OpenedWith::CURRENT;
 
-        bool opened = tryOpen(key, headerKey, macKey, senderLane);
+        bool opened = tryOpen(key, headerKey, macKey, senderNonceLane);
         if (!opened && rotationPending
-            && tryOpen(prevKey, prevHeaderKey, prevMacKey, senderPrevLane))
+            && tryOpen(prevKey, prevHeaderKey, prevMacKey, senderPrevNonceLane))
         {
             opened     = true;
             openedWith = OpenedWith::PREVIOUS;
@@ -1509,7 +1509,7 @@ namespace bcp::flux
                                          internal::HEADER_KEY_LABEL);
             common::crypto::DeriveSubKey(nextMacKey.data(), nextKey.data(),
                                          internal::MAC_KEY_LABEL);
-            if (tryOpen(nextKey, nextHeaderKey, nextMacKey, senderLane))
+            if (tryOpen(nextKey, nextHeaderKey, nextMacKey, senderNonceLane))
             {
                 opened     = true;
                 openedWith = OpenedWith::NEXT;
@@ -1860,11 +1860,11 @@ namespace bcp::flux
                 const Peer* candidate = candidates[i].Read();
                 if (!candidate || !candidate->IsValid()) continue;
 
-                const uint8_t theirLane = candidate->TheirLane();
+                const uint8_t theirNonceLane = candidate->TheirNonceLane();
                 common::crypto::SessionKey key       = candidate->session;
                 common::crypto::SessionKey headerKey = candidate->headerKey;
 
-                if (!OpenSecurePacket(*writablePacket, key, headerKey, theirLane, counter))
+                if (!OpenSecurePacket(*writablePacket, key, headerKey, theirNonceLane, counter))
                 {
                     common::crypto::Wipe(key.data(), key.size());
                     common::crypto::Wipe(headerKey.data(), headerKey.size());
@@ -1909,7 +1909,7 @@ namespace bcp::flux
                         uint32_t presented = peer->theirTagStep;
                         for (uint32_t step = 0; step < 3; ++step)
                         {
-                            if (DerivePeerTag(peer->session, theirLane,
+                            if (DerivePeerTag(peer->session, theirNonceLane,
                                               peer->theirTagStep + step) == wireTag)
                             {
                                 presented = peer->theirTagStep + step;
@@ -2008,7 +2008,7 @@ namespace bcp::flux
         uint32_t slot      = 0;
         uint32_t oldBase   = 0;
         uint32_t newBase   = 0;
-        uint8_t  theirLane = 0;
+        uint8_t  theirNonceLane = 0;
         common::crypto::SessionKey session;
         {
             PeerHandle candidates[4];
@@ -2036,7 +2036,7 @@ namespace bcp::flux
                 slot      = candidates[i].GetSlotIndex();
                 oldBase   = peer->theirTagStep;
                 newBase   = peer->pathStep;
-                theirLane = peer->TheirLane();
+                theirNonceLane = peer->TheirNonceLane();
                 session   = peer->session;
                 peer->theirTagStep = newBase;
                 rebind = true;
@@ -2051,7 +2051,7 @@ namespace bcp::flux
             // leaves the old route; the mover's next packet simply starts a
             // fresh validation round.
             const bool moved = peers_.UpdateAddress(slot, from) == common::Error::Ok;
-            SlideTagWindow(slot, session, theirLane, oldBase, newBase);
+            SlideTagWindow(slot, session, theirNonceLane, oldBase, newBase);
             common::crypto::Wipe(session.data(), session.size());
 
             // Recorded after the rebind and under a fresh borrow, because the
@@ -2094,26 +2094,26 @@ namespace bcp::flux
     }
 
     void Socket::BindTagWindow(uint32_t slot, const common::crypto::SessionKey& session,
-                                uint8_t theirLane, uint32_t baseStep) noexcept
+                                uint8_t theirNonceLane, uint32_t baseStep) noexcept
     {
         for (uint32_t i = 0; i < 3; ++i)
         {
             // A failed bind narrows the window instead of failing the session; a
             // move outside what remains falls back to a re-handshake.
-            (void)peers_.BindTag(slot, DerivePeerTag(session, theirLane, baseStep + i));
+            (void)peers_.BindTag(slot, DerivePeerTag(session, theirNonceLane, baseStep + i));
         }
     }
 
     void Socket::SlideTagWindow(uint32_t slot, const common::crypto::SessionKey& session,
-                                 uint8_t theirLane, uint32_t oldBase, uint32_t newBase) noexcept
+                                 uint8_t theirNonceLane, uint32_t oldBase, uint32_t newBase) noexcept
     {
         if (newBase <= oldBase)
             return;   // same-tag move (NAT rebind): the window already covers it
 
         for (uint32_t s = oldBase; s < newBase; ++s)
-            (void)peers_.UnbindTag(slot, DerivePeerTag(session, theirLane, s));
+            (void)peers_.UnbindTag(slot, DerivePeerTag(session, theirNonceLane, s));
         for (uint32_t s = oldBase + 3; s <= newBase + 2; ++s)
-            (void)peers_.BindTag(slot, DerivePeerTag(session, theirLane, s));
+            (void)peers_.BindTag(slot, DerivePeerTag(session, theirNonceLane, s));
     }
 
     // --- Handshake ---
@@ -2434,7 +2434,7 @@ namespace bcp::flux
             // bound, they pile up in the shared tag index and eventually starve
             // every peer's migration.
             (void)peers_.UnbindTags(slot);
-            BindTagWindow(slot, tagSession, LaneBetween(pk, mine.publicKey), 0);
+            BindTagWindow(slot, tagSession, NonceLaneBetween(pk, mine.publicKey), 0);
         }
         common::crypto::Wipe(tagSession.data(), tagSession.size());
 
@@ -2584,7 +2584,7 @@ namespace bcp::flux
         // Handle scope closed: bind the responder's tag window so its future
         // moves are recognizable from the first packet off a new address.
         if (migration_)
-            BindTagWindow(slot, session, LaneBetween(pk, mine.publicKey), 0);
+            BindTagWindow(slot, session, NonceLaneBetween(pk, mine.publicKey), 0);
         common::crypto::Wipe(session.data(), session.size());
 
         FlushPending(from);
@@ -2607,13 +2607,13 @@ namespace bcp::flux
         // in flight under the interim key keep opening while the flows, their
         // sequences and the congestion state carry straight on.
         const bool fromKnock = peer.knockActive;
-        const uint8_t priorLane = peer.lane;
+        const uint8_t priorNonceLane = peer.nonceLane;
         common::crypto::SessionKey priorSession   = peer.session;
         common::crypto::SessionKey priorHeaderKey = peer.headerKey;
         common::crypto::SessionKey priorMacKey    = peer.macKey;
 
         peer.theirPk = theirPk;
-        peer.lane    = LaneBetween(mine.publicKey, theirPk);
+        peer.nonceLane    = NonceLaneBetween(mine.publicKey, theirPk);
         DeriveSessionInto(peer.session, peer.resumeRoot, mine.secretKey, theirPk,
                           myEphSk, theirEphPk, transcript, transcriptLen);
         // Split off the counter-masking key and the MAC-only key, under
@@ -2636,7 +2636,7 @@ namespace bcp::flux
             // The interim key becomes the previous link, so the trial open
             // carries whatever the peer sealed before it learned of this one.
             peer.prevSession   = priorSession;
-            peer.prevLane      = priorLane;
+            peer.prevNonceLane      = priorNonceLane;
             peer.prevHeaderKey = priorHeaderKey;
             peer.prevMacKey    = priorMacKey;
             peer.rotationConfirmed = false;
@@ -2683,7 +2683,7 @@ namespace bcp::flux
             peer.grantSendPending  = true;
             peer.grantSentAtMicros = 0;   // send at the next tick, not one RTO later
         }
-        peer.myTag        = DerivePeerTag(peer.session, peer.lane, 0);
+        peer.myTag        = DerivePeerTag(peer.session, peer.nonceLane, 0);
         peer.state        = HandshakeState::ESTABLISHED;
         // The acknowledgement silence clock starts here, so a peer that never
         // acknowledges anything still has a defined death, measured from the
@@ -2698,7 +2698,7 @@ namespace bcp::flux
         // reaches it, up to a round trip away. They are wiped when its first
         // packet under the new generation arrives.
         peer.prevSession   = peer.session;
-        peer.prevLane      = peer.lane;
+        peer.prevNonceLane      = peer.nonceLane;
         peer.prevHeaderKey = peer.headerKey;
         peer.prevMacKey    = peer.macKey;
 
@@ -2723,7 +2723,7 @@ namespace bcp::flux
         peer.sendCounter  = 0;
         peer.myTagStep    = 0;
         peer.theirTagStep = 0;
-        peer.myTag        = DerivePeerTag(peer.session, peer.lane, 0);
+        peer.myTag        = DerivePeerTag(peer.session, peer.nonceLane, 0);
 
         peer.keyGeneration      = static_cast<uint8_t>(peer.keyGeneration + 1);
         peer.rotationConfirmed  = false;
@@ -3414,7 +3414,7 @@ namespace bcp::flux
                 if (!peer || !peer->IsValid()) continue;
 
                 ++peer->myTagStep;
-                peer->myTag = DerivePeerTag(peer->session, peer->lane, peer->myTagStep);
+                peer->myTag = DerivePeerTag(peer->session, peer->nonceLane, peer->myTagStep);
                 ++rotated;
             }
         }

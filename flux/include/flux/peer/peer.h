@@ -51,26 +51,32 @@ namespace bcp::flux
         common::crypto::SessionKey session;   ///< DH(our secret, theirPk) through the KDF,
                                               ///< salted per handshake
 
-        /** Which half of the nonce space this side sends in, 0 or 1. Settled
-            when the session key is installed, by comparing the two public
-            keys, and then never recomputed: both ends must agree for the
-            lifetime of the key, and rotating this socket's identity would
-            otherwise move a running session to the other lane and collide
-            two counters under one key. */
-        uint8_t                    lane;
+        /** Which half of the nonce space this side sends in, 0 or 1, and what
+            PeerSendMaterials carries to the seal. The two ends share one key
+            and count independently, so without the split they would reuse
+            nonces. Settled when the session key is installed, by comparing
+            the two public keys, and never recomputed after: both ends must
+            agree for the lifetime of the key, and rotating this socket's
+            identity would otherwise move a running session to the other half
+            and collide two counters under one key.
 
-        /** The lane that went with prevSession. Usually the same as lane, and
-            a separate field for the one case where it is not: an interim
-            opener key is agreed against whichever of this socket's keys the
-            opener named, and the session that replaces it is agreed against
-            the key the handshake announced. When those differ, so do the two
-            lanes, and a packet still in flight under the interim key has to
-            be opened with the lane it was sealed under or not at all. */
-        uint8_t                    prevLane;
+            Nothing to do with the poll lanes in ReadyLanes, which decide
+            which thread drains a peer and so its delivery order. Those are
+            keyed on the peer's slot index and never move. */
+        uint8_t                    nonceLane;
+
+        /** The half that went with prevSession. Usually the same as
+            nonceLane, and a separate field for the one case where it is not:
+            an interim opener key is agreed against whichever of this socket's
+            keys the opener named, and the session that replaces it against
+            the key the handshake announced. When those differ so do the two
+            halves, and a packet still in flight under the interim key has to
+            be opened with the one it was sealed under or not at all. */
+        uint8_t                    prevNonceLane;
 
         /** The half the remote sends in, which is whichever this side is not. */
-        [[nodiscard]] uint8_t TheirLane() const noexcept { return lane == 0 ? 1 : 0; }
-        [[nodiscard]] uint8_t TheirPrevLane() const noexcept { return prevLane == 0 ? 1 : 0; }
+        [[nodiscard]] uint8_t TheirNonceLane() const noexcept { return nonceLane == 0 ? 1 : 0; }
+        [[nodiscard]] uint8_t TheirPrevNonceLane() const noexcept { return prevNonceLane == 0 ? 1 : 0; }
 
         /** Masks the counter field of every secure packet, so the counter is
             not readable on the wire. Split from `session` rather than reused:
