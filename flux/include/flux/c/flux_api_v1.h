@@ -258,7 +258,7 @@ typedef uint32_t FluxEventBits;
 
 /* One message, as Messages reports it. bytes aims into the socket's receive
    pool: real memory, read-only, valid from the Messages call that produced it
-   until ReleasePacket frees the packet it lives in — writing through it is
+   until ReleasePacket frees the packet it lives in. Writing through it is
    undefined, and copying out is the caller's business if it wants the bytes to
    outlive the packet. */
 typedef struct {
@@ -573,8 +573,8 @@ typedef struct {
        (one datagram can carry several), reports the sender, the flow and the
        part through info, and returns the message count. One packet costs one
        lock however much is asked. The bytes pointers aim into the receive
-       pool and stay valid until that packet's ReleasePacket — holding a
-       packet is legal and cheap, it is one pool slot.
+       pool and stay valid until that packet's ReleasePacket. Holding a
+       packet is legal and cheap, because it is one pool slot.
 
        Every packet number Poll returned owes exactly one ReleasePacket. A
        stale or repeated release is refused with NOT_FOUND and frees nothing,
@@ -605,9 +605,9 @@ typedef struct {
        to the puts on two threads at once is a use-after-free the number
        scheme does not, and is not meant to, catch.
 
-       BuildPacket starts one aimed by the caller; Reply starts one already
+       BuildPacket starts one aimed by the caller. Reply starts one already
        aimed at the sender of a received packet, so a reply never rebuilds the
-       pairing by hand — hand it a packet number Poll returned and not yet
+       pairing by hand. Hand it a packet number Poll returned and not yet
        released. Both hand back a number, or FLUX_NONE when no builder was
        free, which is what packetBuilders bounds.
 
