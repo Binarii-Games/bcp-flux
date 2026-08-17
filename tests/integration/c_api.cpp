@@ -36,7 +36,7 @@ namespace
     // Drives both sockets one round and returns how many u32 payloads the right
     // one delivered, reading them the long way a binding has to.
     uint32_t PumpOnce(const FluxApiV1* api, FluxSocket* left, FluxSocket* right,
-                      uint32_t* lastValue)
+                      uint32_t* lastValue, uint32_t* knockedCount = nullptr)
     {
         api->Flush(left);
         api->Flush(right);
@@ -52,6 +52,9 @@ namespace
             const uint32_t got = api->Poll(both[side], &lane, packets, 8);
             for (uint32_t i = 0; i < got; ++i)
             {
+                if (side == 1 && knockedCount != nullptr
+                    && api->PacketIsKnock(both[side], packets[i]) != 0)
+                    ++(*knockedCount);
                 FluxMessage messages[8];
                 const uint32_t count =
                     api->Messages(both[side], packets[i], messages, 8, nullptr);
@@ -262,10 +265,15 @@ static void the_opener_reports_its_own_limits()
 
     uint32_t value = 0;
     uint32_t delivered = 0;
+    uint32_t knocked = 0;
     for (int round = 0; round < 20 && delivered == 0; ++round)
-        delivered += PumpOnce(api, client, server, &value);
+        delivered += PumpOnce(api, client, server, &value, &knocked);
     CHECK(delivered >= 1);
     CHECK(value == 4242u);
+
+    // It rode the opener, before the address was proven, which is the one
+    // thing a caller has to know to keep what must not repeat off that path.
+    CHECK(knocked >= 1);
 
     // Full once the session has replaced the opener.
     for (int round = 0; round < 300 && api->PeerReady(client, peer) == 0; ++round)
