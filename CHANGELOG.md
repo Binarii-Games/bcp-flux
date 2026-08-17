@@ -55,6 +55,20 @@ security fix is allowed to change either.
   whose pinned certificate no longer matches, which is its cue to fetch a fresh
   one. `ForgetPreviousIdentities` wipes the retained keys outright, for a leak.
 
+- The C API reaches everything above. Certificates and identity cross as
+  fixed-size byte buffers rather than handles, because a server has to persist
+  its identity and a handle could never leave the process, and the private form
+  is byte for byte the identity file. Added: identity generation and the
+  certificate derived from it, loading and revoking a certificate, rotating an
+  identity and forgetting the previous ones, rotating a session key, naming the
+  identity expected at an address so a first send can carry data, asking what
+  the next packet to a peer may carry, reading whether a delivered packet rode a
+  first flight, and collecting and presenting a resume note. `LayoutCheck`
+  reports the knock config block so a binding can still prove its own structs,
+  and three event bits the enum was missing are there. `FLUX_SAFE_PAYLOAD_BYTES`
+  and `FLUX_RESUME_NOTE_BYTES` are checked against the C++ constants at build
+  time, so the two cannot drift apart unnoticed.
+
 ## [0.4.0] - 2026-08-11
 
 ### Added

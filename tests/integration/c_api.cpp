@@ -1,0 +1,463 @@
+// The C ABI, driven the way a binding drives it: through the table and nothing
+// else. No flux C++ type appears below the include.
+//
+// Two things here cannot be caught any other way. A binding retypes every
+// struct by hand, so LayoutCheck's answers have to agree with what the header
+// actually describes, and a disagreement is silent corruption rather than a
+// compile error. And the table is a list of function pointers filled in by
+// hand, so one entry in the wrong position compiles perfectly and calls the
+// wrong function forever. Only calling each one and checking what it did will
+// find that.
+//
+// Not covered: that the header parses as C. The test glob is *.cpp, so this
+// translation unit is C++ and proves nothing about C compilation.
+#include <flux/c/flux_api_v1.h>
+
+#include "harness.h"
+
+#include <chrono>
+#include <cstddef>
+#include <cstring>
+#include <thread>
+
+namespace
+{
+    const FluxApiV1* Api()
+    {
+        return static_cast<const FluxApiV1*>(flux_get_api(1));
+    }
+
+    void FillTag(uint8_t* tag, uint8_t seed)
+    {
+        std::memset(tag, 0, FLUX_TAG_SIZE);
+        tag[0] = seed;
+    }
+
+    // Drives both sockets one round and returns how many u32 payloads the right
+    // one delivered, reading them the long way a binding has to.
+    uint32_t PumpOnce(const FluxApiV1* api, FluxSocket* left, FluxSocket* right,
+                      uint32_t* lastValue)
+    {
+        api->Flush(left);
+        api->Flush(right);
+        api->Update(left);
+        api->Update(right);
+
+        uint32_t delivered = 0;
+        FluxSocket* both[2] = { left, right };
+        for (int side = 0; side < 2; ++side)
+        {
+            uint32_t lane = 0;
+            FluxPacket packets[8];
+            const uint32_t got = api->Poll(both[side], &lane, packets, 8);
+            for (uint32_t i = 0; i < got; ++i)
+            {
+                FluxMessage messages[8];
+                const uint32_t count =
+                    api->Messages(both[side], packets[i], messages, 8, nullptr);
+                for (uint32_t m = 0; m < count; ++m)
+                {
+                    if (side == 1 && messages[m].length >= 4)
+                    {
+                        uint32_t value = 0;
+                        for (int b = 0; b < 4; ++b)
+                            value |= static_cast<uint32_t>(messages[m].bytes[b]) << (8 * b);
+                        if (lastValue != nullptr) *lastValue = value;
+                        ++delivered;
+                    }
+                }
+                (void)api->ReleasePacket(both[side], packets[i]);
+            }
+            api->EndPoll(both[side], lane);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        return delivered;
+    }
+}
+
+// What a binding checks before it trusts anything: that the library's idea of
+// every struct matches the one the binding hand-wrote. A mismatch here is why
+// LayoutCheck exists at all.
+static void the_layout_a_binding_hand_writes_agrees_with_the_library()
+{
+    const FluxApiV1* api = Api();
+    CHECK(api != nullptr);
+    if (api == nullptr) return;
+    CHECK(api->version == 1);
+
+    FluxLayout layout;
+    std::memset(&layout, 0, sizeof(layout));
+    api->LayoutCheck(&layout);
+
+    CHECK(layout.sizeofConfig         == sizeof(FluxConfig));
+    CHECK(layout.sizeofFlowsConfig    == sizeof(FluxFlowsConfig));
+    CHECK(layout.sizeofTimersConfig   == sizeof(FluxTimersConfig));
+    CHECK(layout.sizeofLivenessConfig == sizeof(FluxLivenessConfig));
+    CHECK(layout.sizeofEventsConfig   == sizeof(FluxEventsConfig));
+    CHECK(layout.sizeofKnockConfig    == sizeof(FluxKnockConfig));
+    CHECK(layout.sizeofTransferView   == sizeof(FluxTransferView));
+    CHECK(layout.sizeofApiTable       == sizeof(FluxApiV1));
+
+    CHECK(layout.offsetofConfigFlows    == offsetof(FluxConfig, flows));
+    CHECK(layout.offsetofConfigLiveness == offsetof(FluxConfig, liveness));
+    CHECK(layout.offsetofConfigEvents   == offsetof(FluxConfig, events));
+    CHECK(layout.offsetofConfigTimers   == offsetof(FluxConfig, timers));
+    CHECK(layout.offsetofConfigPort     == offsetof(FluxConfig, port));
+    CHECK(layout.offsetofConfigKnock    == offsetof(FluxConfig, knock));
+}
+
+// Identity and certificate bytes cross as fixed-size buffers, so a binding can
+// mint an identity, derive the certificate to hand out, and persist both
+// without ever holding a flux object.
+static void identities_and_certificates_cross_as_plain_bytes()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    uint8_t tag[FLUX_TAG_SIZE];
+    FillTag(tag, 0xF1);
+
+    uint8_t identity[FLUX_IDENTITY_SIZE];
+    uint8_t cert[FLUX_CERT_SIZE];
+    CHECK(api->IdentityGenerate(tag, identity) == FLUX_OK);
+    CHECK(api->IdentityCertificate(identity, cert) == FLUX_OK);
+
+    // The certificate is version, key, tag, in that order, which is what a
+    // binding relies on when it stores or ships one.
+    CHECK(cert[0] == 1);
+    CHECK(std::memcmp(cert + 1 + 32, tag, FLUX_TAG_SIZE) == 0);
+
+    // Two generations for the same tag are different keypairs, which is what
+    // makes RotateIdentity mean anything.
+    uint8_t second[FLUX_IDENTITY_SIZE];
+    CHECK(api->IdentityGenerate(tag, second) == FLUX_OK);
+    CHECK(std::memcmp(second, identity, FLUX_IDENTITY_SIZE) != 0);
+
+    // Null arguments are refused rather than dereferenced.
+    CHECK(api->IdentityGenerate(nullptr, identity) == FLUX_ERR_INVALID_PARAM);
+    CHECK(api->IdentityGenerate(tag, nullptr) == FLUX_ERR_INVALID_PARAM);
+    CHECK(api->IdentityCertificate(nullptr, cert) == FLUX_ERR_INVALID_PARAM);
+}
+
+// Each of the identity and certificate entries does its own job. A table with
+// two of these transposed would still compile and still run.
+static void every_identity_entry_calls_what_it_says()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    uint8_t serverTag[FLUX_TAG_SIZE];
+    uint8_t otherTag[FLUX_TAG_SIZE];
+    FillTag(serverTag, 0xF2);
+    FillTag(otherTag, 0xF3);
+
+    uint8_t serverIdentity[FLUX_IDENTITY_SIZE];
+    uint8_t rotated[FLUX_IDENTITY_SIZE];
+    uint8_t strayIdentity[FLUX_IDENTITY_SIZE];
+    uint8_t serverCert[FLUX_CERT_SIZE];
+    CHECK(api->IdentityGenerate(serverTag, serverIdentity) == FLUX_OK);
+    CHECK(api->IdentityGenerate(serverTag, rotated) == FLUX_OK);
+    CHECK(api->IdentityGenerate(otherTag, strayIdentity) == FLUX_OK);
+    CHECK(api->IdentityCertificate(serverIdentity, serverCert) == FLUX_OK);
+
+    FluxConfig config;
+    api->DefaultConfig(&config);
+    config.port = 9960;
+    config.maxPeers = 8;
+    config.pendingPacketCount = 16;
+    config.trustedCertCount = 4;
+    config.identity = serverIdentity;
+    config.identityHistory = 2;
+
+    FluxSocket* socket = api->CreateSocket();
+    CHECK(socket != nullptr);
+    CHECK(api->InitSocket(socket, &config) == FLUX_OK);
+
+    // IdentityTag reports the configured tag, and 0 for an anonymous socket.
+    uint8_t readBack[FLUX_TAG_SIZE];
+    CHECK(api->IdentityTag(socket, readBack) == FLUX_TAG_SIZE);
+    CHECK(std::memcmp(readBack, serverTag, FLUX_TAG_SIZE) == 0);
+
+    // Rotation keeps the tag and refuses one that would change it.
+    CHECK(api->RotateIdentity(socket, rotated) == FLUX_OK);
+    CHECK(api->IdentityTag(socket, readBack) == FLUX_TAG_SIZE);
+    CHECK(std::memcmp(readBack, serverTag, FLUX_TAG_SIZE) == 0);
+    CHECK(api->RotateIdentity(socket, strayIdentity) == FLUX_ERR_INVALID_PARAM);
+    api->ForgetPreviousIdentities(socket);
+
+    // Loading and withdrawing a pinned certificate, and the answer for a tag
+    // that was never pinned.
+    CHECK(api->LoadCertificate(socket, serverCert) == FLUX_OK);
+    CHECK(api->RemoveCertificate(socket, serverTag) == FLUX_OK);
+    CHECK(api->RemoveCertificate(socket, otherTag) == FLUX_ERR_NOT_FOUND);
+
+    api->DestroySocket(socket);
+
+    // A history past what the transport holds is refused at Init.
+    FluxConfig bad;
+    api->DefaultConfig(&bad);
+    bad.port = 9961;
+    bad.maxPeers = 4;
+    bad.pendingPacketCount = 8;
+    bad.identityHistory = 99;
+    FluxSocket* refused = api->CreateSocket();
+    CHECK(api->InitSocket(refused, &bad) != FLUX_OK);
+    api->DestroySocket(refused);
+}
+
+// The opener, the size a caller may put, and the marker on what arrived. These
+// are the entries a binding cannot work without: without MaxPayload it can only
+// guess at its limit, and guessing wrong is a hard refusal.
+static void the_opener_reports_its_own_limits()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    uint8_t serverTag[FLUX_TAG_SIZE];
+    FillTag(serverTag, 0xF4);
+    uint8_t serverIdentity[FLUX_IDENTITY_SIZE];
+    uint8_t serverCert[FLUX_CERT_SIZE];
+    CHECK(api->IdentityGenerate(serverTag, serverIdentity) == FLUX_OK);
+    CHECK(api->IdentityCertificate(serverIdentity, serverCert) == FLUX_OK);
+
+    FluxConfig serverConfig;
+    api->DefaultConfig(&serverConfig);
+    serverConfig.port = 9963;
+    serverConfig.maxPeers = 8;
+    serverConfig.pendingPacketCount = 16;
+    serverConfig.identity = serverIdentity;
+    FluxSocket* server = api->CreateSocket();
+    CHECK(api->InitSocket(server, &serverConfig) == FLUX_OK);
+
+    FluxConfig clientConfig;
+    api->DefaultConfig(&clientConfig);
+    clientConfig.port = 9962;
+    clientConfig.maxPeers = 8;
+    clientConfig.pendingPacketCount = 16;
+    clientConfig.trustedCertCount = 4;
+    clientConfig.knock.enable = 1;
+    FluxSocket* client = api->CreateSocket();
+    CHECK(api->InitSocket(client, &clientConfig) == FLUX_OK);
+    CHECK(api->LoadCertificate(client, serverCert) == FLUX_OK);
+
+    // PeerExpecting names the identity, which is what arms the opener.
+    const FluxPeer peer = api->PeerExpecting(client, "::1", 9963, serverTag);
+    CHECK(peer != FLUX_NONE);
+
+    // Smaller while the first packet still has to open a session, and never
+    // below the figure that always fits.
+    const uint32_t opening = api->MaxPayload(client, peer);
+    CHECK(opening > 0);
+    CHECK(opening >= FLUX_SAFE_PAYLOAD_BYTES);
+
+    // A peer that does not exist reports nothing rather than guessing.
+    CHECK(api->MaxPayload(client, FLUX_NONE) == 0);
+
+    // Send the always-safe size and the far side takes it.
+    FluxPacket packet = api->BuildPacket(client);
+    CHECK(packet != FLUX_NONE);
+    CHECK(api->NoFlow(client, packet) == FLUX_OK);
+    CHECK(api->PutU32(client, packet, 4242u) == FLUX_OK);
+    CHECK(api->Send(client, packet, peer) == FLUX_OK);
+
+    uint32_t value = 0;
+    uint32_t delivered = 0;
+    for (int round = 0; round < 20 && delivered == 0; ++round)
+        delivered += PumpOnce(api, client, server, &value);
+    CHECK(delivered >= 1);
+    CHECK(value == 4242u);
+
+    // Full once the session has replaced the opener.
+    for (int round = 0; round < 300 && api->PeerReady(client, peer) == 0; ++round)
+        (void)PumpOnce(api, client, server, nullptr);
+    CHECK(api->PeerReady(client, peer) != 0);
+    CHECK(api->MaxPayload(client, peer) > opening);
+
+    api->DestroySocket(client);
+    api->DestroySocket(server);
+}
+
+// Resumption through the C table alone: collect a note, let the process go,
+// and hand it back. The whole point is that the second life needs no handshake,
+// so RotateKeys is used to show the session is genuinely live.
+static void a_note_collected_through_the_table_resumes_a_session()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    uint8_t serverTag[FLUX_TAG_SIZE];
+    uint8_t clientTag[FLUX_TAG_SIZE];
+    FillTag(serverTag, 0xF5);
+    FillTag(clientTag, 0xF6);
+
+    uint8_t serverIdentity[FLUX_IDENTITY_SIZE];
+    uint8_t clientIdentity[FLUX_IDENTITY_SIZE];
+    uint8_t serverCert[FLUX_CERT_SIZE];
+    CHECK(api->IdentityGenerate(serverTag, serverIdentity) == FLUX_OK);
+    CHECK(api->IdentityGenerate(clientTag, clientIdentity) == FLUX_OK);
+    CHECK(api->IdentityCertificate(serverIdentity, serverCert) == FLUX_OK);
+
+    FluxConfig serverConfig;
+    api->DefaultConfig(&serverConfig);
+    serverConfig.port = 9965;
+    serverConfig.maxPeers = 8;
+    serverConfig.pendingPacketCount = 16;
+    serverConfig.identity = serverIdentity;
+    serverConfig.trustedCertCount = 4;
+    serverConfig.knock.enable = 1;
+    FluxSocket* server = api->CreateSocket();
+    CHECK(api->InitSocket(server, &serverConfig) == FLUX_OK);
+
+    uint8_t note[FLUX_RESUME_NOTE_BYTES];
+    uint32_t noteLen = 0;
+    {
+        FluxConfig clientConfig;
+        api->DefaultConfig(&clientConfig);
+        clientConfig.port = 9964;
+        clientConfig.maxPeers = 8;
+        clientConfig.pendingPacketCount = 16;
+        clientConfig.identity = clientIdentity;
+        clientConfig.trustedCertCount = 4;
+        clientConfig.knock.enable = 1;
+        clientConfig.keepResumeNotes = 1;
+        FluxSocket* client = api->CreateSocket();
+        CHECK(api->InitSocket(client, &clientConfig) == FLUX_OK);
+        CHECK(api->LoadCertificate(client, serverCert) == FLUX_OK);
+
+        const FluxPeer peer = api->PeerExpecting(client, "::1", 9965, serverTag);
+        CHECK(peer != FLUX_NONE);
+
+        for (int round = 0; round < 400 && noteLen == 0; ++round)
+        {
+            // A note only goes to a peer that has proven it holds its key.
+            if (round % 20 == 0)
+            {
+                FluxPacket packet = api->BuildPacket(client);
+                if (packet != FLUX_NONE)
+                {
+                    (void)api->NoFlow(client, packet);
+                    (void)api->PutU32(client, packet, 1u);
+                    (void)api->Send(client, packet, peer);
+                }
+            }
+            (void)PumpOnce(api, client, server, nullptr);
+            noteLen = api->PeerResumeNote(client, peer, note, sizeof(note));
+        }
+        CHECK(noteLen == FLUX_RESUME_NOTE_BYTES);
+        api->DestroySocket(client);
+    }
+
+    // Second life, same address, presenting the note.
+    FluxConfig secondConfig;
+    api->DefaultConfig(&secondConfig);
+    secondConfig.port = 9964;
+    secondConfig.maxPeers = 8;
+    secondConfig.pendingPacketCount = 16;
+    secondConfig.identity = clientIdentity;
+    secondConfig.trustedCertCount = 4;
+    secondConfig.knock.enable = 1;
+    FluxSocket* second = api->CreateSocket();
+    CHECK(api->InitSocket(second, &secondConfig) == FLUX_OK);
+    CHECK(api->LoadCertificate(second, serverCert) == FLUX_OK);
+
+    const FluxPeer resumed = api->PeerResuming(second, "::1", 9965, serverTag, note);
+    CHECK(resumed != FLUX_NONE);
+
+    FluxPacket packet = api->BuildPacket(second);
+    CHECK(packet != FLUX_NONE);
+    CHECK(api->NoFlow(second, packet) == FLUX_OK);
+    CHECK(api->PutU32(second, packet, 7777u) == FLUX_OK);
+    CHECK(api->Send(second, packet, resumed) == FLUX_OK);
+
+    uint32_t value = 0;
+    uint32_t delivered = 0;
+    for (int round = 0; round < 20 && delivered == 0; ++round)
+        delivered += PumpOnce(api, second, server, &value);
+
+    // Through, on a session that never handshook. Before resumption existed
+    // this would have waited for the server to evict its stale entry.
+    CHECK(delivered >= 1);
+    CHECK(value == 7777u);
+
+    // A note refused for its contents costs nothing, and a null one is refused
+    // outright rather than sent.
+    CHECK(api->PeerResuming(second, "::1", 9965, serverTag, nullptr) == FLUX_NONE);
+
+    api->DestroySocket(second);
+    api->DestroySocket(server);
+}
+
+// RotateKeys advances one peer's session key, and reports the two refusals its
+// contract names rather than doing it anyway.
+static void rotating_a_session_key_reports_its_refusals()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    uint8_t serverTag[FLUX_TAG_SIZE];
+    FillTag(serverTag, 0xF7);
+    uint8_t serverIdentity[FLUX_IDENTITY_SIZE];
+    uint8_t serverCert[FLUX_CERT_SIZE];
+    CHECK(api->IdentityGenerate(serverTag, serverIdentity) == FLUX_OK);
+    CHECK(api->IdentityCertificate(serverIdentity, serverCert) == FLUX_OK);
+
+    FluxConfig serverConfig;
+    api->DefaultConfig(&serverConfig);
+    serverConfig.port = 9967;
+    serverConfig.maxPeers = 8;
+    serverConfig.pendingPacketCount = 16;
+    serverConfig.identity = serverIdentity;
+    FluxSocket* server = api->CreateSocket();
+    CHECK(api->InitSocket(server, &serverConfig) == FLUX_OK);
+
+    FluxConfig clientConfig;
+    api->DefaultConfig(&clientConfig);
+    clientConfig.port = 9966;
+    clientConfig.maxPeers = 8;
+    clientConfig.pendingPacketCount = 16;
+    clientConfig.trustedCertCount = 4;
+    FluxSocket* client = api->CreateSocket();
+    CHECK(api->InitSocket(client, &clientConfig) == FLUX_OK);
+    CHECK(api->LoadCertificate(client, serverCert) == FLUX_OK);
+
+    // A peer nobody has heard of has no chain to advance.
+    CHECK(api->RotateKeys(client, FLUX_NONE) == FLUX_ERR_NOT_FOUND);
+
+    const FluxPeer peer = api->Peer(client, "::1", 9967);
+    CHECK(peer != FLUX_NONE);
+    for (int round = 0; round < 300 && api->PeerReady(client, peer) == 0; ++round)
+        (void)PumpOnce(api, client, server, nullptr);
+    CHECK(api->PeerReady(client, peer) != 0);
+
+    // Traffic has to cross before the chain can move, and once it can, a second
+    // rotation before the first is confirmed is refused.
+    bool rotated = false;
+    for (int round = 0; round < 80 && !rotated; ++round)
+    {
+        FluxPacket packet = api->BuildPacket(client);
+        if (packet != FLUX_NONE)
+        {
+            (void)api->NoFlow(client, packet);
+            (void)api->PutU32(client, packet, 5u);
+            (void)api->Send(client, packet, peer);
+        }
+        (void)PumpOnce(api, client, server, nullptr);
+        rotated = api->RotateKeys(client, peer) == FLUX_OK;
+    }
+    CHECK(rotated);
+    CHECK(api->RotateKeys(client, peer) == FLUX_ERR_ALREADY_PENDING);
+
+    api->DestroySocket(client);
+    api->DestroySocket(server);
+}
+
+int main()
+{
+    the_layout_a_binding_hand_writes_agrees_with_the_library();
+    identities_and_certificates_cross_as_plain_bytes();
+    every_identity_entry_calls_what_it_says();
+    the_opener_reports_its_own_limits();
+    a_note_collected_through_the_table_resumes_a_session();
+    rotating_a_session_key_reports_its_refusals();
+    return test::report();
+}

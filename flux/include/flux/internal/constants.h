@@ -254,10 +254,6 @@ namespace bcp::flux::internal
         ejected unbuffered until its cookie echo lands. */
     static constexpr uint32_t KNOCK_UNPROVEN_PACKET_LIMIT_DEFAULT = 256;
 
-    /** Round trips (of the estimate at knock time, with a floor) an unproven
-        peer may exist before the tick evicts it. */
-    static constexpr uint64_t KNOCK_PROVE_TIMEOUT_MICROS = 3'000'000;
-
     // --- Flow ---
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
 
