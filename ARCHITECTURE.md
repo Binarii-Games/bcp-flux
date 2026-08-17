@@ -60,7 +60,7 @@ Flux is a general-purpose transport in the same class as QUIC. What it commits t
 - Mixed reliability on one socket. Reliable ordered, reliable unordered,
   unreliable, and bulk flows run side by side, and a whole-buffer transfer runs
   beside them.
-- A session that follows the peer rather than its address, so a NAT rebind or a
+- A session keyed to the peer, so a NAT rebind or a
   VPN reconnect continues with no re-handshake, and nothing on the wire relinks
   the peer across the change.
 - Encryption by default, with the same framing whether a packet is encrypted,
@@ -77,14 +77,13 @@ What it leaves to someone else:
 - The run loop. Flux owns no thread. The application calls `Update`, `Poll`, and
   `Flush` on whatever threads and cadence it chooses.
 - Certificate policy. Flux stores an opaque identity tag and proves possession of
-  the matching key. It never parses the tag, and where trust comes from is the
-  caller's decision.
+  the matching key. It never parses the tag. Trust is the caller's decision.
 - A frozen wire format. Before 1.0 the format and the API can change between
   versions.
 
 ## The library set
 
-| Library | Namespace | What it is | Depends on |
+| Library | Namespace | Meaning | Depends on |
 |---|---|---|---|
 | `common` | `bcp::common` | general-purpose systems primitives | monocypher (vendored) |
 | `flux` | `bcp::flux` | the transport | `common` |
@@ -101,10 +100,10 @@ one of its consumers. A type that only makes sense to a transport belongs in
 
 `common` is meant to carry nothing that only makes sense to a transport, and
 three places currently break that: the error enum names transport conditions,
-`platform.h` pulls in the OS socket headers, and `BytesWriter` carries a pointer
-to a packet length field. They are listed here rather than quietly excepted,
-because a rule with unlisted exceptions is not a rule. Those exceptions are the
-whole list, and nothing new joins it.
+`platform.h` pulls in the OS socket headers, and `BytesWriter` carries a
+pointer to a packet length field. They are listed here, because a rule with
+unlisted exceptions has no force. Those exceptions are the whole list, and
+nothing new joins it.
 
 ### Conventions every library obeys
 
@@ -135,17 +134,18 @@ whole list, and nothing new joins it.
   timeouts or measurement.
 - **Collections.** Two structures, and they are the whole set. `SlotPool` is an
   index free-list over one contiguous block plus a per-slot reader/writer lock.
-  The free-list is lock-free; the per-slot lock is a blocking spin with no try
-  variant and no timeout, so a caller that takes one cannot decline to wait. The free-list is sharded across up to sixteen rings so
-  concurrent acquires and releases spread over independent cache lines. Slots
+  The free-list is lock-free. The per-slot lock is a blocking spin with no try
+  variant and no timeout, so a caller that takes one cannot decline to wait.
+  The free-list is sharded across up to sixteen rings so concurrent acquires
+  and releases spread over independent cache lines. Slots
   are fixed-stride and never move, so an index is a stable name for a piece of
   memory. The pool runs no constructors and zeroes only at `Init`, so anything
   stored in one is trivially copyable and whoever leases a slot writes every
   field. `FifoQueue<T>` is a lock-free bounded MPMC queue.
 - **Byte cursors.** `BytesWriter` and `BytesReader` are the sanctioned way to
   move a multi-byte value into or out of a buffer. Both bounds-check every
-  access, and both encode little-endian by explicit shift, which is what makes
-  the encoding independent of host byte order. Never `memcpy` a scalar through
+  access, and both encode little-endian by explicit shift, so the encoding is
+  independent of host byte order. Never `memcpy` a scalar through
   these buffers, and never overlay a struct on them.
 - **Crypto.** X25519 keypairs and Diffie-Hellman, a blake2b KDF and keyed MAC,
   XChaCha20-Poly1305 AEAD, ids as `blake2b(pubkey)`, constant-time comparison,
@@ -165,15 +165,14 @@ address migration.
 Its entities are peers and sockets. There is no concept of a node, a route, or
 a service name, and naming and routing belong to a layer above. The one
 exception is `Address::From`, which will resolve a hostname through the
-platform's `getaddrinfo` as a convenience for callers that have a name rather
-than a literal. That call blocks and allocates, so it belongs to setup and never
-to a packet path.
+platform's `getaddrinfo` as a convenience for callers that hold a name. That
+call blocks and allocates, so it belongs to setup and never to a packet path.
 
 `Socket` also owns five smaller pieces the sections below refer to without
-introducing: `SocketListener` and `SocketSender`, thin wrappers over the kernel's
-receive and send; `ChallengeGenerator`, the stateless handshake cookie source;
-`IdentityTable`, the keypairs this socket answers on; and `ReplayWindow`, one
-per peer slot.
+introducing. `SocketListener` and `SocketSender` are thin wrappers over the
+kernel's receive and send. `ChallengeGenerator` is the stateless handshake
+cookie source. `IdentityTable` holds the keypairs this socket answers on.
+`ReplayWindow` is one per peer slot.
 
 | Sub-namespace | Holds |
 |---|---|
@@ -198,8 +197,8 @@ Identity comes in three forms, and they are not interchangeable:
   at the moment, and it changes on migration.
 - `BcpId` is `blake2b(publicKey)`, derived at handshake and bound to the peer.
   Either side recomputes it from a presented key and checks the peer owns what
-  it claims, with no registry involved. It follows the key rather than the
-  address, so it is the lookup that survives migration. Its lifetime follows
+  it claims, with no registry involved. It follows the key, so it survives
+  migration. Its lifetime follows
   the keypair: a socket given an identity in `Config` keeps the same id across
   runs, and one that generates its own keeps it only for that process.
 - `PeerTag` is a rotating 4-byte value carried on secure packets, derived
@@ -248,10 +247,10 @@ slot describes its own layout:
 ```
 
 The open batch is the packet a sending association is filling, sized for the
-largest one this socket would put on the wire. It is inline rather than a
-pooled slot so that the association's own lock covers it: finding a pooled slot
-would mean taking the association lock and then the slot's, which is the
-reverse of the order the send path takes everywhere else.
+largest one this socket would put on the wire. It is inline so the
+association's own lock covers it. Finding a pooled slot would mean taking the
+association lock and then the slot's, reversing the order the send path takes
+everywhere else.
 
 #### Transfer
 
@@ -260,11 +259,10 @@ buffers the application owns. The sender hands `SendTransfer` a pointer and a
 length and keeps the memory alive until the outcome comes back. The receiver
 learns of the offer through the `TRANSFER_INCOMING` event and answers it with
 `Allow` and a buffer of the announced size, or with `Reject`. Packet `s`
-belongs at offset `s * stride` and nowhere else, so the interesting work is
-arithmetic rather than buffering: nothing is staged per packet, a retransmit
-is re-read from the sender's buffer, and delivery writes straight into the
-receiver's. That destination is memory the library does not own, which is why
-every bound a sender could influence is checked rather than trusted.
+belongs at offset `s * stride` and nowhere else, so the work is arithmetic.
+Nothing is staged per packet, a retransmit is re-read from the sender's buffer,
+and delivery writes straight into the receiver's. That destination is memory
+the library does not own, so every bound a sender could influence is checked.
 
 A transfer and a bulk flow answer different jobs. A flow carries a stream of
 messages that each need framing and delivery as they arrive, and it retains a
@@ -274,11 +272,10 @@ the per-message framing entirely.
 
 `OutTransfer` and `InTransfer` are the two halves, in their own pools inside
 `TransferTable`, with their window rings (send stamps, acknowledgement bitmap,
-resend marks, placement bitmap) in table-owned blocks beside them. The
-tracking is window sized rather than transfer sized, so a gigabyte and a
-kilobyte need the same state. The window bounds the sequence span above the
-progress cursor rather than the count in flight, because the rings index by
-`seq & (window - 1)` and a sequence a whole window past the cursor would land
+resend marks, placement bitmap) in table-owned blocks beside them. The tracking
+is sized by the window, so a gigabyte and a kilobyte need the same state. The
+window bounds the sequence span above the progress cursor. The rings index by
+`seq & (window - 1)`, so a sequence a whole window past the cursor would land
 on a live entry belonging to an older one.
 
 A transfer spends the same per-peer congestion budget the flows do, through
@@ -300,17 +297,17 @@ stores it, matches it, and surfaces it to the layer above.
 
 #### Identity
 
-The keypair a socket proves its own tag with, and the ones it proved it with
-before. The tag is the durable half and never moves: a rotation replaces the
-key that currently proves it, so peer relationships survive one and only the
-proof is new. A socket that never rotates holds exactly one keypair, which is
-what every socket held before rotation existed.
+A socket holds the keypair it proves its own tag with, plus the keypairs it
+proved it with before. The tag is the durable half and never moves: a rotation
+replaces the key that currently proves it, so peer relationships survive one
+and only the proof is new. A socket that never rotates holds exactly one
+keypair, the same as every socket held before rotation existed.
 
 Each keypair is named by a four-byte id derived from its public half, so a
 first-flight opener can say which key it was encrypted toward. Anyone holding
-the certificate can compute that id, which is exactly who needs to, and it
-says nothing about how often the socket rotates because it comes from the key
-rather than from a counter.
+the certificate can compute that id, and they are the only ones who need it. It
+comes from the key itself, so it says nothing about how often the socket
+rotates.
 
 ### Memory: the pools
 
@@ -374,18 +371,16 @@ All four are move-only, and a moved-from handle is left unusable.
 
 `PacketSlotHandle` is the unit of packet ownership. An invalid index yields a
 failed handle whose `Read()` and `Write()` return `nullptr`. `Detach()` gives
-up ownership and returns the bare index, which is how a reliable body outlives
-the send that wrote it. `PacketSlotWriter` wraps a handle with a byte cursor.
-`PacketSlotReader` borrows one instead of owning it, and walks the messages a
-packet holds one at a time, so it has to be something the packet's owner
-outlives.
+up ownership and returns the bare index, so a reliable body outlives the send
+that wrote it. `PacketSlotWriter` wraps a handle with a byte cursor.
+`PacketSlotReader` borrows one and walks the messages a packet holds one at a
+time, so it has to be something the packet's owner outlives.
 
 `PollCursor` is what `Poll` returns. It borrows the array `Poll` filled and
-drives one reader across every packet in it, which is what lets a caller read
-one flat loop whether the messages arrived one per datagram or packed together.
-It owns the claim on the lane it drained and frees that on destruction, which is
-what keeps one thread the only reader of a peer's traffic for as long as the
-caller is still reading.
+drives one reader across every packet in it, so a caller reads one flat loop
+whether the messages arrived one per datagram or packed together. It owns the
+claim on the lane it drained and frees that on destruction, so one thread stays
+the only reader of a peer's traffic for as long as the caller is still reading.
 
 `PeerHandle` arrives read-locked with the key verified under that lock.
 `RemovePeer` frees a slot only after taking its write lock, so a peer is never
@@ -417,7 +412,7 @@ the packet path and all of them are safe to call concurrently:
 - `Update` runs the tick: retry handshakes, flush owed acks, retransmit, drain
   waiting sends, evict idle peers, reclaim jammed receiving flows. All
   time-based work lives here. One pass runs at a time: while one is in flight,
-  another caller returns immediately instead of running a second pass. The
+  another caller returns immediately. The
   pass takes exclusive peer locks as it walks, so concurrent passes would
   serialize against each other and against the receive path, and a thread that
   skips one loses nothing it was not already getting.
@@ -432,24 +427,24 @@ The rest of the public surface is setup and inspection: `Init`, `Shutdown`,
 
 A send on a flow is packed into a batch and waits for `Flush`, so a caller
 drives all three round its loop and nothing leaves without the last of them.
-There is deliberately no automatic flush. One that fired sometimes would make
-send timing unpredictable and would hide a forgotten call rather than surfacing
-it, and the moment bytes go out is the caller's to choose.
+There is no automatic flush. One that fired sometimes would make send timing
+unpredictable and would hide a forgotten call, and the moment bytes go out
+belongs to the caller.
 
 Flow state lives in `FlowTable`, which owns the flow, association and staging
 pools and every algorithm that reads only those: sequence numbering, the send
 gate, the waiting ring, the seen bitmap, ack ranges, reorder hold-back and
 retransmit selection. It never acquires a peer, never touches the kernel and
 never encrypts. A peer reaches it only as a reference the socket already
-locked, so the ordering below is a property of the split rather than a rule to
-remember: a class with no way to reach a peer cannot lock one out of order.
+locked, so the ordering below falls out of the split. A class with no way to
+reach a peer cannot lock one out of order.
 
 Lock order: packet slot, then peer, then flow. Within the flow level, a flow is
-taken before an association, which is how a flow reaches its association list. The wire send happens with
-nothing held, so every locked scope gathers what the send needs
-(`PeerSendMaterials`), closes, and the packet is sealed and sent afterwards. A
-peer lock is never held across a `SendTo` syscall or anything that takes a
-staging lock.
+taken before an association, so a flow can reach its association list. The wire
+send happens with nothing held, so every locked scope gathers what the send
+needs (`PeerSendMaterials`), closes, and the packet is sealed and sent
+afterwards. A peer lock is never held across a `SendTo` syscall or anything
+that takes a staging lock.
 
 `PeerTable` and `CertStore` share one design: entries in a `SlotPool`, Robin
 Hood open-addressed indexes mapping keys to slots, removal by backward-shift on the peer side only so
@@ -477,7 +472,7 @@ secure    [Controller(1)][NonceCounter(8)][PeerTag(4)]? ‖ [Channel(1)]([FlowId
 unsecured [Controller(1)][content]
 ```
 
-| Field | Bytes | Present | What it is |
+| Field | Bytes | Present | Meaning |
 |---|---|---|---|
 | Controller | 1 | always | six independent bit flags, listed below |
 | NonceCounter | 8 | secure | the sender's counter, masked, the wire half of the nonce |
@@ -487,10 +482,9 @@ unsecured [Controller(1)][content]
 | FlowSeq | 4 | `HAS_FLOW` set | the packet's sequence on that flow, starting at 1 |
 | FlowData | 1 | `HAS_FLOW` set | mode in bits 0-2, epoch in bits 3-5, more-follows in bit 6, continues in bit 7 |
 | content | rest | always | one message, or a list of them when `BATCH` is set |
-| Tag | 16 | secure | the AEAD authentication tag, after the content rather than before it |
+| Tag | 16 | secure | the AEAD authentication tag, at the end |
 
-The tag sits at the end so that everything it covers is one unbroken run of
-bytes rather than pieces on either side of it.
+The tag sits at the end so everything it covers is one unbroken run of bytes.
 
 Content is one message filling it, or, when `CTRL_BATCH` is set, a list of
 messages each behind a two-byte little-endian length. The first message in a
@@ -500,15 +494,15 @@ pays nothing. The lengths must account for the content exactly, and a chain that
 overruns or leaves a tail is refused whole.
 
 The controller bits: `CTRL_INTERNAL` marks session-opening traffic, which is
-consumed rather than delivered in every case but one. The knock is the
-exception: it opens a session and carries application data in the same packet,
-so it is consumed as an opener and what it carried is delivered. `CTRL_HAS_FLOW` says the flow header sits inside the seal.
-`CTRL_UNSECURE` marks the plaintext opt-out, which carries no tag, no nonce,
-and no integrity. `CTRL_TAGGED` says the peer tag follows the nonce.
-`CTRL_MACONLY` marks a packet authenticated but not encrypted, framed exactly
-like an encrypted one so every offset is identical and only the transform
-differs. `CTRL_BATCH` says the content is that list. The controller byte and
-peer tag are authenticated associated data: readable on the wire, not
+consumed in every case but one. The knock is the exception: it opens a session
+and carries application data in the same packet, so it is consumed as an opener
+and what it carried is delivered. `CTRL_HAS_FLOW` says the flow header sits
+inside the seal. `CTRL_UNSECURE` marks the plaintext opt-out, which carries no
+tag, no nonce, and no integrity. `CTRL_TAGGED` says the peer tag follows the
+nonce. `CTRL_MACONLY` marks a packet authenticated but not encrypted, framed
+exactly like an encrypted one so every offset is identical and only the
+transform differs. `CTRL_BATCH` says the content is that list. The controller
+byte and peer tag are authenticated associated data: readable on the wire, not
 alterable.
 
 The nonce counter must travel, but in the clear it is a serial number that
@@ -534,8 +528,8 @@ packer sets it and has no business reaching into the socket's headers.
 
 ### Source layout
 
-Six pieces sit in their own files rather than inside `Socket` or `FlowTable`,
-because each is one job and neither of those is:
+Six pieces sit in their own files, because each is one job and `Socket` and
+`FlowTable` are not:
 
 | File | Holds |
 |---|---|
@@ -549,10 +543,10 @@ because each is one job and neither of those is:
 | `socket/socket_knock.cpp` | the first-flight opener: arming a window, the receiver pipeline, and the caps that bound what an unproven peer costs |
 | `crypto/identity_table.cpp` | the keypairs this socket answers on, and the lock that lets one be replaced under live traffic |
 
-The split is by job, not by size. The handshake and the migration receive path
-are both larger than any of these and both stay where they are: each reaches
-most of `Socket`, so moving either would trade one large file for a large file
-plus a wide interface.
+The split follows the job each piece does. The handshake and the migration
+receive path are both larger than any of these and both stay where they are:
+each reaches most of `Socket`, so moving either would trade one large file for
+a large file plus a wide interface.
 
 ### Operation paths
 
@@ -574,13 +568,12 @@ because one peer holds several tags at once (its rotation window, capped at
 `MAX_TAGS_PER_PEER`) and two peers may derive the same tag by chance. A clash
 resolves by trial decryption.
 
-Two further routes yield no handle at all. `CollectAddresses` copies out
-every live address so the tick and `Flush` can walk peers without holding the
-table, and it takes the writer lock, which is the opposite profile from the three
-lookups above. And a bare slot index, handed out by `RegisterPeer`, is what the
-handshake carries between its steps: every binding call (`BindId`, `BindTag`,
-`UnbindTags`, `UpdateAddress`) is keyed on that index rather than on a handle.
-Reads go through a verified key; those mutations do not.
+Two further routes yield no handle at all. `CollectAddresses` copies out every
+live address so the tick and `Flush` can walk peers without holding the table,
+and it takes the writer lock. The handshake carries a bare slot index, handed
+out by `RegisterPeer`, between its steps: every binding call (`BindId`,
+`BindTag`, `UnbindTags`, `UpdateAddress`) is keyed on that index. Reads go
+through a verified key. Those mutations do not.
 
 #### Opening a session: two triggers, one handshake, one resume
 
@@ -606,9 +599,9 @@ not open leaves an ordinary first contact behind it, so the path is additive:
 nothing that worked before behaves differently.
 
 A returning peer usually arrives holding a stale entry from the session it
-lost, which is why an opener whose stored keys cannot open it falls through to
-the key agreement rather than being refused. That fall-through is what makes a
-peer which has lost its keys recognisable at all.
+lost, so an opener whose stored keys cannot open it falls through to the key
+agreement. Without that fall-through a peer which has lost its keys could
+never be recognised at all.
 
 #### Three security levels
 
@@ -649,8 +642,7 @@ Seven things originate a send:
    nothing retains them and there is no staging copy to seal from
 7. The tick's transfer pass: announcements, data and repairs for every
    transfer a peer is running, read straight from the application's buffer
-   and framed as secure control, so a retransmit costs a ring entry rather
-   than a retained copy
+   and framed as secure control, so a retransmit costs one ring entry
 
 The builder requires the packet's kind declared before any payload, because the
 kind decides the pool: a reliable flow body is its own retransmit source and
@@ -658,25 +650,24 @@ goes to a retained staging slot, everything else goes to a kernel send slot and
 is released once on the wire.
 
 A send on a flow does not usually reach the wire by itself. It is packed into
-that flow's open batch and waits for `Flush`, so several small messages leave as
-one datagram, under one seal, holding one staging slot. A batch that fills goes
-out immediately rather than waiting, since there is no room for the next message
-either way. Nothing else is
-batched: handshake traffic, secure control, retransmits and the waiting-ring
-drain all go straight out, and so does a message the caller framed itself as
-part of a larger one, since the framing bits describe a packet's first and last
-message and hand-framed pieces cannot share one.
+that flow's open batch and waits for `Flush`, so several small messages leave
+as one datagram, under one seal, holding one staging slot. A batch that fills
+goes out immediately, since there is no room for the next message either way.
+Nothing else is batched: handshake traffic, secure control, retransmits and the
+waiting-ring drain all go straight out, and so does a message the caller framed
+itself as part of a larger one, since the framing bits describe a packet's
+first and last message and hand-framed pieces cannot share one.
 
 The batch is a wire packet on its flow and takes that flow's next sequence
-number, which is what leaves acknowledgement, retransmission, duplicate
-detection, ordering and the windows untouched. They still see one packet per
-sequence and never learn how many messages rode inside it.
+number, so acknowledgement, retransmission, duplicate detection, ordering and
+the windows are untouched. They still see one packet per sequence and never
+learn how many messages rode inside it.
 
 Because a batched send answers the caller the moment it is packed, the
-admission gate is consulted before the message is accepted rather than when the
-batch is flushed. A flow that cannot take another packet refuses at the `Send`
-that asked, exactly as it did before batching. A flush whose send is refused
-leaves the batch in place, since nothing reached the wire.
+admission gate is consulted before the message is accepted, at the point the
+caller is answered. A flow that cannot take another packet refuses at the
+`Send` that asked, exactly as it did before batching. A flush whose send is
+refused leaves the batch in place, since nothing reached the wire.
 
 `Flush` seals every batch a peer is holding before it sends any of them, then
 hands that whole round to the backend in one call. Sealing and sending are
@@ -693,7 +684,7 @@ accepted.
 Replying starts from the received packet: `PacketSlotHandle::PrepareResponse()`
 returns the same builder aimed at that packet's source, and the chain ends in
 `Respond()` or `RespondSecured()`. `Poll` stamps its socket into every handle
-it delivers, which is what lets the handle mint the builder.
+it delivers, so the handle can mint the builder.
 
 `Send` is best-effort. `SendSecured` delivers only to a peer authenticated
 against a trusted certificate.
@@ -709,7 +700,7 @@ packet. `StampFlowPacket` assumes it passed and only mutates.
 |---|---|---|
 | `Sent` | stamped and in flight | proceeds to seal and wire |
 | `Queued` | window or budget full | the flow's waiting ring |
-| `Dropped` | unreliable, no buffer configured | released, not an error |
+| `Dropped` | unreliable, no buffer configured | released, no error reported |
 | `Rejected` | reliable waiting ring full | released, `TooManyPending` to the app |
 | `Dead` | no such flow, or not `OPEN` | released, a real failure |
 
@@ -722,23 +713,22 @@ its sequence would outrun older data.
 #### Receiving: one gate, three sinks, two bypasses, two passes
 
 Session-opening traffic goes to `ProcessInternal` before the gate runs at all.
-The handshake messages are unauthenticated by construction, so a known-peer
+The handshake messages carry no authentication of their own, so a known-peer
 check, a decrypt and a replay window have nothing to apply to them. The bypass
 is narrow: a packet claiming to be internal and secure at once is forged or
 corrupt, and is dropped.
 
-A knock takes the same bypass and then does the gate's work itself, because
-what it needs is not what the gate does: the key it opens under is derived from
-the packet's own header rather than looked up on a peer, and there may be no
-peer yet. Having opened, it applies the same replay window and hands what it
-carried to the same three sinks below, so a knock's payload reaches the
-application through exactly the path any other packet's does.
+A knock takes the same bypass and then does the gate's work itself, because the
+key it opens under is derived from the packet's own header, and there may be no
+peer to look one up on. Having opened, it applies the same replay window and
+hands what it carried to the same three sinks below, so a knock's payload
+reaches the application through exactly the path any other packet's does.
 
 Everything else runs through `PreProcessIn` (known-peer check for unsecured
 traffic, decryption for secure, then replay and liveness), which routes what it
 admits to one of three sinks. The decryption tries the current key first and
-then the links a rotation could have put in play, which is how a silent
-rotation is discovered (see Key rotation under Lifecycles):
+then the links a rotation could have put in play, so a silent rotation is
+discovered (see Key rotation under Lifecycles):
 
 1. `ProcessSecureControl`: path validation, flow reject, flow ack, transfer
    data, transfer ack, transfer reject
@@ -748,15 +738,15 @@ rotation is discovered (see Key rotation under Lifecycles):
 Pass 2 drains the ready queue into the caller's buffer. Packets never leave the
 receive pool, and the application receives handles into it.
 
-A packet carrying a list of messages is queued whole, as one entry, exactly like
-a packet carrying one. Nothing is copied and nothing is expanded, so a datagram
-holding sixteen messages costs one slot rather than seventeen. The unpacking
-happens where the application reads: `PollCursor` walks the list and hands back
-one message at a time, so a caller still sees a flat run of messages and never
-has to know which of them travelled together. The length chain is validated
-before the first message is handed out, and a chain that overruns or leaves a
-tail yields nothing from that packet, because reading an entry the chain does
-not account for means trusting bytes chosen by whatever damaged it.
+A packet carrying a list of messages is queued whole, as one entry, exactly
+like a packet carrying one. Nothing is copied and nothing is expanded, so a
+datagram holding sixteen messages costs one slot. The unpacking happens where
+the application reads: `PollCursor` walks the list and hands back one message
+at a time, so a caller still sees a flat run of messages and never has to know
+which of them travelled together. The length chain is validated before the
+first message is handed out, and a chain that overruns or leaves a tail yields
+nothing from that packet, because reading an entry the chain does not account
+for means trusting bytes chosen by whatever damaged it.
 
 #### Lanes: what keeps an ordered flow ordered on the way out
 
@@ -776,25 +766,24 @@ all of them and sees them in order. The slot index is used because it does not
 change while the peer lives: a peer that moves to a new address keeps its lane,
 and no state is ever handed between threads.
 
-`Config::pollLanes` sets how many, defaulting to one, which is the single queue
-this has always been. It must be a power of two and at most sixteen, and `Init`
-refuses anything else rather than rounding, because a rounded count would leave a
-lane no thread was told to drain. The caller names its lane with a
-`ThreadIdentity`, which is nothing but the lane it last held.
+`Config::pollLanes` sets how many, defaulting to one, the single queue this has
+always been. It must be a power of two and at most sixteen, and `Init` refuses
+anything else, because a rounded count would leave a lane no thread was told to
+drain. The caller names its lane with a `ThreadIdentity`, which is nothing but
+the lane it last held.
 
-A lane is claimed for the life of the `PollCursor`, not merely for the drain.
-That span is what the guarantee rests on: the order survives only while one
-thread is the only one working a peer's traffic, and the application reads that
-traffic after `Poll` has returned. Nothing is registered. `Poll` takes whichever
-lane is free, preferring the one the caller passes back, so a thread settles on
-one lane while nothing contends and a lane whose usual thread stops calling is
-taken by another rather than filling untouched.
+A lane is claimed for the whole life of the `PollCursor`. The guarantee rests
+on that span: the order survives only while one thread is the only one working
+a peer's traffic, and the application reads that traffic after `Poll` has
+returned. Nothing is registered. `Poll` takes whichever lane is free,
+preferring the one the caller passes back, so a thread settles on one lane
+while nothing contends and a lane whose usual thread stops calling is taken by
+another before it fills.
 
-Each lane is sized for the whole receive pool rather than a share of it, because
-all the traffic can come from peers landing in one lane, and a push that fails is
-a packet dropped after its sender was told it arrived. That makes the lanes the
-largest memory the socket commits after the pools themselves, and it is why the
-lane count is capped.
+Each lane is sized for the whole receive pool, because all the traffic can come
+from peers landing in one lane, and a push that fails is a packet dropped after
+its sender was told it arrived. So the lanes are the largest memory the socket
+commits after the pools themselves, and the count is capped to bound that.
 
 A packet with no flow carries no sequence and so has no order to keep. It takes
 the lane its source address hashes to, which only keeps one sender's traffic
@@ -819,16 +808,16 @@ buffered and clears those sequences from the seen bitmap, so a resend is not
 mistaken for a duplicate. The association itself stays, with its cursor, epoch
 and identity intact.
 
-Keeping it is the whole point. An association rebuilt from scratch starts at
-sequence one while the sender is already hundreds ahead, so every packet after
-that lands outside the window and neither side has any way to notice. Holding
-the cursor still means the sender resends into the same gap it always had.
+Keeping it is the point. An association rebuilt from scratch starts at sequence
+one while the sender is already hundreds ahead, so every packet after that
+lands outside the window and neither side has any way to notice. Holding the
+cursor still means the sender resends into the same gap it always had.
 
 That works because an acknowledgement no longer frees the sender's copy. A
 sequence is acknowledged when the receiver has it, which is not the same as the
 receiver having delivered it: a packet buffered ahead of a gap is acknowledged
 and can still be dropped. So the copy is kept until the receiver reports a
-cursor past that sequence, which is the point where it can no longer ask for it.
+cursor past that sequence, the point where it can no longer ask for it.
 
 #### The acknowledgement carries a cursor as well as ranges
 
@@ -836,9 +825,9 @@ An entry is `[flowId(2)][epoch(1)][rangeCount(1)][recvNext(4)][ackDelay(2)]`
 followed by that many `[first(4)][last(4)]` pairs.
 
 `recvNext` is the receiver's delivery cursor. Everything below it has reached
-the application and can never be requested again, so it is what the sender
-releases against. It is one fixed field, it only ever climbs, and a report that
-is lost costs nothing because the next one carries the same or better.
+the application and can never be requested again, so the sender releases
+against it. It is one fixed field, it only ever climbs, and a report that is
+lost costs nothing because the next one carries the same or better.
 
 The ranges are the packets held above that cursor, and they are an optimisation:
 they let the sender stop retransmitting something the receiver already holds.
@@ -861,15 +850,15 @@ that wait looks exactly like a slower path.
 
 The entry carries it instead. `ackDelay` is the microseconds between the newest
 sequence in the entry arriving and the reply leaving, and the sender takes it
-back out of the round trip. It saturates at about 65 milliseconds, well past any
-cadence a receiver runs at, and saturating makes the sender subtract too little,
-so an overflow reads as a slow path rather than a fast one.
+back out of the round trip. It saturates at about 65 milliseconds, well past
+any cadence a receiver runs at, and saturating makes the sender subtract too
+little, so an overflow reads as a slow path.
 
 The sender takes one sample per acknowledgement, from the newest sequence that
-acknowledgement resolves for the first time, which is the sequence the hold time
-was measured against. A sequence that has been retransmitted is skipped. The
-reply cannot say which transmission it answers, and measuring from the most
-recent send would give a sample shorter than the path.
+acknowledgement resolves for the first time, the sequence the hold time was
+measured against. A sequence that has been retransmitted is skipped. The reply
+cannot say which transmission it answers, and measuring from the most recent
+send would give a sample shorter than the path.
 
 ### Lifecycles
 
@@ -894,12 +883,14 @@ initiatorPk ‖ responderPk ‖ initiatorEph ‖ responderEph ‖ saltI ‖ salt
 ```
 
 Version and capabilities sit inside the MAC'd transcript, so a downgraded
-negotiation fails key confirmation instead of succeeding quietly.
+negotiation fails key confirmation.
 
-The derivation yields two independent roots, each from the same exchange
-under its own label: the session key, and a resume root reserved for session
-resumption. Neither reveals the other, and both come from material wiped
-before the handshake returns.
+The exchange yields one session key, from material wiped before the handshake
+returns. Two further keys split off it under distinct labels, one that masks
+the nonce counter and one that seals mac-only traffic, so no two derivations
+share a domain and neither reveals the session key it came from. Resumption
+draws on none of this. A resume note is sealed under a key the issuer derives
+from its own identity secret, so a note outlives the session it was issued in.
 
 Packets sent to a peer mid-handshake are parked in the pending pool as an
 intrusive list and flushed when the session completes. The two ends compare
@@ -908,12 +899,12 @@ one shared key occupy distinct nonce spaces and cannot collide.
 
 #### Key rotation
 
-The session key is a chain. Rotating moves one link along it: the next key
-is a one-way derivation of the current one, the counter-masking and MAC-only
-keys re-derive from the new link, the send counter restarts, and the
-migration tags restart with it because they derive from the session. The
-resume root is untouched. Nothing about any of this travels on the wire, so
-an observer sees no boundary to correlate across an address change.
+The session key is a chain. Rotating moves one link along it: the next key is a
+one-way derivation of the current one, the counter-masking and MAC-only keys
+re-derive from the new link, the send counter restarts, and the migration tags
+restart with it because they derive from the session. Nothing about any of this
+travels on the wire, so an observer sees no boundary to correlate across an
+address change.
 
 A rotation happens when a byte threshold crosses or when `RotateKeys` is
 called, and the peer is not told. It discovers the change when a packet
@@ -969,8 +960,8 @@ association back to sequence one and drops what it was holding. The comparison
 walks forward from the epoch the association holds, because the field wraps
 after eight opens: a short walk is a generation this side has not caught up
 with, a long walk is a straggler from a generation already replaced, and the
-straggler is dropped rather than pulling the association back onto a sequence
-space nothing will send on again.
+straggler is dropped, since accepting it would pull the association back onto a
+sequence space nothing will send on again.
 
 A message larger than one packet travels as a run of them on one ordered flow,
 and bits 6 and 7 are the whole of the framing. More-follows says the message
@@ -979,49 +970,49 @@ opened it, so an ordinary send leaves both clear and is a message of one. The
 transport carries the two bits and never gathers the run, so a message has no
 size limit and the receive path allocates nothing to hold one.
 
-Ordered delivery is what lets two bits do that job, and the other modes refuse
+Two bits are enough because delivery is ordered, and the other modes refuse
 them. An unordered flow could deliver a run in any order, leaving nothing to
-append to, and unreliable delivers newest only, which would tear a message apart
-by design.
+append to, and unreliable delivers newest only, which would tear a message
+apart.
 
-The bit that says a packet opened a message is what makes an abandoned one
-recoverable. A flow that fails or is reopened mid-message leaves the receiver
-holding a run nothing will finish, and the next opening packet tells it to drop
-what it holds rather than appending a fresh message to the remains of the old
-one. Without it the receiver would deliver bytes that were never sent, in an
-order that looks correct.
+The bit that says a packet opened a message also lets the receiver recover from
+an abandoned one. A flow that fails or is reopened mid-message leaves the
+receiver holding a run nothing will finish, and the next opening packet tells
+it to drop what it holds, so a fresh message never appends to the remains of
+the old one. Without it the receiver would deliver bytes that were never sent,
+in an order that looks correct.
 
-The in-flight window is the sender's ring capacity, the receiver's
-seen-bitmap width, and the depth of its reorder hold-back, and `WindowFor`
-derives all of it from the mode. It is not
-configuration, and nothing carries it on the wire: both ends read the same three
-mode bits and reach the same number, so they agree by construction. A declared
-window was tried and removed because nothing forced the two to match.
+The in-flight window is the sender's ring capacity, the receiver's seen-bitmap
+width, and the depth of its reorder hold-back, and `WindowFor` derives all of
+it from the mode. It is not configuration, and nothing carries it on the wire:
+both ends read the same three mode bits and reach the same number, so the two
+always agree. A declared window was tried and removed because nothing forced
+the two to match.
 
 Bulk is four times as deep because depth is throughput on a long path, and it
 costs a longer stall behind one lost packet, which realtime traffic will not
 pay. The deeper ring is inline in the association, 24 KB a slot against 6, so
 bulk associations come from a pool of their own and a socket that never opens
 one pays nothing. `Config::flows::bulkOutCount` sizes it, and at zero the mode
-is refused at `OpenFlow` rather than at the first send.
+is refused at `OpenFlow`, before any send.
 
-That agreement is what the seen bitmap rests on. The send gate refuses when the
-ring slot for the next sequence is still occupied, so while a sequence is
-unresolved the sender can never advance a full window past it, and the
-receiver's bitmap floor can never climb above the oldest thing still in flight.
+The seen bitmap rests on that agreement. The send gate refuses when the ring
+slot for the next sequence is still occupied, so while a sequence is unresolved
+the sender can never advance a full window past it, and the receiver's bitmap
+floor can never climb above the oldest thing still in flight.
 
 Registration is caps-only: a dry pool or a full per-peer directory yields
-`FLOW_REJECT`, and the sender fails that one association rather than
-retransmitting into silence. This is the one path where a remote makes
-this socket allocate, and it is reachable only after a completed handshake.
+`FLOW_REJECT`, and the sender fails that one association, since retransmitting
+into silence buys nothing. This is the one path where a remote makes this
+socket allocate, and it is reachable only after a completed handshake.
 
 How much a remote may make this socket hold is a separate limit, told to that
 remote over the secure channel as a `GRANT` op carrying a slot count and a
 generation. Each side announces its own receive capacity once its session
 commits, so the exchange is symmetric and neither side ever states the other's
 allowance. The value is local configuration, so the receiver enforces it from
-the peer's first packet rather than from the announcement, and what travels only
-saves the sender from overshooting.
+the peer's first packet, and what travels only saves the sender from
+overshooting.
 
 Both ends act on it, and the send gate treats it as its own question. What the
 path will carry and what the peer will hold are separate limits, tested
@@ -1035,57 +1026,55 @@ the sender's restraint only spares the bandwidth of sending into a refusal.
 
 Reception happens on the tick, not on the poll. `Update` empties the OS receive
 buffer into the pool, consuming handshake and control traffic and queueing
-application packets, and `Poll` hands over what it brought. That is what puts
-the receive rules, the grant among them, at the moment this socket takes
-responsibility for a packet, and it keeps the kernel from becoming the queue for
-an application that collects at its own pace. How much one tick takes is
+application packets, and `Poll` hands over what it brought. So the receive
+rules, the grant among them, apply at the moment this socket takes
+responsibility for a packet, and the kernel never becomes the queue for an
+application that collects at its own pace. How much one tick takes is
 configured, defaulting to the pool's own capacity, since nothing more can be
 taken while every slot is occupied. Everything on the tick reads its clock from
 one place, so passing a fixed time receives without anything aging out.
 
-Enforcement is a refusal to buffer. A peer already holding its grant has further
-out-of-order packets ejected rather than held, which is the same path an
-out-of-window packet takes: no copy, no pinned slot, and the sequence is left
-unseen so the sender resends it. That is what bounds one remote's share of a
-pool every remote draws from. It cannot stall a flow, because the packet at the
-cursor is delivered rather than buffered, so the one packet that would drain the
-buffer is never the one refused. A grant of zero bounds nothing, which is how a
-socket that configures none behaves exactly as it did before grants existed.
+Enforcement is a refusal to buffer. A peer already holding its grant has
+further out-of-order packets ejected, on the same path an out-of-window packet
+takes: no copy, no pinned slot, and the sequence is left unseen so the sender
+resends it. That bounds one remote's share of a pool every remote draws from.
+It cannot stall a flow, because the packet at the cursor is delivered, so the
+one packet that would drain the buffer is never the one refused. A grant of
+zero bounds nothing, so a socket that configures none behaves exactly as it did
+before grants existed.
 
-Under all of the grants sits one floor they cannot collectively spend. Hold-back
-across every peer may fill the receive pool only down to a reserve, and no
-further. Grants are allowed to overcommit the pool, because most peers are idle
-most of the time and sizing for the worst case would mean granting almost
-nothing to anyone, so the reserve is what keeps reception possible when they are
-not idle. It is the difference between throttling one peer and going deaf to all
-of them: a pool consumed entirely by buffered packets leaves the kernel nowhere
-to read into. A socket whose pool is smaller than the reserve simply never
-buffers, which costs reordering and not reception.
+Under all of the grants sits one floor they cannot collectively spend.
+Hold-back across every peer may fill the receive pool only down to a reserve,
+and no further. Grants are allowed to overcommit the pool, because most peers
+are idle most of the time and sizing for the worst case would mean granting
+almost nothing to anyone, so the reserve keeps reception possible when they are
+not idle. It is the difference between throttling one peer and going deaf to
+all of them: a pool consumed entirely by buffered packets leaves the kernel
+nowhere to read into. A socket whose pool is smaller than the reserve simply
+never buffers, which costs reordering and not reception.
 
 The reserve is configured, defaulting to a sixteenth of the receive pool with a
-floor. A fraction rather than a fixed count, because what it has to absorb is
-arrivals per tick, and a socket sized for ten thousand peers needs headroom a
-socket sized for ten does not. A grant can also be cut without anyone asking. A peer whose buffered packets are
-repeatedly thrown away for making no progress is holding what it is not using,
-and after enough of those its grant is halved and the new figure announced like
-any other. Loss alone never reaches this, because a gap the sender fills costs
-nothing: what counts is buffer taken and left to time out, which is the one
-thing a well-behaved remote never does however poor its path. Halving rather
-than closing, so a peer that recovers can still work, and the strikes reset with
-the cut so it is judged on what it does next rather than on a total it can never
-work off.
+floor. It is a fraction of the pool, because it has to absorb arrivals per
+tick, and a socket sized for ten thousand peers needs more headroom than one
+sized for ten. A grant can also be cut without anyone asking. A peer whose
+buffered packets are repeatedly thrown away for making no progress is holding
+what it is not using, and after enough of those its grant is halved and the new
+figure announced like any other. Loss alone never reaches this, because a gap
+the sender fills costs nothing: what counts is buffer taken and left to time
+out, which a well-behaved remote never does however poor its path. The grant
+halves and never closes, so a peer that recovers can still work, and the
+strikes reset with the cut so it is judged on what it does next.
 
-A grant is per peer rather than per socket. Configuration sets what a peer
-starts with and `SetRecvGrant` changes one afterwards, in either direction, so a
-peer that has proved itself can be given more than one that has not. A reduction
-binds immediately on the receiving side, and a peer already past the new figure
-is not made to give anything back, it simply stops being buffered for until it
-drains under it. A grant may be raised or lowered at any
-time, which is why the announcement is a control op rather than a handshake
-field: the handshake transcript derives the session key, and a limit that
-changes has no business in a key. The generation orders announcements so one
-that overtakes an older one cannot be undone by it, compared as a wrapped
-difference so the counter can run forever.
+A grant belongs to one peer. Configuration sets what a peer starts with and
+`SetRecvGrant` changes one afterwards, in either direction, so a peer that has
+proved itself can be given more than one that has not. A reduction binds
+immediately on the receiving side, and a peer already past the new figure is
+not made to give anything back, it simply stops being buffered for until it
+drains under it. A grant may be raised or lowered at any time, so the
+announcement is a control op. The handshake transcript derives the session key,
+and a limit that changes has no business in a key. The generation orders
+announcements so one that overtakes an older one cannot be undone by it,
+compared as a wrapped difference so the counter can run forever.
 
 Closing is local too. `CloseFlow` walks the flow's association list, releases
 what each was holding, and frees the flow, sending nothing. A remote dropping
@@ -1094,26 +1083,26 @@ association is freed by `CloseFlow` or by its peer going away, and by nothing
 else: there is no idle timer on an association.
 
 `FAILED` is terminal, reached when the remote rejects the flow or the target
-stops answering it. Stopping answering is judged by a clock, not by a count of
-attempts: an association that owes packets and has resolved none of them for
-sixteen of the path's own round trips is dead. A count of attempts spends
-itself in a burst on a lossy but living link and stretches over minutes on a
-slow one, and both are the wrong verdict. The rings drain and the congestion bytes refund
-immediately, and the slot stays leased until `CloseFlow` or the peer's teardown
-frees it. `GetFlowState` reports the failure and does not clear it.
+stops answering it. Stopping answering is judged by a clock. An association
+that owes packets and has resolved none of them for sixteen of the path's own
+round trips is dead. A count of attempts spends itself in a burst on a lossy
+but living link and stretches over minutes on a slow one, and both are the
+wrong verdict. The rings drain and the congestion bytes refund immediately, and
+the slot stays leased until `CloseFlow` or the peer's teardown frees it.
+`GetFlowState` reports the failure and does not clear it.
 
 Mode is copied onto each association at creation, because the send gate, the
-drain, and the retransmit scan read it per packet, and reaching back to the flow
-would mean a second lock on the packet path. The epoch is copied the same way
-and for a different reason. Both control ops name a flow by its id, so an ack
-or a refusal that arrives after the id has been closed and reopened would land
-on the new association and speak for sequences that now mean something else. An
-ack carries the epoch of the association that wrote it and resolves nothing
-unless it matches, and a refusal echoes the epoch of the packet it refused and
-fails nothing unless it matches. The match is exact rather than the forward walk
-the data path uses, because a control op describes one generation and has none
-of its own to catch up to. The flow lock is taken once per send, at the builder,
-and is never held under a peer or association lock.
+drain, and the retransmit scan read it per packet, and reaching back to the
+flow would mean a second lock on the packet path. The epoch is copied the same
+way and for a different reason. Both control ops name a flow by its id, so an
+ack or a refusal that arrives after the id has been closed and reopened would
+land on the new association and speak for sequences that now mean something
+else. An ack carries the epoch of the association that wrote it and resolves
+nothing unless it matches, and a refusal echoes the epoch of the packet it
+refused and fails nothing unless it matches. The match is exact, because a
+control op describes one generation and has none of its own to catch up to. The
+flow lock is taken once per send, at the builder, and is never held under a
+peer or association lock.
 
 Two indexes reach an association, in opposite directions. The per-peer
 directories answer peer-to-association, which the packet path and peer removal
@@ -1128,7 +1117,7 @@ directory, `FLOW_REJECT` against the out.
 length and the stride. Nothing else moves until the receiver answers, because
 data sent at a receiver that has not attached a buffer could only be thrown
 away. A lost announcement retries on the retransmit timeout, so it delays a
-transfer rather than killing it.
+transfer.
 
 On the receiving side the announcement surfaces as `TRANSFER_INCOMING`. The
 application fetches the offer with `PendingTransfer`, then attaches a buffer
@@ -1139,19 +1128,19 @@ because a refusal is not congestion.
 
 The receiver places each data packet at `seq * stride` and acknowledges every
 second arrival with its contiguous cursor and a bitmap of the whole window
-above it, so the sender is told outright which packets have landed rather
-than inferring it from a cursor. An acknowledged sequence resolves out of
-order, and the window slides on the cursor.
+above it, so the sender is told outright which packets have landed. An
+acknowledged sequence resolves out of order, and the window slides on the
+cursor.
 
 A hole is resent once as soon as three sequences above it have landed, or one
-has landed and the packet has been out longer than a round trip and an
-eighth, the same two rules the flow path declares loss by. After that first
-repair the retransmit timeout governs each further attempt, which is what
-gives a resend time to arrive. The overdue scan resumes across one pass, so a
-pass walks the window once however many packets it offers. Losses are charged
-to the controller behind a barrier at the highest sequence yet sent: packets
-already on the wire when a loss was charged cannot charge another, which is
-the transfer's version of the epoch stamp a flow packet carries.
+has landed and the packet has been out longer than a round trip and an eighth,
+the same two rules the flow path declares loss by. After that first repair the
+retransmit timeout governs each further attempt, so a resend has time to
+arrive. The overdue scan resumes across one pass, so a pass walks the window
+once however many packets it offers. Losses are charged to the controller
+behind a barrier at the highest sequence yet sent: packets already on the wire
+when a loss was charged cannot charge another, the transfer's version of the
+epoch stamp a flow packet carries.
 
 Completion surfaces through `PollTransfers` on both ends as a `TransferView`
 naming the buffer, the length and the outcome, and `CompleteTransfer`
@@ -1168,154 +1157,145 @@ derives alone. Two exchanges go into that key, the two long-term identities
 and the sender's fresh ephemeral, so only the named receiver can open it and
 every attempt derives a different one.
 
-The sender's public key is sealed rather than carried in the clear, under a
-key derived from its ephemeral against the receiver's certificate key. That
-is the one exchange a receiver can run before it knows who is knocking, so it
-unseals the name and then runs the second exchange against it. In the clear
-the key would identify the sender to anyone on the path, which is the linkage
-the rotating peer tags and the masked counter exist to prevent, and nothing
-else in the header is stable across two knocks from the same sender. The seal
-also gates the work: a forgery fails its tag after one key agreement rather
-than two.
+The sender's public key is sealed, under a key derived from its ephemeral
+against the receiver's certificate key. That is the one exchange a receiver can
+run before it knows who is knocking, so it unseals the name and then runs the
+second exchange against it. In the clear the key would identify the sender to
+anyone on the path, the same linkage the rotating peer tags and the masked
+counter exist to prevent, and nothing else in the header is stable across two
+knocks from the same sender. The seal also gates the work: a forgery fails its
+tag after one key agreement.
 
-The header also names which of the receiver's keys all of that was aimed at,
-in four bytes, so a receiver holding more than one picks it directly. Without
-that name it would have to attempt an agreement against each key it holds,
-which would let one unauthenticated packet cost as much work as the receiver
-keeps history. The name comes from the key rather than from a counter, so it
-reveals nothing about how often that socket rotates, and a receiver that never
-rotates simply always sees the same one.
+The header also names which of the receiver's keys all of that was aimed at, in
+four bytes, so a receiver holding more than one picks it directly. Without that
+name it would have to attempt an agreement against each key it holds, which
+would let one unauthenticated packet cost as much work as the receiver keeps
+history. The name comes from the key itself, so it reveals nothing about how
+often that socket rotates, and a receiver that never rotates simply always sees
+the same one.
 
 The receiver rebuilds the same key from the header, and the open is the
 identity proof: only the holder of the secret behind the presented public key
-produces a packet that opens, so the peer's id is bound rather than claimed.
+produces a packet that opens, so the peer's id is proved by the open itself.
 From that moment the peer carries traffic. Flows open on it, number their
 packets, acknowledge and retransmit as they always do, because the peer has a
-key. What it does not have is a proven address, and that is a separate
-question with its own answer below.
+key. It does not have a proven address, and that is a separate question with
+its own answer below.
 
 The opener rides on every packet until the far side is known to hold the
-interim key, not merely on the first: reordering means any of them could be
-the one that arrives before the peer exists. The first packet back that opens
-is the proof, because only a side that derived the same key could have sealed
-it, and from there the opener stops and its bytes go to payload instead. The
-key does not change at that moment and neither does anything else, so the
-switch costs nothing to recover from if it never happens: the handshake ends
-the framing in any case.
+interim key. Reordering means any of them could be the one that arrives before
+the peer exists. The first packet back that opens is the proof, because only a
+side that derived the same key could have sealed it, and from there the opener
+stops and its bytes go to payload instead. The key does not change at that
+moment and neither does anything else, so the switch costs nothing to recover
+from if it never happens: the handshake ends the framing in any case.
 
 The handshake runs behind all of this, unchanged. The knock replaces HS_INIT
 and nothing else: the receiver answers it with the ordinary stateless
-challenge, the sender echoes the cookie in HS_RES, and that echo is what
-proves the address, exactly as it does for a peer that never knocked. The
-session it derives then replaces the interim key through the slots a key
-rotation uses, so packets still in flight under the interim key keep opening
-while the flows, their sequences and the congestion state carry straight on.
-The handshake state machine is untouched, which is why an initiator inside its
-knock window still reads as awaiting a challenge: `CanCarryTraffic` answers
-whether a key exists, `IsValid` answers where the handshake stands, and only
-the knock makes the two disagree.
+challenge, the sender echoes the cookie in HS_RES, and that echo proves the
+address, exactly as it does for a peer that never knocked. The session it
+derives then replaces the interim key through the slots a key rotation uses, so
+packets still in flight under the interim key keep opening while the flows,
+their sequences and the congestion state carry straight on. The handshake state
+machine is untouched, so an initiator inside its knock window still reads as
+awaiting a challenge. `CanCarryTraffic` answers whether a key exists, `IsValid`
+answers where the handshake stands, and only the knock makes the two disagree.
 
-The interim key is weaker than the session key by construction, and that is
-the whole price of speaking first. Nothing in it comes from the receiver, so a
-later theft of the receiver's long-term key reopens a recorded first flight.
-The session key mixes both ephemerals and both are wiped, so nothing reopens
-what follows. The window is one round trip, and every message that rode it is
-marked, so an application can hold first-flight data to a different standard
-than the rest.
+The interim key is weaker than the session key, and that weakness is the price
+of speaking first. Nothing in it comes from the receiver, so a later theft of
+the receiver's long-term key reopens a recorded first flight. The session key
+mixes both ephemerals and both are wiped, so nothing reopens what follows. The
+window is one round trip, and every message that rode it is marked, so an
+application can hold first-flight data to a different standard than the rest.
 
 What a refused opener costs the sender follows one rule: whatever is retained
 survives, and nothing else does. A reliable body sits in staging until its
 sequence resolves, so the retransmit re-seals it under whatever framing the
-peer has by then and it arrives late rather than never. Nothing keeps a copy of
-an unreliable flow packet, a non-flow packet, or a mac-only one, so a flight
-nobody opened is where those end. That is the ordinary contract of each kind
-rather than anything the opener introduces.
+peer has by then and it still arrives. Nothing keeps a copy of an unreliable
+flow packet, a non-flow packet, or a mac-only one, so a flight nobody opened is
+where those end. That is the ordinary contract of each kind, and the opener
+changes none of it.
 
 Every way the receiver declines an opener ends the same way: with the ordinary
 challenge. A sender aimed at a key this socket does not hold, one whose clock
 has drifted, one that arrives when the budget is spent, one that repeats an
 opener already seen, and one that finds the cap full all get the same answer,
-and it is the answer that helps: the handshake starts on the next pass rather
-than after a retry interval. The challenge holds no state and is never larger
-than the opener that provoked it, so answering can neither be made to cost
-memory nor turned into amplification. A peer that already has a session gets
-silence instead, because a packet that fails to open for it is noise rather
-than a sender asking for a way in.
+and that answer helps: the handshake starts on the next pass, with no retry
+interval to wait out. The challenge holds no state and is never larger than the
+opener that provoked it, so answering can neither be made to cost memory nor
+turned into amplification. A peer that already has a session gets silence,
+because a packet that fails to open for it is noise.
 
 Three limits keep an opener that anyone can send from costing more than it
-should. A per-tick budget bounds the key agreements one pass will attempt, so
-a flood slows early opening rather than the socket. A cap bounds how many
+should. A per-tick budget bounds the key agreements one pass will attempt, so a
+flood slows early opening and leaves the socket working. A cap bounds how many
 peers may exist with unproven addresses, and past it a knock creates nothing
 and gets the plain handshake instead, which holds no state until its echo
-arrives. Under that cap, each unproven peer has a packet allowance, and past
-it its packets are dropped unbuffered until the echo lands, which reliable
-flows recover from by retransmitting.
+arrives. Under that cap, each unproven peer has a packet allowance, and past it
+its packets are dropped unbuffered until the echo lands, which reliable flows
+recover from by retransmitting.
 
-Replay is bounded by three things that already exist rather than by anything
-the opener path adds. The clock stamp travels inside the authenticated header,
-so a captured opener cannot be refreshed and stops being accepted once it
-falls outside the window. A peer that exists refuses a repeat through its own
-replay window, which is counter-checked like every other packet. And a peer
-elsewhere holding the same identity refuses the registration outright, so a
-copy sent from a second address cannot land beside the original. What is left
-is one case: a copy arriving inside the clock window while no peer anywhere
-holds that identity, which is a receiver that restarted or a peer something
-removed. A message that rode a first flight answers IsKnock, so an application
-that must not act twice can decide for itself what may travel there.
+Three things that already exist bound replay. The clock stamp travels inside
+the authenticated header, so a captured opener cannot be refreshed and stops
+being accepted once it falls outside the window. A peer that exists refuses a
+repeat through its own replay window, which is counter-checked like every other
+packet. A peer elsewhere holding the same identity also refuses the
+registration outright, so a copy sent from a second address cannot land beside
+the original. One case survives all three: a copy arriving inside the clock
+window while no peer anywhere holds that identity. That is a receiver that
+restarted or a peer something removed. A message that rode a first flight
+answers IsKnock, so an application that must not act twice can decide for
+itself what may travel there.
 
 #### Resuming a session
 
 A process that dies and restarts cannot simply handshake again. A confirmed
 peer is never re-keyed, because an off-path rebind of a working session has to
 be impossible, so the newcomer waits until the far side evicts an entry
-belonging to a session that no longer exists. That wait is what a resume note
-removes.
+belonging to a session that no longer exists. A resume note removes that wait.
 
 Once a session confirms, each side seals a note for the other: the holder's
 identity tag and the wall clock it was issued at, sealed under a key the issuer
 derives from its own identity secret. The issuer keeps nothing, because it can
 re-derive that key whenever the note comes back, and the holder keeps bytes it
-cannot read. The seal key coming from the identity secret is what makes a note
-survive the issuer restarting, and rotating the identity is what retires every
-outstanding one, which is the real ceiling on the stated validity.
+cannot read. The seal key comes from the identity secret, so a note survives
+the issuer restarting. Rotating the identity retires every outstanding one, and
+that is the real ceiling on the stated validity.
 
 The holder's public key is not inside the note. It is the note's associated
 data, so a note only ever opens against the key its presenter has already
-proved. That is what makes a stolen note worthless and why nothing secret is in
-one: possessing it is not enough, and possessing what would be enough means
-being the peer it names.
+proved. So a stolen note is worthless and nothing secret has to be in one.
+Possessing it is not enough, and possessing what would be enough means being
+the peer it names.
 
 Presenting one is deliberate, through the `Connect` overload that takes it. The
-note rides inside the opener's seal rather than its header, so an observer
-cannot tell a resume from a first contact. On arrival the tag is re-checked
-against the trust store rather than believed, which is what makes a revoked
-certificate stop a resumption as surely as it stops a handshake, and what comes
-back is whatever authentication the store gives that tag now, not what it gave
-before.
+note rides inside the opener's seal, so an observer cannot tell a resume from a
+first contact. On arrival the tag is re-checked against the trust store, so a
+revoked certificate stops a resumption as surely as it stops a handshake, and
+what comes back is whatever authentication the store gives that tag now.
 
 Notes are kept only when `Config::keepResumeNotes` asks for it. A server issues
 them and has no reason to store the ones its clients issue back, so the default
 is off, and issuing is unaffected either way. A note is acknowledged whether or
-not it was kept, which is what stops an uninterested holder turning its issuer
-into a resender.
+not it was kept, so an uninterested holder cannot turn its issuer into a
+resender.
 
 #### Revoking a pinned identity
 
 `RemoveCertificate` stops trusting whatever key a tag names, at runtime, under
 live traffic. The certificate entry stays and its version is cleared and its
-key wiped, so any key presented against that tag afterwards is a hard
-mismatch. The cleared version is what the check reads, and it has to fail
-before the key comparison, because the wiped key is all zeros and a forged
-handshake could present exactly that. A peer already authenticated keeps its
-live session, and everything that consults the store afresh refuses from the
-next call on.
+key wiped, so any key presented against that tag afterwards is a hard mismatch.
+The check reads the cleared version, and it has to fail before the key
+comparison, because the wiped key is all zeros and a forged handshake could
+present exactly that. A peer already authenticated keeps its live session, and
+everything that consults the store afresh refuses from the next call on.
 
 #### Rotating this socket's own identity
 
-`RotateIdentity` installs a new keypair under the same tag, under live
-traffic. Sessions already running are untouched, because their keys came from
-the handshake ephemerals rather than from this one. What changes is what a new
-handshake announces and what a new opener can be encrypted toward.
+`RotateIdentity` installs a new keypair under the same tag, under live traffic.
+Sessions already running are untouched, because their keys came from the
+handshake ephemerals. A rotation changes what a new handshake announces and
+what a new opener can be encrypted toward.
 
 Everything a rotation has to answer follows from one asymmetry. A handshake
 carries public keys in band, so it always announces the key held now and needs
@@ -1325,7 +1305,7 @@ would otherwise be sending into a key nobody holds.
 
 So the previous keypairs are kept, as many as `Config::identityHistory` allows,
 and an opener naming one of them is opened on it. The data it carried arrives,
-which is the whole reason for keeping the key. The handshake behind it still
+and that is the whole reason for keeping the key. The handshake behind it still
 announces the current key, the sender's pinned certificate refuses that, and
 the two events between them say what to do about it: `PEER_STALE_IDENTITY` on
 the receiver, naming a peer working from an old certificate, and
@@ -1335,8 +1315,8 @@ the application's, exactly as it was for the first one.
 
 An opener naming a key that was never held, or one `ForgetPreviousIdentities`
 has wiped, meets the same uniform decline as an opener that cannot be read: the
-ordinary challenge, and the plain handshake carries the sender instead. That is
-what makes forgetting a real answer to a leaked key rather than a hint.
+ordinary challenge, and the plain handshake carries the sender instead. So
+forgetting is a real answer to a leaked key.
 
 One thing a rotation must never do is move a running session between nonce
 lanes, since the two counters under one key would then collide. The lane is
@@ -1355,10 +1335,10 @@ in one direction: a `CongestionDelta` accumulates under the flow lock and is
 applied to the peer under the peer lock.
 
 Two signals decide how it moves, and they answer different questions. Loss says
-the path could not carry what was sent. Delay says a queue is forming, which is
-the same news arriving earlier, before anything has had to be thrown away. A
-controller with only the first has one resting place and it is a full buffer,
-because a full buffer is the only thing that produces a loss.
+the path could not carry what was sent. Delay says a queue is forming, the same
+news arriving earlier, before anything has had to be thrown away. A controller
+with only the first rests at a full buffer, because a full buffer is what
+produces a loss.
 
 While the budget is below the slow-start threshold it doubles per round trip
 for as long as the path shows no standing queue. The sighting that stops it
@@ -1368,11 +1348,11 @@ the ramp holds flat while the smoothed figure is given a couple of round trips
 to agree. A sighting that fades on both readings resumes the doubling, and one
 that holds ends slow start where it stands, one buffer overflow earlier than a
 loss would have ended it. Above the threshold, growth is a function of time
-since the last reduction rather than of acknowledged bytes, so a long path
-recovers as fast as a short one, with a straight-line estimate underneath so a
-short path is not punished for running a curve designed for long ones. Over
-the curve sits a governor: whatever it wants, the budget does not grow while a
-standing queue already exceeds a fraction of the path's minimum round trip.
+since the last reduction, so a long path recovers as fast as a short one, with
+a straight-line estimate underneath so a short path is not punished for running
+a curve designed for long ones. Over the curve sits a governor: whatever it
+wants, the budget does not grow while a standing queue already exceeds a
+fraction of the path's minimum round trip.
 
 A sender that answers a standing queue by not growing can be starved by a
 neighbour that answers the same queue by filling it further. Both see the same
@@ -1380,32 +1360,30 @@ delay, one reads it as a reason to hold and the other as headroom, and the
 holding side ends at a few packets of budget while the filling side takes the
 link. The controller carries a verdict for this. A budget pinned at a handful
 of packets with the queue over target for many consecutive round trips, while
-acknowledgements keep arriving, is starvation rather than congestion. The
-budget is the reading that tells the two apart, because the queue cannot: two
-well behaved senders sharing a link also hold the queue above target, but
-their budgets sit near their shares, so a verdict keyed on the queue would
-fire against a fair neighbour and one keyed on the budget does not. While the
-verdict holds, the queue level found at that moment replaces the target. The
-budget regrows at slow-start speed while the queue stays at or under that
-level and holds when pushing past it, so the recovery competes for queue
-space the neighbour already created and never adds to it. The verdict lifts
-once the queue holds under the ordinary target for long enough that a
-periodic probe drain cannot mimic a departure, which is the sign the
-neighbour actually left.
+acknowledgements keep arriving, is starvation. The budget is the reading that
+tells the two apart, because the queue cannot: two well behaved senders sharing
+a link also hold the queue above target, but their budgets sit near their
+shares, so a verdict keyed on the queue would fire against a fair neighbour and
+one keyed on the budget does not. While the verdict holds, the queue level
+found at that moment replaces the target. The budget regrows at slow-start
+speed while the queue stays at or under that level and holds when pushing past
+it, so the recovery competes for queue space the neighbour already created and
+never adds to it. The verdict lifts once the queue holds under the ordinary
+target for long enough that a periodic probe drain cannot mimic a departure,
+the sign the neighbour actually left.
 
-The budget says how much may be outstanding, not how fast it may leave, so a
-pacing clock meters departures at the budget over the round trip, with a small
-gain and a small burst allowance. Every path that puts a flow packet on the
-wire answers to the same clock, retransmits included. A resend released at
-tick speed rather than path speed re-overflows the very buffer whose loss it
-is answering, and each wave of copies then drowns the wave before it.
+The budget says how much may be outstanding. How fast it leaves is the pacing
+clock's job, metering departures at the budget over the round trip, with a
+small gain and a small burst allowance. Every path that puts a flow packet on
+the wire answers to the same clock, retransmits included. A resend released at
+tick speed re-overflows the very buffer whose loss it is answering, and each
+wave of copies then drowns the wave before it.
 
 Loss only counts as a congestion signal at all once the path is losing more
 than a congested path needs to. A flow at its fair share of a busy link loses a
 fraction of a percent, because that is all the feedback requires, so a link
-dropping whole percentages steadily is describing itself rather than asking
-anyone to slow down. Below that tolerance the delay signal is the whole
-detector, which is what it was built to be.
+dropping whole percentages steadily is describing its own quality. Below that
+tolerance the delay signal is the whole detector.
 
 A loss trims, and how far depends on whether it was congestion. Two witnesses
 answer that. The queue at the moment of the loss, and the size of the bite,
@@ -1416,15 +1394,15 @@ packets at any send rate while overflow takes the whole excess. A corroborated
 loss takes the full cut and re-anchors the curve. An uncorroborated one takes a
 few percent and leaves the curve alone. A congestion epoch stamped on each
 packet as it is sent bounds the response to one reaction per event, so a burst
-losing ten packets is one trim rather than ten.
+losing ten packets is one trim.
 
 #### Peer eviction
 
-Always on. A zero timeout selects the default rather than switching it off, so
-there is no configuration in which a silent peer is kept forever. A peer from
-whom nothing has been received for the
-configured timeout is torn down on the tick, bounded per call. This socket's own
-sends prove nothing, and forgeable handshake chatter does not refresh the clock.
+Always on. A zero timeout selects the default, so there is no configuration in
+which a silent peer is kept forever. A peer from whom nothing has been received
+for the configured timeout is torn down on the tick, bounded per call. This
+socket's own sends prove nothing, and forgeable handshake chatter does not
+refresh the clock.
 
 A second silence ends a peer the same way. One can stay alive on the receive
 clock, its data reaching us, while it acknowledges nothing we send.

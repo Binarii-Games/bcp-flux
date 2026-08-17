@@ -31,17 +31,24 @@ vendored the same way. Both are Apache-2.0.
   mac-only level for public traffic and an explicit plaintext opt-out.
 - **0-RTT to a known identity.** Hold a peer's certificate and the first packet
   to it already carries application data, encrypted toward that identity, while
-  the handshake completes behind it.
+  the handshake completes behind it. See [0-RTT](#0-rtt).
+- **Session resumption.** A process that restarts picks its session back up
+  immediately, with no handshake and no wait for the far side to drop the entry
+  it still holds.
+- **Rotating identities.** Replace the keypair a socket proves its name with,
+  under live traffic, without changing the name or disturbing a session.
 - **Survives address changes.** A session follows the peer, not its address, so a
   NAT rebind or a VPN reconnect continues with no re-handshake.
 - **Delay-aware congestion control.** It reads queue growth as well as loss, so it
   holds its share beside BBR and leaves CUBIC the larger half almost without a
   drop.
 - **Drivable from other languages.** A numbers-based C API hands out 64-bit
-  handles rather than pointers. See [flux/include/flux/c/](flux/include/flux/c/).
+  handles, so a binding never holds a pointer. See
+  [flux/include/flux/c/](flux/include/flux/c/).
 
 ## Table of contents
 
+- [0-RTT](#0-rtt)
 - [Requirements](#requirements)
 - [Building](#building)
 - [Integrating](#integrating)
@@ -54,6 +61,38 @@ vendored the same way. Both are Apache-2.0.
 - [Contributing](#contributing)
 - [Security](#security)
 - [License](#license)
+
+## 0-RTT
+
+The first packet to a peer can carry application data, even on first contact.
+It takes the peer's certificate (a public key and an identity tag), obtained
+out of band like an SSH host key. Load it, point `Connect(addr, tag)` at the
+address, and the next send leaves immediately, sealed toward that key. The
+ordinary handshake completes behind it, and the first flight belongs to the
+same session as everything after. Sending this way is off until
+`config.knock.enable` turns it on.
+
+The trade-offs:
+
+- **Replay.** A captured first flight is re-accepted only inside a 30 second
+  clock window, and only by a receiver that lost its peers to a restart in the
+  meantime. `IsKnock` marks every message that rode one, so anything
+  non-idempotent can be kept off them.
+- **Forward secrecy.** The first packet is sealed toward the receiver's
+  long-term key, so a later theft of that key opens a recording of it.
+  `RotateIdentity` caps the exposure at one rotation period. Everything after
+  the handshake mixes both ephemerals and is unaffected.
+- **Unproven sender address.** The transport answers a knock with one
+  stateless challenge no larger than the knock itself, key agreements are
+  budgeted per tick (32), and unproven peers are capped (64) with a per-peer
+  packet allowance (256).
+- **Less room.** An opener carries 968 bytes (`SAFE_PAYLOAD_BYTES`) against
+  1200 established. `MaxPayload(addr)` reports the live figure.
+
+A knock the receiver declines for any reason falls back to the ordinary
+handshake, one pass later, with no error to handle. A resume note rides inside
+a knock and brings a previous session back with no handshake at all. See
+[Resume after a restart](#resume-after-a-restart).
 
 ## Requirements
 
@@ -191,14 +230,13 @@ for (;;)
 `Poll` takes whichever lane is free, preferring the one you pass, and holds it
 until the cursor goes out of scope. So a peer's packets reach one thread at a
 time and arrive in sequence, a thread that keeps passing its lane back stays on
-it, and a lane whose thread stops calling is picked up by another instead of
-filling. Left at the default of one lane, `Poll` behaves exactly as above and
-the identity can be left off.
+it, and a lane whose thread stops calling is picked up by another before it
+fills. Left at the default of one lane, `Poll` behaves exactly as above and the
+identity can be left off.
 
 `Flush` matters: a send on a flow is packed together with others going the same
-way, so several small messages leave as one datagram. They wait until you flush,
-which means the moment your bytes go out is yours to pick rather than a timer's.
-Miss it and they sit there.
+way, so several small messages leave as one datagram. They wait until you
+flush, so you pick the moment your bytes go out. Miss it and they sit there.
 
 ```cpp
 flux::PacketSlotHandle inbox[8];
@@ -219,10 +257,9 @@ for (;;)
 ```
 
 `Poll` fills the array with packets and hands back a cursor over the messages
-inside them. One datagram can carry several, so the loop runs once per message
-rather than once per packet, and a caller never has to know which arrived
-together. `cursor.Packet()` reaches the packet a message came in when you want
-its address or its flow.
+inside them. One datagram can carry several, so the loop runs once per message,
+and a caller never has to know which arrived together. `cursor.Packet()`
+reaches the packet a message came in when you want its address or its flow.
 
 The payload is never copied out. A handle points into the socket's receive
 pool and returns its slot when it goes out of scope.
@@ -285,9 +322,9 @@ All four number and acknowledge every packet, so loss feeds congestion
 control even when nothing is resent.
 
 Bulk is the same contract as `RELIABLE_ORDERED` with four times the window, for
-traffic that fills a pipe rather than tracking a clock. It costs more memory per
-target and stalls longer behind a lost packet, so it draws from a pool you size
-yourself with `flows.bulkOutCount`, which is zero by default.
+traffic whose job is to fill a pipe. It costs more memory per target and stalls
+longer behind a lost packet, so it draws from a pool you size yourself with
+`flows.bulkOutCount`, which is zero by default.
 
 ### One flow, many peers
 
@@ -390,6 +427,89 @@ socket.BuildPacket().NoFlow().PutBytes(msg, len).SendSecured(addr);
 socket.BuildPacket().Unsecured().NoFlow().PutBytes(msg, len).Send(addr);
 ```
 
+Authentication runs one way: only the side that dialled out learns the peer's
+tag, so a server can never authenticate a client through the handshake, and
+`SendSecured` toward one always refuses. Authenticate clients at the
+application level. `RemoveCertificate(tag)` revokes a tag at runtime, and every
+later check against it fails hard.
+
+### First contact with data
+
+Carrying data in the first packet needs three things at `Init`: this socket's
+own identity, a store to keep the other side's certificate in, and the switch.
+
+```cpp
+config.identity         = &identity;   // flux::Identity::Generate(tag).Take()
+config.trustedCertCount = 4;
+config.knock.enable     = true;
+```
+
+Then load the certificate of whoever you are about to talk to, name it at the
+address, and send:
+
+```cpp
+socket.LoadCertificate(serverCert);
+socket.Connect(addr, serverCert.identityTag);
+
+const uint32_t room = socket.MaxPayload(addr);   // 968 while the first packet opens
+socket.BuildPacket().NoFlow().PutBytes(msg, len).Send(addr);
+```
+
+That send leaves immediately carrying the payload, and the handshake follows
+behind it. Without the `Connect` call, or with knocking off, the same send
+takes the plain handshake and the message waits.
+
+On the receiving side, first-flight messages are marked:
+
+```cpp
+const flux::PacketSlot* packet = cursor.Packet().Read();
+if (packet && packet->IsKnock())
+{
+    // replayable, so idempotent work only
+}
+```
+
+### Resume after a restart
+
+Once a session confirms, each side seals a note for the other and raises
+`RESUME_NOTE_RECEIVED`. Ask for the bytes and persist them:
+
+```cpp
+config.keepResumeNotes = true;                 // off by default
+
+uint8_t note[flux::Socket::RESUME_NOTE_BYTES];
+const uint32_t len = socket.ResumeNoteFor(addr, note, sizeof(note));
+```
+
+Nothing secret is in a note. Hand it back after a restart:
+
+```cpp
+socket.Connect(addr, serverCert.identityTag, note, len);
+```
+
+The next send carries it in the first packet and the session comes back,
+authenticated, with no handshake. A stale or revoked note just leaves an
+ordinary first contact. Notes last 48 hours by default.
+
+### Rotate an identity
+
+`RotateIdentity` replaces the keypair a socket proves its tag with. The tag
+does not change, so running sessions and every peer relationship carry on
+untouched.
+
+```cpp
+config.identityHistory = 2;      // previous keypairs kept openable
+
+const flux::Identity next = flux::Identity::Generate(socket.IdentityTag()).Take();
+socket.RotateIdentity(next);
+```
+
+A first flight aimed at a retained key still opens, so a sender one rotation
+behind still gets through. `PEER_STALE_IDENTITY` and `PEER_CERT_MISMATCH`
+report the two ends of that, and the mismatch is a sender's cue to fetch a
+fresh certificate. `ForgetPreviousIdentities` wipes the retained secrets at
+once, for a leaked key.
+
 ## Architecture
 
 A session belongs to the peer, not its address. When a peer moves (NAT rebind,
@@ -400,11 +520,10 @@ deliberate address change from everything sent before. Peers are named by
 `blake2b(publicKey)`, so proving the key proves the name and no registry is
 involved.
 
-Congestion control reads delay as well as loss, so its resting state is a
-short queue rather than a full one. When a neighbour keeps the queue full
-anyway, Flux notices it is being starved and stops treating that queue as its
-own. That is what lets it hold its share beside BBR while leaving CUBIC the
-larger half almost without a drop.
+Congestion control reads delay as well as loss, so its resting state is a short
+queue. When a neighbour keeps the queue full anyway, Flux notices it is being
+starved and stops treating that queue as its own. So it holds its share beside
+BBR and leaves CUBIC the larger half almost without a drop.
 
 Packets are little-endian and capped at 1200 bytes, under the IPv6 minimum MTU
 with margin for tunnels. Every secure packet is sealed with XChaCha20-Poly1305,
@@ -474,10 +593,10 @@ Monocypher is portable C with no SIMD, so encryption tops out around
 
 An in-process relay models 50 Mbit with a 40 ms round trip and a 250 KB
 tail-drop queue, one bandwidth-delay product. One 100 MiB transfer crosses it
-per row. Independent loss is what thermal noise looks like, and the burst
-rows lose everything for stretches averaging twenty packets, which is what a
-fade or a handover does and what defeats recovery tuned only for the first
-kind. The floor at the link rate is 16.8 s.
+per row. Independent loss matches thermal noise, and the burst rows lose
+everything for stretches averaging twenty packets, the shape a fade or a
+handover produces, and the shape that defeats recovery tuned for independent
+loss alone. The floor at the link rate is 16.8 s.
 
 ```sh
 ./build-rel/link_transfer_bench
@@ -493,13 +612,12 @@ kind. The floor at the link rate is 16.8 s.
 | 2% bursts of 20 | 26.1 s | 32.1 Mbit | 64% |
 | 5% bursts of 20 | 60.4 s | 13.9 Mbit | 28% |
 
-The acknowledgement names every hole in the window, so repair keeps pace with
-a loss rate the congestion controller reads as the link rather than as
-congestion. Burst rows move a few seconds between runs, since where a burst
-lands against the window decides how much serialises behind repair. A first
-argument changes the payload and a second filters the rows, so
-`link_transfer_bench 200 independent` runs the three independent rows at
-200 MiB.
+The acknowledgement names every hole in the window, so repair keeps pace with a
+loss rate the congestion controller attributes to the link. Burst rows move a
+few seconds between runs, since where a burst lands against the window decides
+how much serialises behind repair. A first argument changes the payload and a
+second filters the rows, so `link_transfer_bench 200 independent` runs the
+three independent rows at 200 MiB.
 
 ### One gigabyte at line rate
 
@@ -516,9 +634,9 @@ model measured 255.7 s at 33.6 Mbit, a third slower on a clean link.
 
 ### Sharing one queue with QUIC
 
-Both senders move 100 MiB through ONE shared tail-drop queue, started
-together, which is what makes them interact: whoever keeps more in flight
-occupies more of the queue and pushes the other toward the drop tail.
+Both senders move 100 MiB through ONE shared tail-drop queue, started together,
+so they interact: whoever keeps more in flight occupies more of the queue and
+pushes the other toward the drop tail.
 
 This is the one bench with an outside dependency. msquic is not vendored,
 because it is a large production stack with its own build and its own release
@@ -545,7 +663,7 @@ cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release
 
 CMake looks for msquic at configure time and prints which way it went. Without
 it every other bench still builds and runs, and only this one is absent, so
-missing it costs you one table rather than the suite.
+missing it costs you one table.
 
 The numbers below came from msquic 2.5.9.
 
@@ -608,10 +726,10 @@ cmake --build build-tsan
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-Disable sanitizers with `-DBCP_SANITIZE=""`. Some toolchains, notably Apple's
-Command Line Tools clang, ship a broken ASan/TSan runtime. The build probes for
-that at configure time and falls back to UBSan only, rather than producing
-binaries that fail to start.
+Disable sanitizers with `-DBCP_SANITIZE=""`. Some toolchains, Apple's Command
+Line Tools clang among them, ship a broken ASan/TSan runtime. The build probes
+for that at configure time and falls back to UBSan only, so the binaries still
+start.
 
 ### Layout
 
@@ -644,7 +762,7 @@ else:
 
 ## Roadmap
 
-Not there yet: path MTU discovery, NAT traversal, and session resumption.
+Not there yet: path MTU discovery and NAT traversal.
 
 The wire format is not frozen before 1.0. It can change between versions, and a
 security fix is allowed to change it.
@@ -671,5 +789,5 @@ Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Flux and `common` stay Apache-2.0. Binarii Games sells products built on these
 libraries. A paid tier means extra code in that tier, not features taken out of
-here. Contributions stay yours: no CLA, no copyright assignment, just a DCO
-sign-off.
+here. Contributions stay yours. There is no CLA and no copyright assignment,
+only a DCO sign-off.

@@ -21,26 +21,27 @@ security fix is allowed to change either.
   behind it and replaces that key. Flows run across the handover. Off by
   default (`Config::knock`), with a per-tick validation budget, a clock
   window, an unproven-peer cap and a per-peer packet allowance.
-  `MaxPayload` reports the payload the next packet to a target can carry, and
-  a send past it is refused with `TooLarge` rather than truncated or silently
-  dropped. An opener honours the security level the caller picked, so a
-  mac-only send inside the window travels readable and unpadded rather than
-  being quietly upgraded to encrypted. `SAFE_PAYLOAD_BYTES` is 968: any opener
+  `MaxPayload` reports the payload the next packet to a target can carry, and a
+  send past it returns `TooLarge` and leaves the payload alone. An opener
+  honours the security level the caller picked, so a
+  mac-only send inside the window travels readable and unpadded.
+  `SAFE_PAYLOAD_BYTES` is 968: any opener
   may carry a resume note, and a figure that always fits has to account for
   one.
 - `RemoveCertificate` revokes a pinned identity at runtime. The tag's entry
-  is kept with its key wiped and version cleared, so every later check
-  against it fails hard rather than falling open.
+  is kept with its key wiped and version cleared, so every later check against
+  it fails hard.
 - Session resumption. A process that dies and restarts brings its session back
-  with no handshake at all, instead of waiting up to thirty seconds for the far
-  side to evict the entry it still holds. Each side seals a note for its peer
+  with no handshake at all. Before this it waited up to thirty seconds for the
+  far side to evict the entry it still holds. Each side seals a note for its
+  peer
   once a session confirms, sealed for the issuer's own future self so the
   holder stores bytes it cannot read and the issuer stores nothing. Presenting
   one at `Connect` puts it inside the first packet: opening that packet proves
   the sender holds the key the note names, so the two together are what the
   exchange would have established. The tag inside is re-checked against the
-  trust store rather than believed, so a revoked certificate stops a resumption
-  too. Nothing secret is in a note, so the bytes are handed to the application
+  trust store on arrival, so a revoked certificate stops a resumption too.
+  Nothing secret is in a note, so the bytes are handed to the application
   and loaded back exactly as certificates are, and a note that will not open
   leaves an ordinary first contact behind it. Notes are kept only when
   `Config::keepResumeNotes` asks, and last 48 hours by default.
@@ -50,13 +51,13 @@ security fix is allowed to change either.
   `Config::identityHistory` allows, and a first-flight opener naming one is
   still opened, so its data arrives while the sender's certificate catches up.
   The opener names the key it was aimed at in four bytes, so a receiver holding
-  several picks one rather than trying each. Two events carry the news:
+  several picks the right one directly. Two events carry the news:
   `PEER_STALE_IDENTITY` on the receiver, and `PEER_CERT_MISMATCH` on a sender
   whose pinned certificate no longer matches, which is its cue to fetch a fresh
   one. `ForgetPreviousIdentities` wipes the retained keys outright, for a leak.
 
 - The C API reaches everything above. Certificates and identity cross as
-  fixed-size byte buffers rather than handles, because a server has to persist
+  fixed-size byte buffers, because a server has to persist
   its identity and a handle could never leave the process, and the private form
   is byte for byte the identity file. Added: identity generation and the
   certificate derived from it, loading and revoking a certificate, rotating an
@@ -73,8 +74,8 @@ security fix is allowed to change either.
 
 ### Added
 - A C API, so other languages can drive the transport. One exported symbol hands
-  back a table of function pointers. Handles are 64-bit numbers (a slot, its
-  generation, and a kind tag) rather than pointers, so a binding can copy, zero
+  back a table of function pointers. Handles are 64-bit numbers holding a slot,
+  its generation and a kind tag, so a binding can copy, zero
   or move a value without touching a live object, and a stale or wrong-kind
   number is refused. A layout check lets a binding confirm its own structs before
   it trusts them.
@@ -89,8 +90,8 @@ security fix is allowed to change either.
   A repeated announcement used to be met with silence, leaving the sender holding
   every data packet behind it until the peer timed out.
 - A packet builder whose flow was never declared no longer faults on a put.
-- A congestion floor set above the ceiling is refused at `Init` rather than
-  tripping an assert on the first acknowledgement.
+- A congestion floor set above the ceiling is refused at `Init`. It used to
+  trip an assert on the first acknowledgement.
 
 ## [0.3.5] - 2026-08-09
 
@@ -99,16 +100,16 @@ security fix is allowed to change either.
   between buffers the application owns. Nothing is staged per packet and the
   sender never chunks, so a gigabyte and a kilobyte cost the same tracking state.
 - Flow message batching, so several messages leave as one datagram under one seal.
-- An event hook, so a socket reports what happened to a peer or a flow rather than
-  waiting to be asked.
+- An event hook, so a socket reports what happened to a peer or a flow without
+  being asked.
 - Per-peer receive grants, so one peer cannot occupy the buffer the others need.
 - A mac-only security level that authenticates a packet without encrypting it.
 
 ### Changed
-- Congestion control reads delay as well as loss, so it settles on a short queue
-  rather than a full one. A sender starved by a neighbour that keeps the queue
-  full stops treating the queue as its own and holds its share. Loss recovery runs
-  off the acknowledgements rather than a clock, and sends are paced at the rate the
+- Congestion control reads delay as well as loss, so it settles on a short
+  queue. A sender starved by a neighbour that keeps the queue
+  full stops treating the queue as its own and holds its share. Loss recovery
+  runs off the acknowledgements, and sends are paced at the rate the
   path takes.
 
 ## [0.3.0] - 2026-07-31

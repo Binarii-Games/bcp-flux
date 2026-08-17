@@ -1,6 +1,6 @@
 ## Summary
 
-What this change does, and why.
+What changed and why.
 
 ## Details
 

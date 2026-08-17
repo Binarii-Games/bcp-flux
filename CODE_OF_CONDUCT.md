@@ -6,8 +6,8 @@ This project is harassment-free for everyone. One bar, applied the same way to
 everyone, without exception.
 
 Beyond that: technical disagreement is expected, bluntness is fine, and being
-wrong is fine. Nobody is owed agreement or praise. What is owed is basic
-respect, and that is where the obligation ends.
+wrong is fine. Nobody is owed agreement or praise. Basic respect is owed, and
+the obligation ends there.
 
 ## Not acceptable
 

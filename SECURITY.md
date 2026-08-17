@@ -57,7 +57,7 @@ In scope, and most useful to hear about:
 Out of scope:
 
 - Flooding a host with traffic. Any UDP service can be flooded, which is a
-  capacity problem rather than a protocol flaw. Amplification is a different
+  question of capacity. Amplification is a different
   matter and is in scope above.
 - Attacks that assume the attacker already runs code on the host, or already
   holds the private identity or session keys.
@@ -73,11 +73,25 @@ Out of scope:
 These are known and are not vulnerabilities:
 
 - `Unsecured()` sends plaintext. It is an explicit opt-out from encryption and
-  authentication, and packets sent that way are readable and forgeable by anyone
+  authentication, so packets sent that way are readable and forgeable by anyone
   on the path. That is the documented contract.
-- Anonymous peers are not authenticated. Without a loaded certificate, a session
-  is encrypted but the peer's identity is unverified. Use `SendSecured` when
+- Anonymous peers are unauthenticated. Without a loaded certificate a session
+  is encrypted and the peer's identity is unverified. Use `SendSecured` where
   identity matters.
+- Authentication runs one way, from the side that dialled out. `HS_RES` carries
+  no identity tag, and the trust store is keyed by tag, so a responder cannot
+  authenticate an inbound peer however many certificates it has loaded, and
+  `SendSecured` from a server to a client always refuses. Authenticating a
+  client belongs to the application, over the encrypted session.
+- A first flight can draw an application reply to an address that did not ask
+  for one, because the source address on a knock is unverified until the
+  handshake proves it. The transport itself only ever answers with one
+  stateless challenge no larger than the knock. The application's reply is
+  bounded too: a spoofed address maps to one peer, capped by the unproven-peer
+  limit and its packet allowance, so the gain is the application's own
+  expansion factor and does not grow with the addresses spoofed. An application
+  with a large first reply should hold it until the peer is established.
+  `IsKnock` says which messages arrived before that.
 - First-flight data has weaker forward secrecy than the rest of a session. The
   interim key that carries a knock is derived without any contribution from the
   receiver, so a later theft of the receiver's long-term key opens a recorded
@@ -87,12 +101,14 @@ These are known and are not vulnerabilities:
 - A replayed first flight can be delivered twice. Three things bound it. The
   clock stamp is inside the authenticated header, so a captured opener cannot
   be refreshed and stops being accepted once it falls outside the window. A
-  peer that exists refuses a repeat through its own replay window. And a peer
-  elsewhere holding the same identity refuses the registration, so a copy sent
-  from a second address cannot land beside the original. What is left is a copy
-  arriving inside the clock window while no peer anywhere holds that identity,
-  which means a receiver that restarted, or a peer that `RemovePeer` or a
-  failed handshake took away. Nothing in a transport can close that: a first
+  peer that exists refuses a repeat through its own replay window. A peer
+  elsewhere holding the same identity also refuses the registration, so a copy
+  sent from a second address cannot land beside the original. One case survives
+  all
+  three: a copy arriving inside the clock window while no peer anywhere holds
+  that identity. That is a receiver that restarted, or a peer that `RemovePeer`
+  or a failed handshake took away. Nothing in a transport can close that: a
+  first
   flight is by definition judged before there is a session to judge it against.
   `IsKnock` reports which delivered messages rode one, so an application can
   keep anything it must not do twice out of the first flight.
