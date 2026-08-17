@@ -45,6 +45,11 @@ namespace bcp::flux
         common::crypto::PublicKey  knockEphPk{};
         uint8_t                    knockSalt[internal::WIRE_HS_SALT_SIZE]{};
         uint8_t                    knockIdentity[internal::KNOCK_IDENTITY_SIZE]{};
+
+        /** A resume note to spend, carried inside the seal so an observer
+            cannot tell a resume from a first contact. */
+        bool                       knockHasNote = false;
+        uint8_t                    knockNote[internal::TICKET_WIRE_SIZE]{};
     };
 
     /** Encrypts the body in place and appends the authentication tag.
@@ -101,5 +106,7 @@ namespace bcp::flux
                                        const common::crypto::SessionKey& knockHeaderKey,
                                        const common::crypto::SessionKey& knockMacKey,
                                        uint8_t senderNonceLane,
-                                       uint64_t& outCounter) noexcept;
+                                       uint64_t& outCounter,
+                                       uint8_t* outNote = nullptr,
+                                       bool* outHasNote = nullptr) noexcept;
 }

@@ -83,7 +83,8 @@ namespace bcp::flux
         common::crypto::Wipe(context, sizeof(context));
     }
 
-    bool Socket::ArmKnock(Peer& peer, const common::crypto::PublicKey& certKey)
+    bool Socket::ArmKnock(Peer& peer, const common::crypto::PublicKey& certKey,
+                          const uint8_t* note)
     {
         if (!knockEnabled_) return false;
 
@@ -136,6 +137,9 @@ namespace bcp::flux
         peer.knockFramed = true;   // until the far side answers, or the handshake lands
         peer.knockEphPk  = ephPk;
         std::memcpy(peer.knockSalt, salt, sizeof(salt));
+        peer.knockHasNote = note != nullptr;
+        if (note != nullptr)
+            std::memcpy(peer.knockNote, note, internal::TICKET_WIRE_SIZE);
         // Which of the receiver's keys this was encrypted toward, so it can
         // pick that one rather than attempting an agreement against each key
         // it holds. Computed from the certificate, which is all the sender has
@@ -206,9 +210,14 @@ namespace bcp::flux
         const uint64_t skew = claimed > nowWall ? claimed - nowWall : nowWall - claimed;
         const bool fresh = skew <= knockTtlWindowSeconds_;
 
-        // A peer already knocking opens with the key on its slot: the rest of
-        // the window's packets cost a lookup rather than a key agreement, and
-        // nothing can be re-created underneath them.
+        // Three cases, and the order matters. A peer already knocking opens with
+        // the key on its slot, so the rest of its window costs a lookup rather
+        // than a key agreement. A peer whose stored keys cannot open this one is
+        // not necessarily a stranger: it is what a returning peer looks like,
+        // holding an entry from a session that has gone, so that case falls
+        // through to the derivation below rather than being refused. Anything
+        // else really is a first contact.
+        bool settled = false;
         {
             PeerHandle peerHandle = peers_.GetPeer(from);
             if (!peerHandle.Failed())
@@ -223,39 +232,51 @@ namespace bcp::flux
                 if (!fresh) return;   // a replay of one of its own packets
                 const bool useCurrent = peer->knockActive;
                 const bool usePrev    = !useCurrent && !peer->rotationConfirmed;
-                if (!useCurrent && !usePrev) return;   // nothing left to open it with
 
                 if (peer->awaitingAddressProof
                     && peer->unprovenPacketsSeen >= knockUnprovenPacketLimit_)
                     return;   // ejected unbuffered until the echo lands
 
                 uint64_t counter = 0;
-                const common::crypto::SessionKey& openKey =
-                    useCurrent ? peer->knockKey : peer->prevSession;
-                const common::crypto::SessionKey& openMask =
-                    useCurrent ? peer->knockHeaderKey : peer->prevHeaderKey;
-                // A mac-only opener is verified under the mac key of the same
-                // generation, which is derived from the key above and so proves
-                // the same thing the AEAD tag would.
-                const common::crypto::SessionKey& openMacKey =
-                    useCurrent ? peer->macKey : peer->prevMacKey;
-                // The previous slot holds the interim key, and that key was
-                // agreed against whichever key the opener named, so it carries
-                // its own lane. Opening it with the committed one produces a
-                // different nonce and it never opens.
-                const uint8_t openNonceLane =
-                    useCurrent ? peer->TheirNonceLane() : peer->TheirPrevNonceLane();
-                if (!OpenKnockPacket(*packet, openKey, openMask, openMacKey,
-                                     openNonceLane, counter))
-                    return;
-                if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
-                    return;
-                if (peer->awaitingAddressProof) ++peer->unprovenPacketsSeen;
-                const uint32_t nowStamp = SeenStamp(common::MonotonicMicros());
-                if (static_cast<uint32_t>(nowStamp - peer->lastSeenAt) >= seenGrainStamp_)
-                    peer->lastSeenAt = nowStamp;
+                bool opened = false;
+                if (useCurrent || usePrev)
+                {
+                    const common::crypto::SessionKey& openKey =
+                        useCurrent ? peer->knockKey : peer->prevSession;
+                    const common::crypto::SessionKey& openMask =
+                        useCurrent ? peer->knockHeaderKey : peer->prevHeaderKey;
+                    // A mac-only opener is verified under the mac key of the
+                    // same generation, which is derived from the key above and
+                    // so proves the same thing the AEAD tag would.
+                    const common::crypto::SessionKey& openMacKey =
+                        useCurrent ? peer->macKey : peer->prevMacKey;
+                    // The previous slot holds the interim key, and that key was
+                    // agreed against whichever key the opener named, so it
+                    // carries its own lane. Opening it with the committed one
+                    // produces a different nonce and it never opens.
+                    const uint8_t openNonceLane =
+                        useCurrent ? peer->TheirNonceLane() : peer->TheirPrevNonceLane();
+                    opened = OpenKnockPacket(*packet, openKey, openMask, openMacKey,
+                                             openNonceLane, counter);
+                }
+
+                if (opened)
+                {
+                    if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
+                        return;
+                    if (peer->awaitingAddressProof) ++peer->unprovenPacketsSeen;
+                    const uint32_t nowStamp = SeenStamp(common::MonotonicMicros());
+                    if (static_cast<uint32_t>(nowStamp - peer->lastSeenAt) >= seenGrainStamp_)
+                        peer->lastSeenAt = nowStamp;
+                    settled = true;
+                }
+                // Not opened: fall out of this scope holding no lock, so the
+                // derivation below can judge it fresh. The handle has to be
+                // released first, because that path removes and registers peers.
             }
-            else
+        }
+        if (!settled)
+        {
             {
                 // A new peer, so everything that costs work or memory is gated
                 // before any of it is spent. Every gate below declines the same
@@ -322,8 +343,11 @@ namespace bcp::flux
 
                 uint64_t counter = 0;
                 const uint8_t theirNonceLane = NonceLaneBetween(theirStatic, mine.publicKey);
+                uint8_t note[internal::TICKET_WIRE_SIZE];
+                bool hasNote = false;
                 const bool opened = OpenKnockPacket(*packet, knockKey, knockHeaderKey,
-                                                    knockMacKey, theirNonceLane, counter);
+                                                    knockMacKey, theirNonceLane, counter,
+                                                    note, &hasNote);
                 if (!opened)
                 {
                     common::crypto::Wipe(knockKey.data(), knockKey.size());
@@ -339,11 +363,64 @@ namespace bcp::flux
                 // id does not match the one it proves.
                 const BcpId id = BcpId::Derive(theirStatic);
 
+                // A resume note turns this from a first contact into a return.
+                // The open already proved the sender holds this key, and the
+                // note proves this key held a session here. Together that is
+                // what the handshake would have established, so there is no
+                // reason to make it run again.
+                //
+                // The tag is re-checked against the trust store rather than
+                // believed, which is what makes a revoked certificate stop a
+                // resumption as surely as it stops a handshake.
+                bool resumed = false;
+                bool resumedAuthenticated = false;
+                Certificate::IdentityTag announced{};
+                if (hasNote)
+                {
+                    uint8_t resumedTag[internal::WIRE_HS_TAG_SIZE] = {};
+                    if (OpenResumeNote(note, theirStatic, resumedTag))
+                    {
+                        std::memcpy(announced.data(), resumedTag, announced.size());
+                        const CertStore::Match match =
+                            certStore_.Check(announced, theirStatic);
+                        if (match != CertStore::Match::Mismatch)
+                        {
+                            resumed = true;
+                            resumedAuthenticated = (match == CertStore::Match::Trusted);
+                        }
+                    }
+                }
+
+                // A returning peer is usually already here under a stale entry,
+                // and that entry is what it came to replace. Dropping it is safe
+                // only because the note and the open together prove this is the
+                // same party, which is the whole reason a note exists.
+                if (resumed)
+                {
+                    Address staleAddr{};
+                    bool haveStale = false;
+                    {
+                        PeerHandle stale = peers_.GetPeer(id);
+                        if (!stale.Failed() && stale.Read())
+                        {
+                            staleAddr = stale.Read()->addr;
+                            haveStale = true;
+                        }
+                    }
+                    // Outside the handle: the table refuses a removal while one
+                    // is held, the same rule the unproven-id path follows.
+                    if (haveStale) (void)RemovePeer(staleAddr);
+                }
+
                 // Unproven address, so the peer counts against the cap. Past
                 // it, nothing is created and the plain handshake carries the
                 // sender instead, which stays stateless until its echo.
+                // A resume does not count against the cap. The cap bounds how
+                // much state an unproven stranger can make this socket hold,
+                // and a peer presenting a note this socket sealed is neither.
                 bool capped = false;
-                if (unprovenPeers_.fetch_add(1, std::memory_order_relaxed) >= knockMaxUnproven_)
+                if (!resumed
+                    && unprovenPeers_.fetch_add(1, std::memory_order_relaxed) >= knockMaxUnproven_)
                 {
                     unprovenPeers_.fetch_sub(1, std::memory_order_relaxed);
                     capped = true;
@@ -351,7 +428,8 @@ namespace bcp::flux
                 uint32_t slot = common::collections::SlotPool::INVALID;
                 if (capped || peers_.RegisterPeer(from, &id, slot) != common::Error::Ok)
                 {
-                    if (!capped) unprovenPeers_.fetch_sub(1, std::memory_order_relaxed);
+                    if (!capped && !resumed)
+                        unprovenPeers_.fetch_sub(1, std::memory_order_relaxed);
                     common::crypto::Wipe(knockKey.data(), knockKey.size());
                     common::crypto::Wipe(knockHeaderKey.data(), knockHeaderKey.size());
                     common::crypto::Wipe(knockMacKey.data(), knockMacKey.size());
@@ -378,13 +456,24 @@ namespace bcp::flux
                                                  internal::MAC_KEY_LABEL);
                     peer->sendCounter    = 0;
                     peer->state          = HandshakeState::ESTABLISHED;
-                    // Deliberately not confirmed: that flag means a packet
-                    // opened under a handshake-derived key, and it is what
-                    // stops an HS_RES re-keying a proven session. The handshake
-                    // behind this knock still has to run, so it must not be set
-                    // by a knock.
-                    peer->confirmed            = false;
-                    peer->awaitingAddressProof = true;
+
+                    // A first contact is deliberately not confirmed: that flag
+                    // means a packet opened under a handshake-derived key, and
+                    // it is what stops an HS_RES re-keying a proven session, so
+                    // a knock must not set it while a handshake is still owed.
+                    //
+                    // A resume is the opposite case. Nothing is owed, because
+                    // the note and the open between them already established
+                    // what the exchange would have. The peer is confirmed and
+                    // its address is not in question either: a returning peer
+                    // may legitimately be somewhere new, and the cookie echo
+                    // was never what gated sending to it.
+                    peer->confirmed            = resumed;
+                    peer->authenticated        = resumedAuthenticated;
+                    if (resumed)
+                        std::memcpy(peer->announcedTag, announced.data(),
+                                    sizeof(peer->announcedTag));
+                    peer->awaitingAddressProof = !resumed;
                     peer->unprovenPacketsSeen  = 1;
                     peer->knockStartedAtMicros = common::MonotonicMicros();
                     if (peer->congestionBudget < minCongestionBudget_)
@@ -404,11 +493,12 @@ namespace bcp::flux
                 common::crypto::Wipe(knockHeaderKey.data(), knockHeaderKey.size());
                 common::crypto::Wipe(knockMacKey.data(), knockMacKey.size());
 
-                // The handshake starts here, from the packet that carried the
-                // data: the challenge is stateless, and the sender's echo of
-                // its cookie is what proves the address and derives the real
-                // session. One reply to one packet, so this cannot amplify.
-                Handshake_Challenge(from);
+                // A first contact starts its handshake here, from the packet
+                // that carried the data: the challenge is stateless, and the
+                // sender's echo of its cookie proves the address and derives
+                // the real session. One reply to one packet, so this cannot
+                // amplify. A resume sends nothing, because nothing is owed.
+                if (!resumed) Handshake_Challenge(from);
             }
         }
 

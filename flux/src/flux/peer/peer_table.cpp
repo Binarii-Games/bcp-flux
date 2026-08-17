@@ -490,6 +490,8 @@ namespace bcp::flux
         p->knockEphPk           = {};
         std::memset(p->knockSalt, 0, sizeof(p->knockSalt));
         std::memset(p->knockIdentity, 0, sizeof(p->knockIdentity));
+        std::memset(p->knockNote, 0, sizeof(p->knockNote));
+        p->knockHasNote         = false;
         p->awaitingAddressProof = false;
         p->unprovenPacketsSeen  = 0;
         p->knockStartedAtMicros = 0;

@@ -682,6 +682,40 @@ namespace bcp::flux
         [[nodiscard]] common::Error Connect(const Address& addr,
                                             const Certificate::IdentityTag& expect);
 
+        /** Names the identity AND presents a resume note this peer issued
+            before, so a process that restarted picks its session back up
+            instead of waiting out the entry the far side still holds.
+
+            The note rides inside the first packet. Opening that packet proves
+            this socket holds the key the note names, so the two together are
+            what a handshake would have established and none of it runs: the
+            session is live and authenticated from the first exchange.
+
+            A note that will not open, or names a tag the far side no longer
+            trusts, costs nothing. The opener is treated as a first contact and
+            the ordinary handshake carries it, so a stale note is never worse
+            than no note. InvalidParam when len is not the size a note is,
+            otherwise the same answers as the overload above. */
+        [[nodiscard]] common::Error Connect(const Address& addr,
+                                            const Certificate::IdentityTag& expect,
+                                            const uint8_t* note, size_t len);
+
+        /** Copies out the resume note this peer most recently issued, as the
+            RESUME_NOTE_RECEIVED event announced. Persist the bytes and hand
+            them back to Connect after a restart. Returns how many were
+            written, or 0 when this peer has issued none or the buffer is too
+            small. Kept only when Config::keepResumeNotes asked.
+
+            Nothing secret is in a note, so wherever these bytes land needs no
+            more care than a certificate does. */
+        [[nodiscard]] uint32_t ResumeNoteFor(const Address& addr,
+                                            uint8_t* out, uint32_t cap);
+
+        /** The size a resume note always is, so a caller can size storage
+            without asking. */
+        static constexpr uint32_t RESUME_NOTE_BYTES =
+            static_cast<uint32_t>(internal::TICKET_WIRE_SIZE);
+
         /** Payload bytes the next packet to this target can carry, as a
             caller may put them: the channel byte the seal writes is already
             subtracted, and a packet sent on a flow spends
@@ -1183,7 +1217,8 @@ namespace bcp::flux
             PreProcessOut seals its sends as knocks. Returns false when the
             window could not be armed, which is the caller's cue to fall back
             to a plain handshake. Caller holds the peer write lock. */
-        bool ArmKnock(Peer& peer, const common::crypto::PublicKey& certKey);
+        bool ArmKnock(Peer& peer, const common::crypto::PublicKey& certKey,
+                      const uint8_t* note);
         /** Combines the two knock DH results into the interim key and its
             header key. The two shared secrets are computed by the caller
             because their roles differ by side (the sender pairs its ephemeral

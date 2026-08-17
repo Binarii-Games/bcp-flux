@@ -428,6 +428,17 @@ namespace bcp::flux
         return certStore_.Revoke(tag);
     }
 
+    uint32_t Socket::ResumeNoteFor(const Address& addr, uint8_t* out, uint32_t cap)
+    {
+        if (out == nullptr || cap < RESUME_NOTE_BYTES) return 0;
+        PeerHandle peerHandle = peers_.GetPeer(addr);
+        if (peerHandle.Failed()) return 0;
+        const Peer* peer = peerHandle.Read();
+        if (!peer || !peer->hasResumeNote) return 0;
+        std::memcpy(out, peer->resumeNote, RESUME_NOTE_BYTES);
+        return RESUME_NOTE_BYTES;
+    }
+
     common::Error Socket::RotateIdentity(const Identity& next)
     {
         if (!initialized_.load(std::memory_order_acquire))
@@ -530,7 +541,11 @@ namespace bcp::flux
         // before the peer exists on the far side.
         if (peer.knockFramed)
         {
-            materials.knock      = true;
+            materials.knock        = true;
+            materials.knockHasNote = peer.knockHasNote;
+            if (peer.knockHasNote)
+                std::memcpy(materials.knockNote, peer.knockNote,
+                            sizeof(materials.knockNote));
             materials.knockKeyId = peer.knockKeyId;
             materials.knockEphPk = peer.knockEphPk;
             std::memcpy(materials.knockSalt, peer.knockSalt, sizeof(materials.knockSalt));
@@ -3342,6 +3357,16 @@ namespace bcp::flux
     common::Error Socket::Connect(const Address& addr,
                                  const Certificate::IdentityTag& expect)
     {
+        return Connect(addr, expect, nullptr, 0);
+    }
+
+    common::Error Socket::Connect(const Address& addr,
+                                 const Certificate::IdentityTag& expect,
+                                 const uint8_t* note, size_t len)
+    {
+        if (note != nullptr && len != internal::TICKET_WIRE_SIZE)
+            return common::Error::InvalidParam;
+
         if (!initialized_.load(std::memory_order_acquire))
             return common::Error::NotInitialized;
         if (!knockEnabled_) return common::Error::NotInitialized;
@@ -3369,7 +3394,7 @@ namespace bcp::flux
             {
                 Peer* peer = peerHandle.Write();
                 peer->attempts = 1;
-                knocking = ArmKnock(*peer, pinned);
+                knocking = ArmKnock(*peer, pinned, note);
             }
         }
         // The knock is the opener, so it replaces HS_INIT rather than joining

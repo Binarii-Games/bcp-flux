@@ -287,6 +287,15 @@ namespace bcp::flux
         uint8_t  knockSalt[internal::WIRE_HS_SALT_SIZE];
         uint8_t  knockIdentity[internal::KNOCK_IDENTITY_SIZE];
 
+        /** A resume note this side is presenting, if the application handed
+            one over at Connect. Part of the knock window rather than beside
+            resumeNote, because the two are different notes with different
+            lifetimes: this is the old one being spent, that is the new one
+            being collected, and a window still sending openers must not have
+            its outgoing note overwritten by an arriving one. */
+        uint8_t  knockNote[internal::TICKET_WIRE_SIZE];
+        bool     knockHasNote;
+
         /** Set on a receiver-side peer created by a knock, cleared when the
             HS_RES cookie echo proves the address. While set, the peer counts
             against the socket-wide unproven cap, its accepted packets count
