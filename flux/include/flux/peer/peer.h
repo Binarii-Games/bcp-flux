@@ -277,13 +277,6 @@ namespace bcp::flux
         uint32_t unprovenPacketsSeen;
         uint64_t knockStartedAtMicros;
 
-        /** Set on the initiating side from the moment its knock window opens
-            until the handshake behind it completes. A knocked peer is
-            established under the interim key, so without this the retry pass
-            would skip it and a lost opener would never be resent. The
-            responder leaves it clear: it answers handshakes, it does not
-            start them. */
-        bool     knockHandshakePending;
 
         uint32_t slowStartThreshold;      ///< below it the budget doubles per round-trip;
                                           ///< at or above, the curve decides

@@ -144,8 +144,8 @@ namespace bcp::flux
 
         // A working session under the interim key: flows admit, packets number
         // and acknowledge, and the peer's replies open. The handshake is still
-        // owed, which knockHandshakePending says, so the retry pass keeps
-        // covering this peer even though it reads as established.
+        // owed, and the retry pass finds this peer because the handshake state
+        // below is left where it was, so IsValid stays false until it lands.
         peer.theirPk    = certKey;
         peer.nonceLane       = NonceLaneBetween(mine.publicKey, certKey);
         peer.session    = peer.knockKey;
@@ -158,7 +158,6 @@ namespace bcp::flux
         // make it refuse the one that arrives. CanCarryTraffic is what says the
         // interim key is usable meanwhile.
         peer.confirmed   = false;
-        peer.knockHandshakePending = true;
         if (peer.congestionBudget < minCongestionBudget_)
             peer.congestionBudget = minCongestionBudget_;
         return true;

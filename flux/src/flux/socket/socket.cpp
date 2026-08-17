@@ -2645,7 +2645,6 @@ namespace bcp::flux
             // and it is wiped when a packet opens under this key.
             peer.knockActive = false;
             peer.knockFramed = false;
-            peer.knockHandshakePending = false;
             common::crypto::Wipe(peer.knockKey.data(), peer.knockKey.size());
             common::crypto::Wipe(peer.knockHeaderKey.data(), peer.knockHeaderKey.size());
         }

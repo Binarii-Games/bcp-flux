@@ -490,7 +490,6 @@ namespace bcp::flux
         p->awaitingAddressProof = false;
         p->unprovenPacketsSeen  = 0;
         p->knockStartedAtMicros = 0;
-        p->knockHandshakePending = false;
         p->slowStartThreshold   = UINT32_MAX;   // pure fast-ramp until the first loss
         p->slowStartQueueSinceMicros = 0;
         p->rtt.Reset();
