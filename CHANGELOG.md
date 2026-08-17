@@ -7,7 +7,7 @@ All notable changes to Flux and `common` are recorded here. The format follows
 Before 1.0 the wire format and the API may change between any two versions, and a
 security fix is allowed to change either.
 
-## [Unreleased]
+## [0.5.0] - 2026-08-17
 
 ### Added
 - Session key rotation. The key is now a chain: each rotation derives the next
@@ -148,7 +148,7 @@ security fix is allowed to change either.
   had not yet been compiled or run at this release. The wire format and API may
   still change before 1.0.
 
-[Unreleased]: https://github.com/Binarii-Games/bcp-flux/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/Binarii-Games/bcp-flux/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Binarii-Games/bcp-flux/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/Binarii-Games/bcp-flux/compare/v0.3.0...v0.3.5
 [0.3.0]: https://github.com/Binarii-Games/bcp-flux/compare/v0.2.0...v0.3.0

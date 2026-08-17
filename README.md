@@ -123,7 +123,7 @@ include(FetchContent)
 FetchContent_Declare(
   flux
   GIT_REPOSITORY https://github.com/Binarii-Games/bcp-flux.git
-  GIT_TAG        v0.4.0
+  GIT_TAG        v0.5.0
 )
 FetchContent_MakeAvailable(flux)
 
