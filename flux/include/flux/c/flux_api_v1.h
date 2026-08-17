@@ -48,6 +48,12 @@
    rather not ask. Checked against the C++ constant at build time. */
 #define FLUX_SAFE_PAYLOAD_BYTES 968
 
+/* A resume note, always this size. A peer issues one over an established
+   session, the holder persists the bytes, and handing them back after a
+   restart brings the session up with no handshake at all. Nothing secret is
+   inside, so wherever they land needs no more care than a certificate. */
+#define FLUX_RESUME_NOTE_BYTES  80
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -246,6 +252,10 @@ typedef uint32_t FluxEventBits;
    Fetching a fresh certificate answers both. */
 #define FLUX_EVENT_PEER_CERT_MISMATCH     (1u << 13)
 
+/* This peer issued a resume note and this socket kept it, which it only does
+   when the config asked. Read it with PeerResumeNote and persist it. */
+#define FLUX_EVENT_RESUME_NOTE_RECEIVED   (1u << 14)
+
 /* One message, as Messages reports it. bytes aims into the socket's receive
    pool: real memory, read-only, valid from the Messages call that produced it
    until ReleasePacket frees the packet it lives in — writing through it is
@@ -420,6 +430,15 @@ typedef struct {
        certificate has not caught up can still open toward this socket. 0 is a
        socket that never rotates. Init refuses more than the transport holds. */
     uint32_t    identityHistory;
+
+    /* Nonzero keeps resume notes peers issue, so PeerResumeNote can hand the
+       bytes over. Off by default: a server issues notes and has no reason to
+       keep the ones its clients issue back. Issuing is unaffected. */
+    uint32_t    keepResumeNotes;
+
+    /* Validity stamped into notes this socket issues, in seconds. 0 takes the
+       default of two days. */
+    uint32_t    resumeNoteSeconds;
 
     FluxKnockConfig knock;
     FluxBackend backend;
@@ -741,6 +760,30 @@ typedef struct {
                                                const uint8_t tag[FLUX_TAG_SIZE]);
     uint32_t  (FLUX_CALL *MaxPayload)         (FluxSocket*, FluxPeer);
     uint32_t  (FLUX_CALL *PacketIsKnock)     (FluxSocket*, FluxPacket);
+
+    /* Resumption.
+
+       PeerResumeNote copies out the note this peer most recently issued, as
+       the RESUME_NOTE_RECEIVED event announced, and returns how many bytes it
+       wrote or 0 when there is none. Persist them.
+
+       PeerResuming is PeerExpecting with one of those notes presented. The
+       note rides inside the first packet, and because opening that packet
+       proves this socket holds the key the note names, the two together are
+       what a handshake would have established: the session is live from the
+       first exchange with none of it having run. That is what a process which
+       died and restarted uses instead of waiting out the entry the far side
+       still holds for the session it lost.
+
+       A note that will not open, or that names a tag the far side no longer
+       trusts, costs nothing: the opener is treated as a first contact and the
+       ordinary handshake carries it. FLUX_NONE when the address will not
+       resolve, no loaded certificate carries the tag, or knocking is off. */
+    uint32_t  (FLUX_CALL *PeerResumeNote)   (FluxSocket*, FluxPeer,
+                                             uint8_t* out, uint32_t cap);
+    FluxPeer  (FLUX_CALL *PeerResuming)     (FluxSocket*, const char* host, uint16_t port,
+                                             const uint8_t tag[FLUX_TAG_SIZE],
+                                             const uint8_t note[FLUX_RESUME_NOTE_BYTES]);
 } FluxApiV1;
 
 /* The one symbol anybody has to find. Cast what comes back to the struct for

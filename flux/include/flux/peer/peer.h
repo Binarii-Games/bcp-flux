@@ -94,12 +94,6 @@ namespace bcp::flux
             session, discarded with it. */
         common::crypto::SessionKey macKey;
 
-        /** Second secret derived at the handshake beside the session key,
-            under its own label, so neither reveals the other. Reserved for
-            session resumption. Never used for traffic and never rotated.
-            Wiped with the peer. */
-        common::crypto::SessionKey resumeRoot;
-
         /** Old talking keys, held only between our own rotation and the
             peer's first packet under the new generation. The peer keeps
             sealing under the old key until a rotated packet reaches it, so

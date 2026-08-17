@@ -466,7 +466,6 @@ namespace bcp::flux
     }
 
     void Socket::DeriveSessionInto(common::crypto::SessionKey& outSession,
-                                    common::crypto::SessionKey& outResume,
                                     const common::crypto::SecretKey& mySk,
                                     const common::crypto::PublicKey& theirPk,
                                     const common::crypto::SecretKey& myEphSk,
@@ -480,32 +479,20 @@ namespace bcp::flux
         // same answer, which is what the confirmation MAC then proves. Either
         // one alone loses the other property.
         //
-        // One KDF pass per root. The long-lived secret keys the hash and the
-        // ephemeral one leads the context, which keeps each derivation to a
-        // single call and leaves the vendored crypto floor untouched. The
-        // resume root prefixes a label to the same context, so the two roots
-        // are independent: holding either tells nothing about the other, and
-        // both come from material wiped before this returns.
+        // One KDF pass. The long-lived secret keys the hash and the ephemeral
+        // one leads the context, which keeps the derivation to a single call
+        // and leaves the vendored crypto floor untouched.
         common::crypto::SharedSecret staticShared;
         common::crypto::SharedSecret ephShared;
         common::crypto::ComputeSharedSecret(staticShared, mySk, theirPk);
         common::crypto::ComputeSharedSecret(ephShared, myEphSk, theirEphPk);
 
-        uint8_t context[sizeof(internal::RESUME_ROOT_LABEL) + common::crypto::SHARED_SIZE
-                        + internal::HS_TRANSCRIPT_SIZE];
+        uint8_t context[common::crypto::SHARED_SIZE + internal::HS_TRANSCRIPT_SIZE];
         std::memcpy(context, ephShared.data(), ephShared.size());
         std::memcpy(context + ephShared.size(), transcript, transcriptLen);
 
         common::crypto::DeriveSessionKey(outSession, staticShared, context,
                                          ephShared.size() + transcriptLen);
-
-        std::memmove(context + sizeof(internal::RESUME_ROOT_LABEL), context,
-                     ephShared.size() + transcriptLen);
-        std::memcpy(context, internal::RESUME_ROOT_LABEL, sizeof(internal::RESUME_ROOT_LABEL));
-
-        common::crypto::DeriveSessionKey(outResume, staticShared, context,
-                                         sizeof(internal::RESUME_ROOT_LABEL)
-                                         + ephShared.size() + transcriptLen);
 
         common::crypto::Wipe(context, sizeof(context));
         common::crypto::Wipe(ephShared.data(), ephShared.size());
@@ -2560,10 +2547,8 @@ namespace bcp::flux
         BuildTranscript(transcript, mine.publicKey, pk, ephI, ephR, saltI, saltR, initiatorCaps, responderCaps, internal::VERSION, responderVersion, tag);
 
         common::crypto::SessionKey session;
-        common::crypto::SessionKey scratchResume;   // proof needs the session alone
-        DeriveSessionInto(session, scratchResume, mine.secretKey, pk, ephSk, ephR,
+        DeriveSessionInto(session, mine.secretKey, pk, ephSk, ephR,
                           transcript, sizeof(transcript));
-        common::crypto::Wipe(scratchResume.data(), scratchResume.size());
 
         common::crypto::Mac expected;
         common::crypto::ComputeMac(expected, session, transcript, sizeof(transcript));
@@ -2634,7 +2619,7 @@ namespace bcp::flux
 
         peer.theirPk = theirPk;
         peer.nonceLane    = NonceLaneBetween(mine.publicKey, theirPk);
-        DeriveSessionInto(peer.session, peer.resumeRoot, mine.secretKey, theirPk,
+        DeriveSessionInto(peer.session, mine.secretKey, theirPk,
                           myEphSk, theirEphPk, transcript, transcriptLen);
         // Split off the counter-masking key and the MAC-only key, under
         // distinct labels so no two derivations share a domain.

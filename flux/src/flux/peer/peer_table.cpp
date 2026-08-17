@@ -440,7 +440,6 @@ namespace bcp::flux
         p->prevNonceLane    = 0;
         p->headerKey   = {};
         p->macKey      = {};
-        p->resumeRoot    = {};
         p->prevSession   = {};
         p->prevHeaderKey = {};
         p->prevMacKey    = {};

@@ -539,7 +539,7 @@ because each is one job and neither of those is:
 
 | File | Holds |
 |---|---|
-| `crypto/packet_seal.cpp` | the two seals and the two opens, and nothing that reaches a peer, a flow or a pool |
+| `crypto/packet_seal.cpp` | one seal and one open per framing, at whichever security level the caller picked, and nothing that reaches a peer, a flow or a pool |
 | `flow/flow_batching.cpp` | the open batch on a sending association: what may join it and what its bytes cost |
 | `flow/assoc_directory.cpp` | flow id to slot index, per peer, per direction |
 | `peer/congestion.cpp` | the budget, loss and delay signals both, which belongs to the peer and not to any one flow |
@@ -556,7 +556,7 @@ plus a wide interface.
 
 ### Operation paths
 
-#### Reaching a peer: three keys, one sweep, one raw index
+#### Reaching a peer: four keys, one sweep, one raw index
 
 | Route | Call | When |
 |---|---|---|
@@ -564,12 +564,17 @@ plus a wide interface.
 | by id | `PeerTable::GetPeer(const BcpId&)` | after a peer proves an id, survives migration |
 | by tag | `PeerTable::GetPeersByTag(...)` | migration only, multi-valued |
 
-All three return a read-locked `PeerHandle`. The tag route is multi-valued
+A fourth exists for naming a peer outside this library, where an address is
+too large to hand over and a bare slot index is unsafe: `GetPeer(slot,
+generation)`, which proves the slot has not been recycled since the pair was
+handed out. The C API is its only caller.
+
+All four return a read-locked `PeerHandle`. The tag route is multi-valued
 because one peer holds several tags at once (its rotation window, capped at
 `MAX_TAGS_PER_PEER`) and two peers may derive the same tag by chance. A clash
 resolves by trial decryption.
 
-Two more routes exist and neither yields a handle. `CollectAddresses` copies out
+Two further routes yield no handle at all. `CollectAddresses` copies out
 every live address so the tick and `Flush` can walk peers without holding the
 table, and it takes the writer lock, which is the opposite profile from the three
 lookups above. And a bare slot index, handed out by `RegisterPeer`, is what the
@@ -577,18 +582,33 @@ handshake carries between its steps: every binding call (`BindId`, `BindTag`,
 `UnbindTags`, `UpdateAddress`) is keyed on that index rather than on a handle.
 Reads go through a verified key; those mutations do not.
 
-#### Opening a session: two triggers, one handshake
+#### Opening a session: two triggers, one handshake, one resume
 
 | Trigger | When | What it carries |
 |---|---|---|
 | `HS_INIT` | nothing is known about the target | nothing, it only asks to be challenged |
 | `HS_KNOCK` | a certificate is named for the target | an interim key and application data |
+| `HS_KNOCK` with a resume note | a note that target issued before is presented | the above, and proof of a prior session |
 
-Both end in the same place: the receiver answers with the ordinary stateless
-challenge, and the `HS_CHLG` / `HS_RES` / `HS_FINISH` exchange that follows is
-one path with no knowledge of which trigger started it. The cookie echo in
-`HS_RES` proves the address either way, and the session it derives is the same
-session. There is no second handshake and no second way to prove an address.
+The first two end in the same place: the receiver answers with the ordinary
+stateless challenge, and the `HS_CHLG` / `HS_RES` / `HS_FINISH` exchange that
+follows is one path with no knowledge of which trigger started it. The cookie
+echo in `HS_RES` proves the address either way, and the session it derives is
+the same session. There is no second handshake and no second way to prove an
+address.
+
+The third runs none of that. Opening the packet proves the sender holds the key
+it presents, and the note proves that key held a session with this socket, so
+between them they have already established what the exchange would have. The
+peer is installed confirmed, with whatever authentication the trust store gives
+its tag now, and no challenge is sent because nothing is owed. A note that will
+not open leaves an ordinary first contact behind it, so the path is additive:
+nothing that worked before behaves differently.
+
+A returning peer usually arrives holding a stale entry from the session it
+lost, which is why an opener whose stored keys cannot open it falls through to
+the key agreement rather than being refused. That fall-through is what makes a
+peer which has lost its keys recognisable at all.
 
 #### Three security levels
 

@@ -367,6 +367,8 @@ void FLUX_CALL flux_default_config(FluxConfig* out)
     out->rotateAfterBytes          = d.rotateAfterBytes;
     out->trustedCertCount          = d.trustedCertCount;
     out->identityHistory           = d.identityHistory;
+    out->keepResumeNotes           = d.keepResumeNotes ? 1u : 0u;
+    out->resumeNoteSeconds         = d.resumeNoteSeconds;
     out->knock.enable              = d.knock.enable ? 1u : 0u;
     out->knock.maxUnprovenPeers    = d.knock.maxUnprovenPeers;
     out->knock.unprovenPacketLimit = d.knock.unprovenPacketLimit;
@@ -443,6 +445,8 @@ FLUX_GUARD_BEGIN
     if (in->identityHistory > flux::internal::MAX_IDENTITY_HISTORY)
         return FLUX_ERR_INVALID_PARAM;
     cfg.identityHistory      = static_cast<uint8_t>(in->identityHistory);
+    cfg.keepResumeNotes      = in->keepResumeNotes != 0;
+    cfg.resumeNoteSeconds    = in->resumeNoteSeconds;
 
     cfg.knock.enable              = in->knock.enable != 0;
     cfg.knock.maxUnprovenPeers    = in->knock.maxUnprovenPeers;
@@ -1192,6 +1196,8 @@ static_assert(FLUX_CERT_SIZE == flux::Certificate::PINNED_SIZE,
               "FLUX_CERT_SIZE must match the serialized certificate");
 static_assert(FLUX_SAFE_PAYLOAD_BYTES == flux::Socket::SAFE_PAYLOAD_BYTES,
               "FLUX_SAFE_PAYLOAD_BYTES must match the always-safe payload");
+static_assert(FLUX_RESUME_NOTE_BYTES == flux::Socket::RESUME_NOTE_BYTES,
+              "FLUX_RESUME_NOTE_BYTES must match the size a resume note is");
 
 FluxError FLUX_CALL flux_identity_generate(const uint8_t* tag, uint8_t* out)
 {
@@ -1309,6 +1315,36 @@ FLUX_GUARD_BEGIN
 FLUX_GUARD_END(FLUX_NONE)
 }
 
+uint32_t FLUX_CALL flux_peer_resume_note(FluxSocket* s, FluxPeer name,
+                                         uint8_t* out, uint32_t cap)
+{
+    if (s == nullptr || out == nullptr) return 0;
+FLUX_GUARD_BEGIN
+    flux::Address addr;
+    if (!PeerAddressOf(Box(s), name, addr)) return 0;
+    return Box(s)->socket.ResumeNoteFor(addr, out, cap);
+FLUX_GUARD_END(0)
+}
+
+FluxPeer FLUX_CALL flux_peer_resuming(FluxSocket* s, const char* host, uint16_t port,
+                                     const uint8_t* tag, const uint8_t* note)
+{
+    if (s == nullptr || host == nullptr || tag == nullptr || note == nullptr)
+        return FLUX_NONE;
+FLUX_GUARD_BEGIN
+    common::Result<flux::Address> resolved = flux::Address::From(host, port);
+    if (resolved.isErr()) return FLUX_NONE;
+    const flux::Address addr = resolved.Take();
+
+    flux::Certificate::IdentityTag expect{};
+    std::memcpy(expect.data(), tag, expect.size());
+    if (Box(s)->socket.Connect(addr, expect, note, FLUX_RESUME_NOTE_BYTES)
+        != common::Error::Ok)
+        return FLUX_NONE;
+    return PeerNameOf(Box(s), addr);
+FLUX_GUARD_END(FLUX_NONE)
+}
+
 uint32_t FLUX_CALL flux_max_payload(FluxSocket* s, FluxPeer name)
 {
     if (s == nullptr) return 0;
@@ -1413,6 +1449,9 @@ static const FluxApiV1 API_V1 = {
     flux_peer_expecting,
     flux_max_payload,
     flux_packet_is_knock,
+
+    flux_peer_resume_note,
+    flux_peer_resuming,
 };
 extern "C" const void* FLUX_CALL flux_get_api(uint32_t version)
 {

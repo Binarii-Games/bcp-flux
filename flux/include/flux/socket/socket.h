@@ -1370,7 +1370,6 @@ namespace bcp::flux
             returns, which is what makes the session unrecoverable once the
             handshake is over. */
         void DeriveSessionInto(common::crypto::SessionKey& outSession,
-                               common::crypto::SessionKey& outResume,
                                const common::crypto::SecretKey& mySk,
                                const common::crypto::PublicKey& theirPk,
                                const common::crypto::SecretKey& myEphSk,

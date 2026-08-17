@@ -25,10 +25,25 @@ security fix is allowed to change either.
   a send past it is refused with `TooLarge` rather than truncated or silently
   dropped. An opener honours the security level the caller picked, so a
   mac-only send inside the window travels readable and unpadded rather than
-  being quietly upgraded to encrypted.
+  being quietly upgraded to encrypted. `SAFE_PAYLOAD_BYTES` is 968: any opener
+  may carry a resume note, and a figure that always fits has to account for
+  one.
 - `RemoveCertificate` revokes a pinned identity at runtime. The tag's entry
   is kept with its key wiped and version cleared, so every later check
   against it fails hard rather than falling open.
+- Session resumption. A process that dies and restarts brings its session back
+  with no handshake at all, instead of waiting up to thirty seconds for the far
+  side to evict the entry it still holds. Each side seals a note for its peer
+  once a session confirms, sealed for the issuer's own future self so the
+  holder stores bytes it cannot read and the issuer stores nothing. Presenting
+  one at `Connect` puts it inside the first packet: opening that packet proves
+  the sender holds the key the note names, so the two together are what the
+  exchange would have established. The tag inside is re-checked against the
+  trust store rather than believed, so a revoked certificate stops a resumption
+  too. Nothing secret is in a note, so the bytes are handed to the application
+  and loaded back exactly as certificates are, and a note that will not open
+  leaves an ordinary first contact behind it. Notes are kept only when
+  `Config::keepResumeNotes` asks, and last 48 hours by default.
 - Identity rotation. `RotateIdentity` replaces the keypair a socket proves its
   tag with, under live traffic, without changing the tag, so running sessions
   and peer relationships are untouched. Previous keypairs are kept as

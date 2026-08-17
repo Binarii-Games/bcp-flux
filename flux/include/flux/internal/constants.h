@@ -133,9 +133,6 @@ namespace bcp::flux::internal
     static constexpr uint8_t KEY_ROTATE_LABEL[16] = {
         'f','l','u','x','-','k','e','y','-','r','o','t','a','t','e',0
     };
-    static constexpr uint8_t RESUME_ROOT_LABEL[16] = {
-        'f','l','u','x','-','r','e','s','u','m','e',0,0,0,0,0
-    };
     static constexpr uint8_t KNOCK_KEY_LABEL[16] = {
         'f','l','u','x','-','k','n','o','c','k',0,0,0,0,0,0
     };
