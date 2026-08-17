@@ -23,14 +23,30 @@
    One symbol is exported, flux_get_api. It hands back this version's table of
    function pointers and everything else comes from the table.
 
-   Not in v1: certificates and identity. A socket built through this API is
-   anonymous and has no trust store, so no peer can ever be authenticated and
-   SendSecured, which is here for the shape of the thing, never delivers.
-   Loading certificates is what a later version adds. */
+   Certificates and identity are here. A socket given no identity is still
+   anonymous and a socket given no trust store still authenticates nobody, so
+   the earlier behaviour is what leaving those fields alone produces. */
 #ifndef FLUX_API_V1_H
 #define FLUX_API_V1_H
 
 #include <stdint.h>
+
+/* Fixed sizes a binding allocates against. An identity is the private form,
+   secret key then tag, which is exactly what a private identity file holds. A
+   certificate is the public form, version then key then tag. Both are plain
+   caller-owned bytes rather than handles, because a server has to persist its
+   identity and a handle could never leave the process. The secret half of an
+   identity is secret: whoever holds those bytes owns protecting and wiping
+   them, the same duty the identity file already carries. */
+#define FLUX_TAG_SIZE       32
+#define FLUX_IDENTITY_SIZE  64
+#define FLUX_CERT_SIZE      65
+
+/* Payload bytes that always fit, whatever the target's state. MaxPayload
+   reports what one particular peer can take right now, which is larger in
+   every case but the tightest; this is the figure for a caller that would
+   rather not ask. Checked against the C++ constant at build time. */
+#define FLUX_SAFE_PAYLOAD_BYTES 1049
 
 #ifdef __cplusplus
 extern "C" {
@@ -213,6 +229,23 @@ typedef uint32_t FluxEventBits;
    the flow stall timeout takes it. */
 #define FLUX_EVENT_TRANSFER_INCOMING      (1u << 10)
 
+/* This peer arrived on a first-flight opener, so its data was delivered
+   before its address was proven. Every message that rode it also answers
+   PacketWasKnock, which is the per-message form of the same news. */
+#define FLUX_EVENT_PEER_KNOCKED           (1u << 11)
+
+/* This peer's opener named a key this socket has since replaced, so its
+   certificate for us is out of date. Its data still arrived. Its handshake
+   will be answered with the current key and refused until it holds a fresh
+   certificate. */
+#define FLUX_EVENT_PEER_STALE_IDENTITY    (1u << 12)
+
+/* A peer announced a tag this socket trusts but presented a key that tag is
+   not pinned to, so the session was refused. Either it rotated its identity
+   and the certificate here is stale, or something is impersonating it.
+   Fetching a fresh certificate answers both. */
+#define FLUX_EVENT_PEER_CERT_MISMATCH     (1u << 13)
+
 /* One message, as Messages reports it. bytes aims into the socket's receive
    pool: real memory, read-only, valid from the Messages call that produced it
    until ReleasePacket frees the packet it lives in — writing through it is
@@ -331,6 +364,20 @@ typedef struct {
     uint8_t       reserved[4];
 } FluxEventsConfig;
 
+/* The first-flight opener. A send to a peer named through PeerExpecting, whose
+   certificate this socket holds, carries application data in its first packet
+   under a key the sender derives alone, while the ordinary handshake completes
+   behind it. All zero leaves it off, which is what every socket did before it
+   existed. Every count zero takes a workable default. */
+typedef struct {
+    uint32_t enable;              /* nonzero sends openers; receiving one is always handled */
+    uint32_t maxUnprovenPeers;    /* peers allowed to exist before their address is proven */
+    uint32_t unprovenPacketLimit; /* packets one unproven peer may land before the rest drop */
+    uint32_t budgetPerTick;       /* openers one Update pass will pay a key agreement for */
+    uint32_t ttlWindowSeconds;    /* clock disagreement past which an opener is stale */
+    uint32_t ringSize;            /* recent openers remembered, so a replay is refused */
+} FluxKnockConfig;
+
 typedef struct {
     FluxFlowsConfig    flows;
     FluxLivenessConfig liveness;
@@ -355,6 +402,27 @@ typedef struct {
     uint32_t    migrateBudgetPerPoll; /* unknown-address tag lookups one Poll pass spends
                                          before dropping the rest; 0 disables migration receive */
     uint32_t    replayWindowBits;     /* tolerance for out-of-order secure packets */
+
+    /* This socket's own long-term identity, FLUX_IDENTITY_SIZE bytes, copied
+       by Init so the caller may wipe its own afterwards. Null is anonymous: a
+       fresh keypair and a zero tag, which no peer can pin. */
+    const uint8_t* identity;
+
+    /* Bytes sealed to one peer before its session key rotates itself. 0 takes
+       the default. */
+    uint64_t    rotateAfterBytes;
+
+    /* Certificates this socket may pin. 0 disables the trust store, so
+       LoadCertificate fails, every peer stays unauthenticated and SendSecured
+       never delivers. */
+    uint32_t    trustedCertCount;
+
+    /* Previous keypairs kept past a RotateIdentity, so a peer whose
+       certificate has not caught up can still open toward this socket. 0 is a
+       socket that never rotates. Init refuses more than the transport holds. */
+    uint32_t    identityHistory;
+
+    FluxKnockConfig knock;
     FluxBackend backend;
     uint16_t    port;
     uint8_t     enableMigration;      /* a session survives its peer's address changing */
@@ -377,7 +445,9 @@ typedef struct {
     uint32_t offsetofConfigEvents;
     uint32_t offsetofConfigTimers;
     uint32_t offsetofConfigPort;
-    uint32_t reserved[4];
+    uint32_t sizeofKnockConfig;
+    uint32_t offsetofConfigKnock;
+    uint32_t reserved[2];
 } FluxLayout;
 
 /* The table. One struct per version, frozen when it ships; a later version is
@@ -605,6 +675,73 @@ typedef struct {
     uint64_t  (FLUX_CALL *TransferProgress)(FluxSocket*, uint16_t transferId, FluxPeer);
     uint32_t  (FLUX_CALL *PollTransfers)   (FluxSocket*, FluxTransferView* out, uint32_t max);
     FluxError (FLUX_CALL *CompleteTransfer)(FluxSocket*, uint16_t transferId, FluxPeer);
+
+    /* Identity and certificates.
+
+       IdentityGenerate makes a fresh keypair carrying tag and writes the
+       private form. IdentityCertificate derives the public form from it, which
+       is the artifact handed to whoever should trust this socket. Neither
+       needs a socket, so a tool can mint an identity without starting one.
+
+       LoadCertificate pins a key to a tag, and loading again for a tag already
+       held replaces it in place, which is how a peer's rotation is adopted and
+       how a revoked tag is trusted again. RemoveCertificate withdraws one: the
+       entry stays with its key wiped, so every later check on that tag fails
+       hard rather than falling back to unauthenticated, which is stronger than
+       never having pinned it. NotFound when the tag was never pinned. */
+    FluxError (FLUX_CALL *IdentityGenerate)   (const uint8_t tag[FLUX_TAG_SIZE],
+                                               uint8_t out[FLUX_IDENTITY_SIZE]);
+    FluxError (FLUX_CALL *IdentityCertificate)(const uint8_t identity[FLUX_IDENTITY_SIZE],
+                                               uint8_t out[FLUX_CERT_SIZE]);
+    FluxError (FLUX_CALL *LoadCertificate)    (FluxSocket*, const uint8_t cert[FLUX_CERT_SIZE]);
+    FluxError (FLUX_CALL *RemoveCertificate)  (FluxSocket*, const uint8_t tag[FLUX_TAG_SIZE]);
+
+    /* Replaces the keypair this socket proves its tag with, under live
+       traffic. The tag does not change, so peer relationships survive and
+       sessions already running are untouched, their keys having come from the
+       handshake rather than from this one. Previous keypairs are kept as
+       Config::identityHistory allows, so a peer still holding the old
+       certificate can open toward this socket while its copy catches up.
+       InvalidParam when the identity carries a different tag.
+
+       ForgetPreviousIdentities wipes those retained keys, so an opener naming
+       one stops being answerable and its sender falls back to the plain
+       handshake. That is the answer to a leaked key.
+
+       IdentityTag writes this socket's tag and returns its length, or 0 when
+       the socket is anonymous. */
+    FluxError (FLUX_CALL *RotateIdentity)     (FluxSocket*,
+                                               const uint8_t identity[FLUX_IDENTITY_SIZE]);
+    void      (FLUX_CALL *ForgetPreviousIdentities)(FluxSocket*);
+    uint32_t  (FLUX_CALL *IdentityTag)        (FluxSocket*, uint8_t out[FLUX_TAG_SIZE]);
+
+    /* Moves one peer's session key along its chain. Nothing is announced: the
+       far side discovers the change when a packet opens under the next link.
+       Config::rotateAfterBytes does the same on a byte threshold. */
+    FluxError (FLUX_CALL *RotateKeys)         (FluxSocket*, FluxPeer);
+
+    /* The first-flight opener.
+
+       PeerExpecting is Peer with the identity expected at that address named,
+       so the first send can carry data encrypted toward that identity's pinned
+       certificate. The certificate must already be loaded. Without this a
+       first send takes the plain handshake. FLUX_NONE when no loaded
+       certificate carries the tag, or when knocking is off.
+
+       MaxPayload is how many payload bytes the next packet to this peer can
+       carry, as a caller may put them: smaller while the first packet must
+       still open a session, full once it has. A send past it is refused rather
+       than truncated, so a binding either asks or sizes to
+       FLUX_SAFE_PAYLOAD_BYTES. 0 means the peer is gone.
+
+       PacketWasKnock says a received packet arrived on an opener, before its
+       sender's address was proven. Such a packet can be presented twice by a
+       replayed opener in one narrow case, so an application that must not act
+       twice reads this and decides what it accepts there. */
+    FluxPeer  (FLUX_CALL *PeerExpecting)      (FluxSocket*, const char* host, uint16_t port,
+                                               const uint8_t tag[FLUX_TAG_SIZE]);
+    uint32_t  (FLUX_CALL *MaxPayload)         (FluxSocket*, FluxPeer);
+    uint32_t  (FLUX_CALL *PacketWasKnock)     (FluxSocket*, FluxPacket);
 } FluxApiV1;
 
 /* The one symbol anybody has to find. Cast what comes back to the struct for

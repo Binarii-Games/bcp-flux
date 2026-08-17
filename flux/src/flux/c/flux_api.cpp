@@ -351,6 +351,8 @@ void FLUX_CALL flux_layout_check(FluxLayout* out)
     out->offsetofConfigEvents   = static_cast<uint32_t>(offsetof(FluxConfig, events));
     out->offsetofConfigTimers   = static_cast<uint32_t>(offsetof(FluxConfig, timers));
     out->offsetofConfigPort     = static_cast<uint32_t>(offsetof(FluxConfig, port));
+    out->sizeofKnockConfig      = static_cast<uint32_t>(sizeof(FluxKnockConfig));
+    out->offsetofConfigKnock    = static_cast<uint32_t>(offsetof(FluxConfig, knock));
 }
 
 void FLUX_CALL flux_default_config(FluxConfig* out)
@@ -361,6 +363,16 @@ void FLUX_CALL flux_default_config(FluxConfig* out)
     // two can never disagree about what a fresh socket starts from.
     const flux::Socket::Config d{};
     std::memset(out, 0, sizeof(*out));
+
+    out->rotateAfterBytes          = d.rotateAfterBytes;
+    out->trustedCertCount          = d.trustedCertCount;
+    out->identityHistory           = d.identityHistory;
+    out->knock.enable              = d.knock.enable ? 1u : 0u;
+    out->knock.maxUnprovenPeers    = d.knock.maxUnprovenPeers;
+    out->knock.unprovenPacketLimit = d.knock.unprovenPacketLimit;
+    out->knock.budgetPerTick       = d.knock.budgetPerTick;
+    out->knock.ttlWindowSeconds    = d.knock.ttlWindowSeconds;
+    out->knock.ringSize            = d.knock.ringSize;
 
     out->flows.maxTransferBytes    = d.flows.maxTransferBytes;
     out->flows.flowCount           = d.flows.flowCount;
@@ -427,6 +439,35 @@ FLUX_GUARD_BEGIN
     cfg.replayWindowBits     = in->replayWindowBits;
     cfg.enableMigration      = in->enableMigration != 0;
     cfg.migrateBudgetPerPoll = in->migrateBudgetPerPoll;
+    cfg.rotateAfterBytes     = in->rotateAfterBytes;
+    cfg.trustedCertCount     = in->trustedCertCount;
+    if (in->identityHistory > flux::internal::MAX_IDENTITY_HISTORY)
+        return FLUX_ERR_INVALID_PARAM;
+    cfg.identityHistory      = static_cast<uint8_t>(in->identityHistory);
+
+    cfg.knock.enable              = in->knock.enable != 0;
+    cfg.knock.maxUnprovenPeers    = in->knock.maxUnprovenPeers;
+    cfg.knock.unprovenPacketLimit = in->knock.unprovenPacketLimit;
+    cfg.knock.budgetPerTick       = in->knock.budgetPerTick;
+    cfg.knock.ttlWindowSeconds    = in->knock.ttlWindowSeconds;
+    cfg.knock.ringSize            = in->knock.ringSize;
+
+    // Init copies the identity, so the parsed one is wiped as this scope ends
+    // and the only lasting copy of the secret is the socket's own.
+    flux::Identity identity;
+    if (in->identity != nullptr)
+    {
+        common::Result<flux::Identity> parsed =
+            flux::Identity::Parse(in->identity, FLUX_IDENTITY_SIZE);
+        if (parsed.isErr()) return FLUX_ERR_INVALID_PARAM;
+        identity     = parsed.Take();
+        cfg.identity = &identity;
+    }
+    const struct IdentityWipe
+    {
+        flux::Identity& held;
+        ~IdentityWipe() { held.Wipe(); }
+    } identityWipe{ identity };
 
     cfg.flows.flowCount           = in->flows.flowCount;
     cfg.flows.outCount            = in->flows.outCount;
@@ -1141,6 +1182,162 @@ FluxError FLUX_CALL flux_complete_transfer(FluxSocket* s, uint16_t transferId, F
 // The initializer is positional, so this order and the struct's order in
 // flux_api_v1.h are the same order, and a line moved in one has to move in the
 // other.
+// --- Identity and certificates ---
+
+// The C constant is what a binding sizes buffers against and the C++ one is
+// what the transport enforces, so the build refuses to let them drift.
+static_assert(FLUX_TAG_SIZE == flux::Certificate::IDENTITY_TAG_SIZE,
+              "FLUX_TAG_SIZE must match the certificate's tag");
+static_assert(FLUX_IDENTITY_SIZE == flux::Identity::FILE_SIZE,
+              "FLUX_IDENTITY_SIZE must match the serialized identity");
+static_assert(FLUX_CERT_SIZE == flux::Certificate::PINNED_SIZE,
+              "FLUX_CERT_SIZE must match the serialized certificate");
+static_assert(FLUX_SAFE_PAYLOAD_BYTES == flux::Socket::SAFE_PAYLOAD_BYTES,
+              "FLUX_SAFE_PAYLOAD_BYTES must match the always-safe payload");
+
+FluxError FLUX_CALL flux_identity_generate(const uint8_t* tag, uint8_t* out)
+{
+    if (tag == nullptr || out == nullptr) return FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_BEGIN
+    flux::Certificate::IdentityTag wanted{};
+    std::memcpy(wanted.data(), tag, wanted.size());
+
+    common::Result<flux::Identity> made = flux::Identity::Generate(wanted);
+    if (made.isErr()) return Err(made.error);
+
+    flux::Identity identity = made.Take();
+    const bool wrote = identity.Serialize(out, FLUX_IDENTITY_SIZE);
+    identity.Wipe();
+    return wrote ? FLUX_OK : FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_END(FLUX_ERR_INVALID_PARAM)
+}
+
+FluxError FLUX_CALL flux_identity_certificate(const uint8_t* identityBytes, uint8_t* out)
+{
+    if (identityBytes == nullptr || out == nullptr) return FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_BEGIN
+    common::Result<flux::Identity> parsed =
+        flux::Identity::Parse(identityBytes, FLUX_IDENTITY_SIZE);
+    if (parsed.isErr()) return Err(parsed.error);
+
+    flux::Identity identity = parsed.Take();
+    const flux::Certificate cert = identity.ToCertificate();
+    identity.Wipe();
+    return cert.Serialize(out, FLUX_CERT_SIZE) ? FLUX_OK : FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_END(FLUX_ERR_INVALID_PARAM)
+}
+
+FluxError FLUX_CALL flux_load_certificate(FluxSocket* s, const uint8_t* certBytes)
+{
+    if (s == nullptr || certBytes == nullptr) return FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_BEGIN
+    common::Result<flux::Certificate> parsed =
+        flux::Certificate::Parse(certBytes, FLUX_CERT_SIZE);
+    if (parsed.isErr()) return Err(parsed.error);
+    return Err(Box(s)->socket.LoadCertificate(parsed.Take()));
+FLUX_GUARD_END(FLUX_ERR_INVALID_PARAM)
+}
+
+FluxError FLUX_CALL flux_remove_certificate(FluxSocket* s, const uint8_t* tag)
+{
+    if (s == nullptr || tag == nullptr) return FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_BEGIN
+    flux::Certificate::IdentityTag wanted{};
+    std::memcpy(wanted.data(), tag, wanted.size());
+    return Err(Box(s)->socket.RemoveCertificate(wanted));
+FLUX_GUARD_END(FLUX_ERR_INVALID_PARAM)
+}
+
+FluxError FLUX_CALL flux_rotate_identity(FluxSocket* s, const uint8_t* identityBytes)
+{
+    if (s == nullptr || identityBytes == nullptr) return FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_BEGIN
+    common::Result<flux::Identity> parsed =
+        flux::Identity::Parse(identityBytes, FLUX_IDENTITY_SIZE);
+    if (parsed.isErr()) return Err(parsed.error);
+
+    flux::Identity next = parsed.Take();
+    const common::Error result = Box(s)->socket.RotateIdentity(next);
+    next.Wipe();
+    return Err(result);
+FLUX_GUARD_END(FLUX_ERR_INVALID_PARAM)
+}
+
+void FLUX_CALL flux_forget_previous_identities(FluxSocket* s)
+{
+    if (s == nullptr) return;
+    Box(s)->socket.ForgetPreviousIdentities();
+}
+
+uint32_t FLUX_CALL flux_identity_tag(FluxSocket* s, uint8_t* out)
+{
+    if (s == nullptr || out == nullptr) return 0;
+FLUX_GUARD_BEGIN
+    const flux::Certificate::IdentityTag& tag = Box(s)->socket.IdentityTag();
+    bool anonymous = true;
+    for (size_t i = 0; i < tag.size(); ++i)
+        if (tag[i] != 0) { anonymous = false; break; }
+    if (anonymous) return 0;
+    std::memcpy(out, tag.data(), tag.size());
+    return static_cast<uint32_t>(tag.size());
+FLUX_GUARD_END(0)
+}
+
+FluxError FLUX_CALL flux_rotate_keys(FluxSocket* s, FluxPeer name)
+{
+    if (s == nullptr) return FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_BEGIN
+    flux::Address addr;
+    if (!PeerAddressOf(Box(s), name, addr)) return FLUX_ERR_NOT_FOUND;
+    return Err(Box(s)->socket.RotateKeys(addr));
+FLUX_GUARD_END(FLUX_ERR_INVALID_PARAM)
+}
+
+// --- The first-flight opener ---
+
+FluxPeer FLUX_CALL flux_peer_expecting(FluxSocket* s, const char* host, uint16_t port,
+                                       const uint8_t* tag)
+{
+    if (s == nullptr || host == nullptr || tag == nullptr) return FLUX_NONE;
+FLUX_GUARD_BEGIN
+    common::Result<flux::Address> resolved = flux::Address::From(host, port);
+    if (resolved.isErr()) return FLUX_NONE;
+    const flux::Address addr = resolved.Take();
+
+    flux::Certificate::IdentityTag expect{};
+    std::memcpy(expect.data(), tag, expect.size());
+    if (Box(s)->socket.Connect(addr, expect) != common::Error::Ok) return FLUX_NONE;
+    return PeerNameOf(Box(s), addr);
+FLUX_GUARD_END(FLUX_NONE)
+}
+
+uint32_t FLUX_CALL flux_max_payload(FluxSocket* s, FluxPeer name)
+{
+    if (s == nullptr) return 0;
+FLUX_GUARD_BEGIN
+    flux::Address addr;
+    if (!PeerAddressOf(Box(s), name, addr)) return 0;
+    return Box(s)->socket.MaxPayload(addr);
+FLUX_GUARD_END(0)
+}
+
+uint32_t FLUX_CALL flux_packet_was_knock(FluxSocket* s, FluxPacket name)
+{
+    if (s == nullptr) return 0;
+    SocketBox* box = Box(s);
+
+    uint32_t idx = 0;
+    if (!UnpackPacket(box, name, idx)) return 0;
+
+    // Detached rather than destroyed, as flux_messages does it: the slot is
+    // the caller's until ReleasePacket and destruction would hand it back.
+    flux::PacketSlotHandle handle = box->socket.PacketAt(idx);
+    const flux::PacketSlot* packet = handle.Read();
+    const uint32_t knocked = (packet != nullptr && packet->WasKnock()) ? 1u : 0u;
+    (void)handle.Detach();
+    return knocked;
+}
+
 static const FluxApiV1 API_V1 = {
     1,
 
@@ -1203,8 +1400,22 @@ static const FluxApiV1 API_V1 = {
     flux_transfer_progress,
     flux_poll_transfers,
     flux_complete_transfer,
-};
 
+    flux_identity_generate,
+    flux_identity_certificate,
+    flux_load_certificate,
+    flux_remove_certificate,
+
+    flux_rotate_identity,
+    flux_forget_previous_identities,
+    flux_identity_tag,
+
+    flux_rotate_keys,
+
+    flux_peer_expecting,
+    flux_max_payload,
+    flux_packet_was_knock,
+};
 extern "C" const void* FLUX_CALL flux_get_api(uint32_t version)
 {
     switch (version)

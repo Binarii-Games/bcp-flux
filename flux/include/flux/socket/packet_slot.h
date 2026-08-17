@@ -61,6 +61,19 @@ namespace bcp::flux
             payload is ciphertext. */
         bool IsMacOnly() const;
 
+        /** Whether this arrived on a first-flight opener, under the interim
+            key, before the sender's address was proven. Such a packet is
+            delivered like any other, and the one thing it does not carry is
+            the guarantee the rest do: a replayed opener can present it twice
+            if the seen-ring was lost to a restart inside the clock window.
+            So an application that must not act twice on a message reads this
+            and decides, per message, what it will accept there.
+
+            Set on this socket's copy after the open and never on the wire.
+            False for everything that arrived under a proven session, which
+            is everything after the handshake completes. */
+        bool WasKnock() const;
+
         /** Whether the content is a list of length-prefixed messages rather
             than one message. The packet is delivered whole and PollCursor walks
             the list, so a caller reading messages never has to ask. */

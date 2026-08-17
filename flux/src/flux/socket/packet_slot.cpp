@@ -45,6 +45,13 @@ namespace bcp::flux
         return IsSecure() && (Controller()[0] & ToByte(Controls::CTRL_MACONLY)) != 0;
     }
 
+    bool PacketSlot::WasKnock() const
+    {
+        if (!IsValid())
+            return false;
+        return (Controller()[0] & internal::WIRE_CTRL_KNOCKED) != 0;
+    }
+
     bool PacketSlot::IsBatch() const
     {
         if (!IsValid())
