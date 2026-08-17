@@ -599,6 +599,15 @@ crypto, for traffic that is public anyway and sent often. Unsecured carries no
 tag at all and cannot carry a flow, because a forged packet could otherwise name
 any sequence it liked.
 
+The choice holds inside a first-flight opener as well. An opener carries the
+level in its controller byte, so the two share every byte of framing and differ
+only in the transform over the interior, the same relationship the two ordinary
+seals have. An encrypted opener pads its interior to the full wire size, so no
+observer learns how much rode the first flight. A mac-only one does not, since a
+readable payload announces its own length and padding would buy nothing but
+bandwidth. The level is visible either way, which costs nothing: a readable
+payload is self-evidently readable.
+
 #### Sending: two seals, seven origins
 
 An outbound packet is sealed one of two ways. `SealSecurePacket` encrypts the

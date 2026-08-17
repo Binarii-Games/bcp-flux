@@ -92,9 +92,23 @@ namespace bcp::flux
             bodies recover, because their retransmit re-seals from staging
             under whatever framing the peer has by then, and MaxPayload told
             the caller the ceiling in the first place. */
+        /** The opener, at whichever security level the caller asked for. Both
+            levels share every byte of framing, so the header, the offsets and
+            the interior prefix are identical and only the transform over the
+            interior differs, exactly as the two ordinary seals relate.
+
+            Encrypted pads the interior to a fixed size, so no observer learns
+            how much rode the first flight. Mac-only does not, because its
+            payload is readable and there is nothing left for the padding to
+            hide, and paying full wire size for a public message would be
+            waste. That is why the level shows in the controller byte: not to
+            announce anything, since a readable payload announces itself, but
+            because the receiver has to know which transform to apply before it
+            can touch the interior at all. */
         void SealKnockPacket(PacketSlot& dst, const uint8_t* plaintext,
                              size_t bodyLen,
-                             const PeerSendMaterials& materials) noexcept
+                             const PeerSendMaterials& materials,
+                             bool macOnly) noexcept
         {
             // Unreachable through the send path: PreProcessOut refuses an
             // oversized payload before the flow admits it, and the batch
@@ -120,6 +134,7 @@ namespace bcp::flux
 
             uint8_t* header = dst.data;
             header[0] = ToByte(Controls::CTRL_INTERNAL | Controls::CTRL_UNSECURE);
+            if (macOnly) header[0] |= ToByte(Controls::CTRL_MACONLY);
             header[1] = static_cast<uint8_t>(SocketOpCode::HS_KNOCK);
             header[internal::KNOCK_OFF_VERSION]     = static_cast<uint8_t>(internal::VERSION >> 0);
             header[internal::KNOCK_OFF_VERSION + 1] = static_cast<uint8_t>(internal::VERSION >> 8);
@@ -139,6 +154,29 @@ namespace bcp::flux
                     static_cast<uint8_t>(materials.knockKeyId >> (8 * i));
             std::memcpy(header + internal::KNOCK_OFF_IDENTITY, materials.knockIdentity,
                         sizeof(materials.knockIdentity));
+
+            if (macOnly)
+            {
+                // The interior travels as it is, so one pass covers the whole
+                // packet: the header the receiver has to trust for its clock
+                // stamp and its key id, and the payload behind it. No padding,
+                // so the length field is what says where the payload ends.
+                const size_t interior = internal::KNOCK_INNER_PREFIX + bodyLen;
+                std::memcpy(dst.data + internal::KNOCK_HEADER_SIZE, inner, interior);
+                const size_t covered = internal::KNOCK_HEADER_SIZE + interior;
+
+                common::crypto::Mac mac;
+                common::crypto::ComputeMac(mac, materials.macKey, dst.data, covered);
+                std::memcpy(dst.data + covered, mac.data(), mac.size());
+                dst.dataSize = static_cast<uint16_t>(covered + internal::WIRE_TAG_SIZE);
+
+                // Last, so the MAC covered the real counter, the discipline
+                // SealMacOnlyPacket uses for the same reason.
+                MaskNonceCounter(header + internal::KNOCK_OFF_COUNTER,
+                                 materials.headerKey, mac.data());
+                common::crypto::Wipe(inner, sizeof(inner));
+                return;
+            }
 
             common::crypto::Nonce nonce;
             ExpandNonce(nonce, materials.counter, materials.lane);
@@ -164,6 +202,7 @@ namespace bcp::flux
     bool OpenKnockPacket(PacketSlot& packet,
                          const common::crypto::SessionKey& knockKey,
                          const common::crypto::SessionKey& knockHeaderKey,
+                         const common::crypto::SessionKey& knockMacKey,
                          uint8_t senderNonceLane,
                          uint64_t& outCounter) noexcept
     {
@@ -173,27 +212,62 @@ namespace bcp::flux
             packet.dataSize - internal::KNOCK_HEADER_SIZE - internal::WIRE_TAG_SIZE;
         if (cipherLen < internal::KNOCK_INNER_PREFIX) return false;
 
+        // Read raw rather than through IsMacOnly, which answers for a packet
+        // that already carries the secure framing. An opener is unsecured until
+        // it is opened, so the accessor would say no to every one of them.
+        const bool macOnly =
+            (packet.data[0] & ToByte(Controls::CTRL_MACONLY)) != 0;
+
         common::crypto::Tag tag;
         std::memcpy(tag.data(), packet.data + packet.dataSize - internal::WIRE_TAG_SIZE,
                     tag.size());
 
-        // The AAD is the header as the sender authenticated it, counter
-        // unmasked. Rebuilt in a copy so a failed open leaves the wire bytes
-        // exactly as they arrived for the next attempt.
-        uint8_t aad[internal::KNOCK_HEADER_SIZE];
-        std::memcpy(aad, packet.data, sizeof(aad));
-        MaskNonceCounter(aad + internal::KNOCK_OFF_COUNTER, knockHeaderKey, tag.data());
-        const uint64_t counter = ReadNonceCounter(aad + internal::KNOCK_OFF_COUNTER);
+        uint64_t counter = 0;
+        if (macOnly)
+        {
+            // One pass over the whole packet, the header included, so the clock
+            // stamp and the key id are as covered here as they are under the
+            // AEAD. Unmasked into a local first and restored only for the span
+            // of the check, so a wrong key leaves the wire bytes untouched for
+            // whatever tries next.
+            const size_t covered = packet.dataSize - internal::WIRE_TAG_SIZE;
+            uint8_t unmasked[internal::WIRE_NONCE_SIZE];
+            std::memcpy(unmasked, packet.data + internal::KNOCK_OFF_COUNTER,
+                        sizeof(unmasked));
+            MaskNonceCounter(unmasked, knockHeaderKey, tag.data());
+            counter = ReadNonceCounter(unmasked);
 
-        common::crypto::Nonce nonce;
-        ExpandNonce(nonce, counter, senderNonceLane);
+            uint8_t masked[internal::WIRE_NONCE_SIZE];
+            std::memcpy(masked, packet.data + internal::KNOCK_OFF_COUNTER, sizeof(masked));
+            std::memcpy(packet.data + internal::KNOCK_OFF_COUNTER, unmasked, sizeof(unmasked));
 
-        if (!common::crypto::Decrypt(packet.data + internal::KNOCK_HEADER_SIZE,
-                                     knockKey, nonce,
-                                     packet.data + internal::KNOCK_HEADER_SIZE,
-                                     cipherLen, tag,
-                                     aad, sizeof(aad)))
-            return false;
+            common::crypto::Mac expected;
+            common::crypto::ComputeMac(expected, knockMacKey, packet.data, covered);
+            const bool ok =
+                common::crypto::Equal(expected.data(), tag.data(), expected.size());
+            std::memcpy(packet.data + internal::KNOCK_OFF_COUNTER, masked, sizeof(masked));
+            if (!ok) return false;
+        }
+        else
+        {
+            // The AAD is the header as the sender authenticated it, counter
+            // unmasked. Rebuilt in a copy so a failed open leaves the wire
+            // bytes exactly as they arrived for the next attempt.
+            uint8_t aad[internal::KNOCK_HEADER_SIZE];
+            std::memcpy(aad, packet.data, sizeof(aad));
+            MaskNonceCounter(aad + internal::KNOCK_OFF_COUNTER, knockHeaderKey, tag.data());
+            counter = ReadNonceCounter(aad + internal::KNOCK_OFF_COUNTER);
+
+            common::crypto::Nonce nonce;
+            ExpandNonce(nonce, counter, senderNonceLane);
+
+            if (!common::crypto::Decrypt(packet.data + internal::KNOCK_HEADER_SIZE,
+                                         knockKey, nonce,
+                                         packet.data + internal::KNOCK_HEADER_SIZE,
+                                         cipherLen, tag,
+                                         aad, sizeof(aad)))
+                return false;
+        }
 
         // Verified and decrypted: rewrite in place into an already-opened
         // ordinary packet, marked as having ridden the first flight, so the
@@ -220,7 +294,7 @@ namespace bcp::flux
     {
         if (materials.knock)
         {
-            SealKnockPacket(dst, plaintext, bodyLen, materials);
+            SealKnockPacket(dst, plaintext, bodyLen, materials, false);
             return;
         }
         // On a tagged packet the migration tag goes into the authenticated
@@ -262,13 +336,9 @@ namespace bcp::flux
     void SealMacOnlyPacket(PacketSlot& dst, size_t headerSize, size_t bodyLen,
                                    const PeerSendMaterials& materials, bool tagged) noexcept
     {
-        // The knock window has no readable-on-the-wire tier: everything rides
-        // the full opener seal, and the mac-only choice resumes with the
-        // session. Costs the sender some crypto for a round trip, loses
-        // nothing else.
         if (materials.knock)
         {
-            SealKnockPacket(dst, dst.data + headerSize, bodyLen, materials);
+            SealKnockPacket(dst, dst.data + headerSize, bodyLen, materials, true);
             return;
         }
         if (tagged)

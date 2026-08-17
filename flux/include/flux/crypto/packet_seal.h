@@ -99,6 +99,7 @@ namespace bcp::flux
     [[nodiscard]] bool OpenKnockPacket(PacketSlot& packet,
                                        const common::crypto::SessionKey& knockKey,
                                        const common::crypto::SessionKey& knockHeaderKey,
+                                       const common::crypto::SessionKey& knockMacKey,
                                        uint8_t senderNonceLane,
                                        uint64_t& outCounter) noexcept;
 }

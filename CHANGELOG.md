@@ -23,7 +23,9 @@ security fix is allowed to change either.
   window, an unproven-peer cap and a per-peer packet allowance.
   `MaxPayload` reports the payload the next packet to a target can carry, and
   a send past it is refused with `TooLarge` rather than truncated or silently
-  dropped.
+  dropped. An opener honours the security level the caller picked, so a
+  mac-only send inside the window travels readable and unpadded rather than
+  being quietly upgraded to encrypted.
 - `RemoveCertificate` revokes a pinned identity at runtime. The tag's entry
   is kept with its key wiped and version cleared, so every later check
   against it fails hard rather than falling open.

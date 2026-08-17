@@ -234,13 +234,19 @@ namespace bcp::flux
                     useCurrent ? peer->knockKey : peer->prevSession;
                 const common::crypto::SessionKey& openMask =
                     useCurrent ? peer->knockHeaderKey : peer->prevHeaderKey;
+                // A mac-only opener is verified under the mac key of the same
+                // generation, which is derived from the key above and so proves
+                // the same thing the AEAD tag would.
+                const common::crypto::SessionKey& openMacKey =
+                    useCurrent ? peer->macKey : peer->prevMacKey;
                 // The previous slot holds the interim key, and that key was
                 // agreed against whichever key the opener named, so it carries
                 // its own lane. Opening it with the committed one produces a
                 // different nonce and it never opens.
                 const uint8_t openNonceLane =
                     useCurrent ? peer->TheirNonceLane() : peer->TheirPrevNonceLane();
-                if (!OpenKnockPacket(*packet, openKey, openMask, openNonceLane, counter))
+                if (!OpenKnockPacket(*packet, openKey, openMask, openMacKey,
+                                     openNonceLane, counter))
                     return;
                 if (!ReplayFor(peerHandle.GetSlotIndex()).Accept(counter))
                     return;
@@ -308,17 +314,21 @@ namespace bcp::flux
                 common::crypto::SessionKey knockKey;
                 common::crypto::SessionKey knockHeaderKey;
                 CombineKnockKey(knockKey, knockHeaderKey, staticShared, ephShared, saltField);
+                common::crypto::SessionKey knockMacKey;
+                common::crypto::DeriveSubKey(knockMacKey.data(), knockKey.data(),
+                                             internal::MAC_KEY_LABEL);
                 common::crypto::Wipe(staticShared.data(), staticShared.size());
                 common::crypto::Wipe(ephShared.data(), ephShared.size());
 
                 uint64_t counter = 0;
                 const uint8_t theirNonceLane = NonceLaneBetween(theirStatic, mine.publicKey);
                 const bool opened = OpenKnockPacket(*packet, knockKey, knockHeaderKey,
-                                                    theirNonceLane, counter);
+                                                    knockMacKey, theirNonceLane, counter);
                 if (!opened)
                 {
                     common::crypto::Wipe(knockKey.data(), knockKey.size());
                     common::crypto::Wipe(knockHeaderKey.data(), knockHeaderKey.size());
+                    common::crypto::Wipe(knockMacKey.data(), knockMacKey.size());
                     Handshake_Challenge(from);
                     return;
                 }
@@ -344,6 +354,7 @@ namespace bcp::flux
                     if (!capped) unprovenPeers_.fetch_sub(1, std::memory_order_relaxed);
                     common::crypto::Wipe(knockKey.data(), knockKey.size());
                     common::crypto::Wipe(knockHeaderKey.data(), knockHeaderKey.size());
+                    common::crypto::Wipe(knockMacKey.data(), knockMacKey.size());
                     Handshake_Challenge(from);
                     return;
                 }
@@ -391,6 +402,7 @@ namespace bcp::flux
                 }
                 common::crypto::Wipe(knockKey.data(), knockKey.size());
                 common::crypto::Wipe(knockHeaderKey.data(), knockHeaderKey.size());
+                common::crypto::Wipe(knockMacKey.data(), knockMacKey.size());
 
                 // The handshake starts here, from the packet that carried the
                 // data: the challenge is stateless, and the sender's echo of
