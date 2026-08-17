@@ -7,7 +7,7 @@ PROJECT_NAME      = "openbcp"
 PROJECT_BRIEF     = "A connectionless zero-alloc encrypted transport (flux) and systems primitives (common)"
 OUTPUT_DIRECTORY  = docs
 
-INPUT             = common/include flux/include
+INPUT             = flux/include external/common/include
 FILE_PATTERNS     = *.h
 RECURSIVE         = YES
 
