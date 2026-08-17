@@ -84,8 +84,15 @@ These are known and are not vulnerabilities:
   first flight. Everything from the handshake's completion onward mixes both
   ephemerals and is unaffected. This is inherent to sending data before the
   other end has spoken.
-- A replayed first flight can be delivered twice in one case. Each opener is
-  refused on its second presentation and one older than the clock window is
-  refused outright, so the gap is a receiver restart that wiped the ring paired
-  with a copy arriving inside that window. Messages that rode a first flight are
-  marked as such, so an application can decide what may travel there.
+- A replayed first flight can be delivered twice. Three things bound it. The
+  clock stamp is inside the authenticated header, so a captured opener cannot
+  be refreshed and stops being accepted once it falls outside the window. A
+  peer that exists refuses a repeat through its own replay window. And a peer
+  elsewhere holding the same identity refuses the registration, so a copy sent
+  from a second address cannot land beside the original. What is left is a copy
+  arriving inside the clock window while no peer anywhere holds that identity,
+  which means a receiver that restarted, or a peer that `RemovePeer` or a
+  failed handshake took away. Nothing in a transport can close that: a first
+  flight is by definition judged before there is a session to judge it against.
+  `IsKnock` reports which delivered messages rode one, so an application can
+  keep anything it must not do twice out of the first flight.

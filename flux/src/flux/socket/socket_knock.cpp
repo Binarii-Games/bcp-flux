@@ -56,14 +56,6 @@ namespace bcp::flux
         knockTtlWindowSeconds_ = cfg.ttlWindowSeconds != 0
             ? cfg.ttlWindowSeconds : internal::KNOCK_TTL_WINDOW_SECONDS_DEFAULT;
         knockBudgetThisTick_ = knockBudgetPerTick_;
-
-        uint32_t want = cfg.ringSize != 0 ? cfg.ringSize : internal::KNOCK_RING_SIZE_DEFAULT;
-        uint32_t size = 1;
-        while (size < want) size <<= 1;   // power of two: the fingerprint masks into it
-        knockRing_.reset(new (std::nothrow) uint64_t[size]);
-        if (!knockRing_) return common::Error::AllocFailed;
-        for (uint32_t i = 0; i < size; ++i) knockRing_[i] = 0;
-        knockRingMask_ = size - 1;
         return common::Error::Ok;
     }
 
@@ -180,19 +172,6 @@ namespace bcp::flux
         (void)BuildPacket().NoFlow().Send(addr);
     }
 
-    bool Socket::KnockRingAdmit(uint64_t fingerprint) noexcept
-    {
-        if (!knockRing_) return true;
-        if (fingerprint == 0) fingerprint = 1;   // 0 is the empty marker
-        const uint32_t slot = static_cast<uint32_t>(fingerprint) & knockRingMask_;
-        while (knockRingLock_.test_and_set(std::memory_order_acquire))
-            common::CpuPause();
-        const bool admit = knockRing_[slot] != fingerprint;
-        if (admit) knockRing_[slot] = fingerprint;   // evicts whatever shared the bucket
-        knockRingLock_.clear(std::memory_order_release);
-        return admit;
-    }
-
     void Socket::MarkAddressProven(Peer& peer) noexcept
     {
         if (!peer.awaitingAddressProof) return;
@@ -283,14 +262,6 @@ namespace bcp::flux
                 if (!fresh) { Handshake_Challenge(from); return; }
                 if (knockBudgetThisTick_ == 0) { Handshake_Challenge(from); return; }
                 --knockBudgetThisTick_;
-
-                // The ephemeral is uniform random and fresh per genuine knock,
-                // so its leading bytes name this attempt: a replay repeats them
-                // and collides, a new attempt does not.
-                uint64_t fingerprint = 0;
-                for (size_t i = 0; i < 8; ++i)
-                    fingerprint |= static_cast<uint64_t>(ephPk[i]) << (8 * i);
-                if (!KnockRingAdmit(fingerprint)) { Handshake_Challenge(from); return; }
 
                 // Which of this socket's keys the opener was aimed at. A
                 // named key it no longer holds declines exactly as an opener

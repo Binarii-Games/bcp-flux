@@ -372,7 +372,6 @@ void FLUX_CALL flux_default_config(FluxConfig* out)
     out->knock.unprovenPacketLimit = d.knock.unprovenPacketLimit;
     out->knock.budgetPerTick       = d.knock.budgetPerTick;
     out->knock.ttlWindowSeconds    = d.knock.ttlWindowSeconds;
-    out->knock.ringSize            = d.knock.ringSize;
 
     out->flows.maxTransferBytes    = d.flows.maxTransferBytes;
     out->flows.flowCount           = d.flows.flowCount;
@@ -450,7 +449,6 @@ FLUX_GUARD_BEGIN
     cfg.knock.unprovenPacketLimit = in->knock.unprovenPacketLimit;
     cfg.knock.budgetPerTick       = in->knock.budgetPerTick;
     cfg.knock.ttlWindowSeconds    = in->knock.ttlWindowSeconds;
-    cfg.knock.ringSize            = in->knock.ringSize;
 
     // Init copies the identity, so the parsed one is wiped as this scope ends
     // and the only lasting copy of the secret is the socket's own.

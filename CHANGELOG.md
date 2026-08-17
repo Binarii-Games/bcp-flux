@@ -19,8 +19,8 @@ security fix is allowed to change either.
   `Connect(addr, tag)`, carries application data in its first packet, under an
   interim key the sender derives alone, while the ordinary handshake completes
   behind it and replaces that key. Flows run across the handover. Off by
-  default (`Config::knock`), with a per-tick validation budget, a replay ring,
-  a clock window, an unproven-peer cap and a per-peer packet allowance.
+  default (`Config::knock`), with a per-tick validation budget, a clock
+  window, an unproven-peer cap and a per-peer packet allowance.
   `MaxPayload` reports the payload the next packet to a target can carry, and
   a send past it is refused with `TooLarge` rather than truncated or silently
   dropped.

@@ -277,11 +277,6 @@ namespace bcp::flux
                     Zero selects the default. */
                 uint32_t    budgetPerTick     = 0;
 
-                /** Recently seen first-flight fingerprints remembered against
-                    replay. Rounded up to a power of two. Zero selects the
-                    default. */
-                uint32_t    ringSize          = 0;
-
                 /** Seconds of clock disagreement past which a knock is stale.
                     Zero selects the default. */
                 uint32_t    ttlWindowSeconds  = 0;
@@ -882,9 +877,6 @@ namespace bcp::flux
         uint32_t                       knockUnprovenPacketLimit_ = 0;
         uint32_t                       knockBudgetPerTick_ = 0;
         uint32_t                       knockTtlWindowSeconds_ = 0;
-        std::unique_ptr<uint64_t[]>    knockRing_;          ///< fingerprints, 0 = empty
-        uint32_t                       knockRingMask_ = 0;
-        std::atomic_flag               knockRingLock_ = ATOMIC_FLAG_INIT;
         std::atomic<uint32_t>          unprovenPeers_{0};
         uint32_t                       knockBudgetThisTick_ = 0;   ///< refilled by the tick
 
@@ -1158,9 +1150,6 @@ namespace bcp::flux
             deliver the carried packet, then let the ordinary handshake run
             by sending the challenge. */
         void Handshake_Knock(PacketSlotHandle pHandle);
-        /** True and consumes a slot if this fingerprint is new, false if the
-            ring has seen it (a replay). */
-        bool KnockRingAdmit(uint64_t fingerprint) noexcept;
         /** Sends a knock carrying no payload, which is what a Connect with no
             data attached puts on the wire when material is in hand: the
             opener and the interim key in one packet, with nothing to deliver

@@ -375,7 +375,6 @@ typedef struct {
     uint32_t unprovenPacketLimit; /* packets one unproven peer may land before the rest drop */
     uint32_t budgetPerTick;       /* openers one Update pass will pay a key agreement for */
     uint32_t ttlWindowSeconds;    /* clock disagreement past which an opener is stale */
-    uint32_t ringSize;            /* recent openers remembered, so a replay is refused */
 } FluxKnockConfig;
 
 typedef struct {

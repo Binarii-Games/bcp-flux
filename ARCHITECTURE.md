@@ -1213,16 +1213,26 @@ memory nor turned into amplification. A peer that already has a session gets
 silence instead, because a packet that fails to open for it is noise rather
 than a sender asking for a way in.
 
-Four limits keep an opener that anyone can send from costing more than it
+Three limits keep an opener that anyone can send from costing more than it
 should. A per-tick budget bounds the key agreements one pass will attempt, so
-a flood slows early opening rather than the socket. A ring of recent
-fingerprints refuses a replayed opener outright, and the clock stamp bounds
-what a replay achieves in the one case the ring cannot cover, its own loss to
-a restart. A cap bounds how many peers may exist with unproven addresses, and
-past it a knock creates nothing and gets the plain handshake instead, which
-holds no state until its echo arrives. Under that cap, each unproven peer has
-a packet allowance, and past it its packets are dropped unbuffered until the
-echo lands, which reliable flows recover from by retransmitting.
+a flood slows early opening rather than the socket. A cap bounds how many
+peers may exist with unproven addresses, and past it a knock creates nothing
+and gets the plain handshake instead, which holds no state until its echo
+arrives. Under that cap, each unproven peer has a packet allowance, and past
+it its packets are dropped unbuffered until the echo lands, which reliable
+flows recover from by retransmitting.
+
+Replay is bounded by three things that already exist rather than by anything
+the opener path adds. The clock stamp travels inside the authenticated header,
+so a captured opener cannot be refreshed and stops being accepted once it
+falls outside the window. A peer that exists refuses a repeat through its own
+replay window, which is counter-checked like every other packet. And a peer
+elsewhere holding the same identity refuses the registration outright, so a
+copy sent from a second address cannot land beside the original. What is left
+is one case: a copy arriving inside the clock window while no peer anywhere
+holds that identity, which is a receiver that restarted or a peer something
+removed. A message that rode a first flight answers IsKnock, so an application
+that must not act twice can decide for itself what may travel there.
 
 #### Revoking a pinned identity
 
