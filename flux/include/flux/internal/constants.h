@@ -239,8 +239,9 @@ namespace bcp::flux::internal
         after the open, on this socket's copy alone. */
     static constexpr uint8_t  WIRE_CTRL_KNOCKED = 0x40;
 
-    /** Clock disagreement past which a knock is stale. Bounds what a replayed
-        first flight can achieve when the seen-ring was wiped by a restart. */
+    /** Clock disagreement past which a knock is stale. A captured opener
+        cannot be refreshed, because the stamp is inside the authenticated
+        header, so this bounds how long a replay of one stays acceptable. */
     static constexpr uint32_t KNOCK_TTL_WINDOW_SECONDS_DEFAULT = 30;
 
     /** Knock validations one tick pays for, each costing key agreement.

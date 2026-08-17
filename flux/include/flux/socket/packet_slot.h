@@ -63,11 +63,13 @@ namespace bcp::flux
 
         /** Whether this arrived on a first-flight opener, under the interim
             key, before the sender's address was proven. Such a packet is
-            delivered like any other, and the one thing it does not carry is
-            the guarantee the rest do: a replayed opener can present it twice
-            if the seen-ring was lost to a restart inside the clock window.
-            So an application that must not act twice on a message reads this
-            and decides, per message, what it will accept there.
+            delivered like any other, except that a replay of it can be
+            delivered a second time. A peer that exists refuses the repeat
+            through its own replay window, so what remains is a copy arriving
+            inside the clock window while no peer holds the sender's identity
+            at all, which is a receiver that restarted or a peer something
+            removed. So an application that must not act twice on a message
+            reads this and decides, per message, what it will accept there.
 
             Set on this socket's copy after the open and never on the wire.
             False for everything that arrived under a proven session, which

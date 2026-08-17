@@ -1211,7 +1211,8 @@ namespace bcp::flux
         void Ticket_Acked(const Address& from, const uint8_t* payload, size_t len);
 
         // --- Knock (socket_knock.cpp) ---
-        /** Config validation, the seen-ring, and the resolved knock limits. */
+        /** Resolves the knock limits, each zero in Config selecting its
+            default. */
         [[nodiscard]] common::Error InitKnock(const Config& config);
         /** Arms a peer's knock window toward a pinned certificate key, so
             PreProcessOut seals its sends as knocks. Returns false when the
