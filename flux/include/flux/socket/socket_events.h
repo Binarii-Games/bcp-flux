@@ -103,7 +103,7 @@ namespace bcp::flux
 
         /** This peer arrived through a first-flight opener: its data was
             delivered before its address was proven, under the interim key.
-            Every message that rode that flight also answers WasKnock() on
+            Every message that rode that flight also answers IsKnock() on
             its packet, so the replay contract is per message. This event is
             the per-peer heads-up. */
         PEER_KNOCKED           = (1u << 11),

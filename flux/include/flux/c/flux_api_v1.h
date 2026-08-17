@@ -231,7 +231,7 @@ typedef uint32_t FluxEventBits;
 
 /* This peer arrived on a first-flight opener, so its data was delivered
    before its address was proven. Every message that rode it also answers
-   PacketWasKnock, which is the per-message form of the same news. */
+   PacketIsKnock, which is the per-message form of the same news. */
 #define FLUX_EVENT_PEER_KNOCKED           (1u << 11)
 
 /* This peer's opener named a key this socket has since replaced, so its
@@ -734,14 +734,14 @@ typedef struct {
        than truncated, so a binding either asks or sizes to
        FLUX_SAFE_PAYLOAD_BYTES. 0 means the peer is gone.
 
-       PacketWasKnock says a received packet arrived on an opener, before its
+       PacketIsKnock says a received packet arrived on an opener, before its
        sender's address was proven. Such a packet can be presented twice by a
        replayed opener in one narrow case, so an application that must not act
        twice reads this and decides what it accepts there. */
     FluxPeer  (FLUX_CALL *PeerExpecting)      (FluxSocket*, const char* host, uint16_t port,
                                                const uint8_t tag[FLUX_TAG_SIZE]);
     uint32_t  (FLUX_CALL *MaxPayload)         (FluxSocket*, FluxPeer);
-    uint32_t  (FLUX_CALL *PacketWasKnock)     (FluxSocket*, FluxPacket);
+    uint32_t  (FLUX_CALL *PacketIsKnock)     (FluxSocket*, FluxPacket);
 } FluxApiV1;
 
 /* The one symbol anybody has to find. Cast what comes back to the struct for

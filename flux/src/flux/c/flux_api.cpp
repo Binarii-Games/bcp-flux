@@ -1321,7 +1321,7 @@ FLUX_GUARD_BEGIN
 FLUX_GUARD_END(0)
 }
 
-uint32_t FLUX_CALL flux_packet_was_knock(FluxSocket* s, FluxPacket name)
+uint32_t FLUX_CALL flux_packet_is_knock(FluxSocket* s, FluxPacket name)
 {
     if (s == nullptr) return 0;
     SocketBox* box = Box(s);
@@ -1333,7 +1333,7 @@ uint32_t FLUX_CALL flux_packet_was_knock(FluxSocket* s, FluxPacket name)
     // the caller's until ReleasePacket and destruction would hand it back.
     flux::PacketSlotHandle handle = box->socket.PacketAt(idx);
     const flux::PacketSlot* packet = handle.Read();
-    const uint32_t knocked = (packet != nullptr && packet->WasKnock()) ? 1u : 0u;
+    const uint32_t knocked = (packet != nullptr && packet->IsKnock()) ? 1u : 0u;
     (void)handle.Detach();
     return knocked;
 }
@@ -1414,7 +1414,7 @@ static const FluxApiV1 API_V1 = {
 
     flux_peer_expecting,
     flux_max_payload,
-    flux_packet_was_knock,
+    flux_packet_is_knock,
 };
 extern "C" const void* FLUX_CALL flux_get_api(uint32_t version)
 {

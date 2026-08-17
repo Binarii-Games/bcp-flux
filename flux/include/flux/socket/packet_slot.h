@@ -72,7 +72,7 @@ namespace bcp::flux
             Set on this socket's copy after the open and never on the wire.
             False for everything that arrived under a proven session, which
             is everything after the handshake completes. */
-        bool WasKnock() const;
+        bool IsKnock() const;
 
         /** Whether the content is a list of length-prefixed messages rather
             than one message. The packet is delivered whole and PollCursor walks
