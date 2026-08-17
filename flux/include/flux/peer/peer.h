@@ -240,6 +240,25 @@ namespace bcp::flux
             opportunity. */
         uint64_t grantSentAtMicros;
 
+        /** Set while this peer still owes an acknowledgement for the resume
+            note this side issued it. Raised when a session confirms, cleared
+            by a TICKET_ACK, resent by the tick meanwhile: the grant contract
+            exactly. Nothing is kept about the note itself, because the issuer
+            seals it for its own future self and can re-derive everything it
+            needs when it comes back. */
+        bool     ticketSendPending;
+
+        /** When the pending note last went out, pacing the resend the way
+            grantSentAtMicros does. Zero sends at the first opportunity. */
+        uint64_t ticketSentAtMicros;
+
+        /** The most recent note this peer issued us, kept only when Config
+            asked for it, for the application to read and persist. Opaque here:
+            it is sealed for the issuer and this side never parses it. A newer
+            one replaces it, since only the newest is worth presenting. */
+        uint8_t  resumeNote[internal::TICKET_WIRE_SIZE];
+        bool     hasResumeNote;
+
         /** The knock window: the interim key material that lets data flow
             from the first packet while the standard handshake completes
             behind it. On the sender every outgoing packet is knock-framed

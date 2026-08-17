@@ -128,8 +128,9 @@ namespace bcp::flux
             // session means no migration tag, and the open lays content out
             // at untagged offsets.
             inner[0] = dst.data[0] & static_cast<uint8_t>(~ToByte(Controls::CTRL_TAGGED));
-            inner[1] = static_cast<uint8_t>(bodyLen >> 0);
-            inner[2] = static_cast<uint8_t>(bodyLen >> 8);
+            inner[1] = 0;   // interior flags; a resume note sets its bit here
+            inner[2] = static_cast<uint8_t>(bodyLen >> 0);
+            inner[3] = static_cast<uint8_t>(bodyLen >> 8);
             std::memcpy(inner + internal::KNOCK_INNER_PREFIX, plaintext, bodyLen);
 
             uint8_t* header = dst.data;
@@ -274,8 +275,8 @@ namespace bcp::flux
         // rest of the receive path never learns knocks exist.
         const uint8_t* inner = packet.data + internal::KNOCK_HEADER_SIZE;
         const uint8_t  originalController = inner[0];
-        const uint16_t innerLen = static_cast<uint16_t>(inner[1])
-                                | static_cast<uint16_t>(inner[2]) << 8;
+        const uint16_t innerLen = static_cast<uint16_t>(inner[2])
+                                | static_cast<uint16_t>(inner[3]) << 8;
         if (innerLen > cipherLen - internal::KNOCK_INNER_PREFIX) return false;
 
         packet.data[0] = originalController | internal::WIRE_CTRL_KNOCKED;

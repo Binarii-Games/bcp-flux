@@ -123,6 +123,13 @@ namespace bcp::flux
             fresh certificate is the right answer to both: a real rotation
             then works, and an impersonator still does not match. */
         PEER_CERT_MISMATCH     = (1u << 13),
+
+        /** This peer issued a resume note and this socket kept it, which it
+            only does when Config asked. Read the bytes with ResumeNoteFor and
+            persist them: presenting one later is what lets a restarted process
+            pick its session back up without a handshake. Nothing secret is in
+            it, so wherever it lands needs no more care than a certificate. */
+        RESUME_NOTE_RECEIVED   = (1u << 14),
     };
 
     constexpr uint32_t ToBits(SocketEvent e) noexcept { return static_cast<uint32_t>(e); }

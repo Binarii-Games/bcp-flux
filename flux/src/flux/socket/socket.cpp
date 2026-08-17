@@ -231,6 +231,9 @@ namespace bcp::flux
             certStore_.Init(config.trustedCertCount) != common::Error::Ok)
             return common::Error::NotInitialized;
 
+        // After the identity, because the note seal key derives from it.
+        InitResumeNotes(config);
+
         const common::Error knock = InitKnock(config);
         if (knock != common::Error::Ok)
             return knock;
@@ -1697,6 +1700,8 @@ namespace bcp::flux
             case internal::SECURE_CHANNEL_FLOW_REJECT:    Flow_Reject(from, buf, plen);    break;
             case internal::SECURE_CHANNEL_GRANT:          Grant_Update(from, buf, plen);   break;
             case internal::SECURE_CHANNEL_GRANT_ACK:      Grant_Acked(from, buf, plen);    break;
+            case internal::SECURE_CHANNEL_TICKET:         Ticket_Update(from, buf, plen);  break;
+            case internal::SECURE_CHANNEL_TICKET_ACK:     Ticket_Acked(from, buf, plen);   break;
             case internal::SECURE_CHANNEL_FLOW_ACK:       Flow_Ack(from, buf, plen);       break;
             case internal::SECURE_CHANNEL_TRANSFER:       Transfer_Data(from, buf, plen);  break;
             case internal::SECURE_CHANNEL_TRANSFER_ACK:   Transfer_Ack(from, buf, plen);   break;
@@ -2682,6 +2687,10 @@ namespace bcp::flux
             peer.grantSendPending  = true;
             peer.grantSentAtMicros = 0;   // send at the next tick, not one RTO later
         }
+        // A fresh session owes a fresh note, and the old one is worth nothing
+        // now: it named a session this one just replaced.
+        peer.ticketSendPending  = true;
+        peer.ticketSentAtMicros = 0;
         peer.myTag        = DerivePeerTag(peer.session, peer.nonceLane, 0);
         peer.state        = HandshakeState::ESTABLISHED;
         // The acknowledgement silence clock starts here, so a peer that never
@@ -3622,6 +3631,9 @@ namespace bcp::flux
                 // Retried every tick until the peer acknowledges it, so a lost
                 // announcement is not a peer that never learns its limit.
                 SendPendingGrant(addr, peers_.GetPeer(addr), Now(nowOverride));
+
+                // The resume note this session owes, same contract.
+                SendPendingTicket(addr, peers_.GetPeer(addr), Now(nowOverride));
 
                 // Out-flows: open/close retries with give-up, and reliable
                 // retransmits / unreliable loss declarations past the RTO. Each

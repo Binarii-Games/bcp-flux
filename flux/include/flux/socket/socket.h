@@ -135,12 +135,17 @@ namespace bcp::flux
             be refused: it is the smallest ceiling the transport has, the one
             an opener carrying a flow packet leaves.
 
+            The tightest case is an opener that carries both a flow packet and
+            a resume note, since any opener may carry one and this figure has
+            to hold whether it does or not.
+
             MaxPayload reports what this particular target can take right now,
             which is larger in every case but that one, and larger again once
             the session replaces the opener. Prefer it when the extra room is
             worth a call, and use this when it is not. */
         static constexpr uint32_t SAFE_PAYLOAD_BYTES =
             static_cast<uint32_t>(internal::KNOCK_PAYLOAD_MAX
+                                  - internal::TICKET_WIRE_SIZE
                                   - internal::WIRE_SECURE_CHANNEL_SIZE
                                   - internal::WIRE_FLOW_HEADER_SIZE);
 
@@ -226,6 +231,19 @@ namespace bcp::flux
                 caller may Wipe its own copy after. Null = anonymous (fresh
                 keypair, zero tag). */
             const Identity* identity       = nullptr;
+
+            /** Resume notes this socket keeps when a peer issues one, so the
+                application can read the bytes and persist them. Off by
+                default, because a note is only useful to the side that will
+                reconnect: a server issues them and has no reason to keep the
+                ones its clients issue back. Issuing is unaffected either way,
+                and costs no memory, since a note is sealed for the issuer's
+                own future self and never stored by it. */
+            bool        keepResumeNotes    = false;
+
+            /** Validity stamped into notes this socket issues. Zero selects
+                the default of two days. */
+            uint32_t    resumeNoteSeconds  = 0;
 
             /** Previous keypairs kept past a RotateIdentity, so a peer whose
                 certificate has not caught up can still open toward this
@@ -864,6 +882,9 @@ namespace bcp::flux
         SocketSender                   sender_;
         ChallengeGenerator             challengeGenerator_;
         IdentityTable                  identities_;
+        common::crypto::SessionKey     ticketSealKey_{};      ///< from the identity secret, set at Init
+        uint32_t                       ticketLifetime_ = 0;   ///< seconds, resolved at Init
+        bool                           keepResumeNotes_ = false;
         Certificate::IdentityTag       ownTag_{};   ///< announced in HS_FINISH; zero when anonymous
         CertStore                      certStore_;
 
@@ -1125,6 +1146,35 @@ namespace bcp::flux
             retried until it lands. Takes the handle by value: the gather
             happens under it and the send after it is released. */
         void SendPendingGrant(const Address& to, PeerHandle peerHandle, uint64_t now);
+
+        // --- Resume notes (socket_ticket.cpp) ---
+        /** Derives the key this socket seals its own notes under, from its
+            identity secret, so a restart re-derives the same one and a note
+            issued before it still opens. Rotating the identity is therefore
+            what retires outstanding notes, which is the only ceiling on their
+            stated lifetime. */
+        void InitResumeNotes(const Config& config) noexcept;
+        /** Seals a note naming this holder for this socket's own future self.
+            The holder's public key is the associated data rather than content,
+            so the note only ever opens against the key its presenter proves.
+            Writes internal::TICKET_WIRE_SIZE bytes. */
+        void SealResumeNote(uint8_t* out,
+                            const common::crypto::PublicKey& holderKey,
+                            const uint8_t holderTag[internal::WIRE_HS_TAG_SIZE]) noexcept;
+        /** Opens one this socket issued. False when it was not ours, was not
+            issued to this key, or has outlived its stated validity. */
+        [[nodiscard]] bool OpenResumeNote(const uint8_t* note,
+                                          const common::crypto::PublicKey& holderKey,
+                                          uint8_t outTag[internal::WIRE_HS_TAG_SIZE]) noexcept;
+        /** Sends the note this session owes its peer, paced like the grant
+            resend, until Ticket_Acked clears the flag. Takes the handle by
+            value: the gather happens under it and the send after it. */
+        void SendPendingTicket(const Address& to, PeerHandle peerHandle, uint64_t now);
+        /** A note arrived. Kept for the application when Config asks, dropped
+            otherwise, and acknowledged either way so a full or uninterested
+            holder does not turn the issuer into a resender. */
+        void Ticket_Update(const Address& from, const uint8_t* payload, size_t len);
+        void Ticket_Acked(const Address& from, const uint8_t* payload, size_t len);
 
         // --- Knock (socket_knock.cpp) ---
         /** Config validation, the seen-ring, and the resolved knock limits. */

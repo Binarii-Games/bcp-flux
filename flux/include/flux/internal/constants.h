@@ -70,6 +70,16 @@ namespace bcp::flux::internal
         TRANSFER_REJECT is the receiver declining, which is a refusal of one
         transfer rather than of the channel it came on, so it is its own op and
         not a reuse of FLOW_REJECT. */
+    /** A resume note travelling to its holder, and the acknowledgement that
+        stops the issuer resending it. The issuer seals the note for its own
+        future self and keeps nothing, so the memory of a session travels with
+        the side that will want it back. Same contract as GRANT and GRANT_ACK.
+        These two op numbers were used by an earlier attempt at resumption that
+        was reverted, and nothing on the wire outlived it, so reusing them
+        collides with nothing. */
+    static constexpr uint8_t  SECURE_CHANNEL_TICKET          = 0x0A;
+    static constexpr uint8_t  SECURE_CHANNEL_TICKET_ACK      = 0x0B;
+
     static constexpr uint8_t  SECURE_CHANNEL_TRANSFER        = 0x07;
     static constexpr uint8_t  SECURE_CHANNEL_TRANSFER_ACK    = 0x08;
     static constexpr uint8_t  SECURE_CHANNEL_TRANSFER_REJECT = 0x09;
@@ -132,6 +142,40 @@ namespace bcp::flux::internal
     static constexpr uint8_t KNOCK_STATIC_LABEL[16] = {
         'f','l','u','x','-','k','n','k','-','s','t','a','t','i','c',0
     };
+    static constexpr uint8_t TICKET_SEAL_LABEL[16] = {
+        'f','l','u','x','-','t','k','t','-','s','e','a','l',0,0,0
+    };
+
+    // --- Resume notes ---
+
+    /** What the issuer seals for its own future self: the holder's identity
+        tag, so the issuer can re-check it against its trust store rather than
+        take the note's word, and the wall clock it was issued at, so an old
+        one stops being honoured.
+
+        The holder's public key is NOT in here. It rides the note's associated
+        data instead, so a note only opens against the key the opener already
+        proved, which binds the two together and costs nothing to carry. */
+    static constexpr size_t   TICKET_SEALED_SIZE = WIRE_HS_TAG_SIZE + 8;
+
+    /** The note as it travels and as the holder stores it: nonce, sealed body,
+        tag. The holder never parses any of it. */
+    static constexpr size_t   TICKET_WIRE_SIZE =
+        common::crypto::NONCE_SIZE + TICKET_SEALED_SIZE + common::crypto::TAG_SIZE;
+
+    /** TICKET payload: the note, nothing else. The holder needs no id to
+        acknowledge, because a note replaces whatever it held for that issuer. */
+    static constexpr size_t   WIRE_TICKET_PAYLOAD_SIZE = TICKET_WIRE_SIZE;
+
+    /** Validity stamped into a note when Config leaves it at zero. Two days
+        covers a deploy, a crash and an overnight reboot, which is what the
+        mechanism is for. Nothing secret is in a note, so a longer life costs
+        no confidentiality: what actually bounds it is the issuer rotating its
+        identity, since the seal key comes from that. */
+    static constexpr uint32_t TICKET_LIFETIME_SECONDS_DEFAULT = 48u * 3600u;
+
+    /** How long an unacknowledged note waits before the tick resends it. */
+    static constexpr uint64_t TICKET_RESEND_MICROS = 500'000;
 
     // --- Identity ---
 
@@ -179,10 +223,16 @@ namespace bcp::flux::internal
     static constexpr size_t   KNOCK_OFF_KEYID    = KNOCK_OFF_CLOCK + 8;
     static constexpr size_t   KNOCK_OFF_IDENTITY = KNOCK_OFF_KEYID + WIRE_KEY_ID_SIZE;
 
-    /** The encrypted interior leads with the sender's real controller byte
-        and the payload length, then the payload, then zero padding out to
-        the fixed packet size. */
-    static constexpr size_t   KNOCK_INNER_PREFIX  = 1 + 2;
+    /** The interior leads with the sender's real controller byte, a flags
+        byte, and the payload length. A resume note follows when the flags say
+        so, and then the payload. Everything after the header is inside the
+        seal, so an observer cannot tell a resume from a first contact.
+
+        The flags byte is here rather than in the cleartext header for that
+        reason, and it is spent from the interior's budget rather than the
+        header's so a knock carrying no note stays the size it was. */
+    static constexpr uint8_t  KNOCK_INNER_HAS_TICKET = 0x01;
+    static constexpr size_t   KNOCK_INNER_PREFIX  = 1 + 1 + 2;
     static constexpr size_t   KNOCK_INNER_SIZE    =
         MAX_WIRE_PACKET_SIZE - KNOCK_HEADER_SIZE - WIRE_TAG_SIZE;
     static constexpr size_t   KNOCK_PAYLOAD_MAX   = KNOCK_INNER_SIZE - KNOCK_INNER_PREFIX;

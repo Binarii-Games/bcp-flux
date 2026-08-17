@@ -479,6 +479,9 @@ namespace bcp::flux
         p->freeWhenRead         = false;
         p->grantSendPending     = false;   // raised when a session commits
         p->grantSentAtMicros    = 0;
+        p->ticketSendPending    = false;   // raised when a session confirms
+        p->ticketSentAtMicros   = 0;
+        p->hasResumeNote        = false;
         p->knockActive          = false;
         p->knockFramed          = false;
         p->knockKeyId           = 0;

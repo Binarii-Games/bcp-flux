@@ -46,7 +46,7 @@
    reports what one particular peer can take right now, which is larger in
    every case but the tightest; this is the figure for a caller that would
    rather not ask. Checked against the C++ constant at build time. */
-#define FLUX_SAFE_PAYLOAD_BYTES 1049
+#define FLUX_SAFE_PAYLOAD_BYTES 968
 
 #ifdef __cplusplus
 extern "C" {
