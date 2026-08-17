@@ -223,6 +223,16 @@ function(register_tests glob label timeout link_target harness_dir)
     endforeach()
 endfunction()
 
+# The C API header claims to be a C ABI, and every test of it written in C++
+# leaves that claim unchecked: C++ accepts constructs C rejects. This object
+# library exists to be compiled by the C compiler and never linked, so the build
+# fails the moment the header stops being valid C rather than the first binding
+# somebody writes.
+add_library(flux_c_header_check OBJECT tests/c_header_check.c)
+target_include_directories(flux_c_header_check PRIVATE flux/include)
+set_target_properties(flux_c_header_check PROPERTIES
+                      C_STANDARD 11 C_STANDARD_REQUIRED ON)
+
 register_tests("tests/unit/*.cpp"        unit        240 flux tests)
 register_tests("tests/integration/*.cpp" integration 240 flux tests)
 register_tests("tests/acceptance/*.cpp"  acceptance  240 flux tests)
