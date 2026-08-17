@@ -1263,6 +1263,42 @@ holds that identity, which is a receiver that restarted or a peer something
 removed. A message that rode a first flight answers IsKnock, so an application
 that must not act twice can decide for itself what may travel there.
 
+#### Resuming a session
+
+A process that dies and restarts cannot simply handshake again. A confirmed
+peer is never re-keyed, because an off-path rebind of a working session has to
+be impossible, so the newcomer waits until the far side evicts an entry
+belonging to a session that no longer exists. That wait is what a resume note
+removes.
+
+Once a session confirms, each side seals a note for the other: the holder's
+identity tag and the wall clock it was issued at, sealed under a key the issuer
+derives from its own identity secret. The issuer keeps nothing, because it can
+re-derive that key whenever the note comes back, and the holder keeps bytes it
+cannot read. The seal key coming from the identity secret is what makes a note
+survive the issuer restarting, and rotating the identity is what retires every
+outstanding one, which is the real ceiling on the stated validity.
+
+The holder's public key is not inside the note. It is the note's associated
+data, so a note only ever opens against the key its presenter has already
+proved. That is what makes a stolen note worthless and why nothing secret is in
+one: possessing it is not enough, and possessing what would be enough means
+being the peer it names.
+
+Presenting one is deliberate, through the `Connect` overload that takes it. The
+note rides inside the opener's seal rather than its header, so an observer
+cannot tell a resume from a first contact. On arrival the tag is re-checked
+against the trust store rather than believed, which is what makes a revoked
+certificate stop a resumption as surely as it stops a handshake, and what comes
+back is whatever authentication the store gives that tag now, not what it gave
+before.
+
+Notes are kept only when `Config::keepResumeNotes` asks for it. A server issues
+them and has no reason to store the ones its clients issue back, so the default
+is off, and issuing is unaffected either way. A note is acknowledged whether or
+not it was kept, which is what stops an uninterested holder turning its issuer
+into a resender.
+
 #### Revoking a pinned identity
 
 `RemoveCertificate` stops trusting whatever key a tag names, at runtime, under
