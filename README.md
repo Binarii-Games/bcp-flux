@@ -533,6 +533,8 @@ Loading it from C#:
 [DllImport("flux_c")]
 static extern unsafe FluxApiV1* flux_get_api(uint version);
 
+struct FluxSocket { }   // opaque, only ever behind a pointer
+
 [StructLayout(LayoutKind.Sequential)]
 unsafe struct FluxApiV1
 {
@@ -550,7 +552,7 @@ unsafe
 {
     FluxApiV1* api = flux_get_api(1);
 
-    FluxConfig config;
+    FluxConfig config = default;
     api->DefaultConfig(&config);
     config.port = 9500;
 
