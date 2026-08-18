@@ -54,6 +54,13 @@
    inside, so wherever they land needs no more care than a certificate. */
 #define FLUX_RESUME_NOTE_BYTES  80
 
+/* An address in canonical form: 16 bytes of IPv6 (an IPv4 address travels
+   as its v4-mapped form), 4 bytes of scope id and 2 of port, both
+   little-endian. Platform-neutral where the OS socket address is not, so
+   these bytes can be held, compared, stored and handed back on any machine.
+   Checked against the C++ constant at build time. */
+#define FLUX_ADDRESS_SIZE       22
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -784,6 +791,21 @@ typedef struct {
     FluxPeer  (FLUX_CALL *PeerResuming)     (FluxSocket*, const char* host, uint16_t port,
                                              const uint8_t tag[FLUX_TAG_SIZE],
                                              const uint8_t note[FLUX_RESUME_NOTE_BYTES]);
+
+    /* Addresses, as FLUX_ADDRESS_SIZE bytes a binding can build an address
+       type out of.
+
+       AddressResolve turns a host and port into the canonical form,
+       resolving a name through DNS when it has to, and needs no socket.
+       PeerAddress writes the address a peer currently answers on and
+       returns FLUX_ADDRESS_SIZE, or 0 when the peer is gone. It is the
+       byte counterpart of PeerText. PeerAt is Peer from bytes already in
+       hand, so a stored address opens a session with nothing resolved. */
+    FluxError (FLUX_CALL *AddressResolve)(const char* host, uint16_t port,
+                                          uint8_t out[FLUX_ADDRESS_SIZE]);
+    uint32_t  (FLUX_CALL *PeerAddress)   (FluxSocket*, FluxPeer,
+                                          uint8_t out[FLUX_ADDRESS_SIZE]);
+    FluxPeer  (FLUX_CALL *PeerAt)        (FluxSocket*, const uint8_t addr[FLUX_ADDRESS_SIZE]);
 } FluxApiV1;
 
 /* Marks flux_get_api visible when this library is built as the shared

@@ -1198,6 +1198,8 @@ static_assert(FLUX_SAFE_PAYLOAD_BYTES == flux::Socket::SAFE_PAYLOAD_BYTES,
               "FLUX_SAFE_PAYLOAD_BYTES must match the always-safe payload");
 static_assert(FLUX_RESUME_NOTE_BYTES == flux::Socket::RESUME_NOTE_BYTES,
               "FLUX_RESUME_NOTE_BYTES must match the size a resume note is");
+static_assert(FLUX_ADDRESS_SIZE == flux::Address::CANONICAL_SIZE,
+              "FLUX_ADDRESS_SIZE must match the canonical address form");
 
 FluxError FLUX_CALL flux_identity_generate(const uint8_t* tag, uint8_t* out)
 {
@@ -1345,6 +1347,44 @@ FLUX_GUARD_BEGIN
 FLUX_GUARD_END(FLUX_NONE)
 }
 
+FluxError FLUX_CALL flux_address_resolve(const char* host, uint16_t port, uint8_t* out)
+{
+    if (host == nullptr || out == nullptr) return FLUX_ERR_INVALID_PARAM;
+FLUX_GUARD_BEGIN
+    common::Result<flux::Address> resolved = flux::Address::From(host, port);
+    if (resolved.isErr()) return Err(resolved.error);
+    if (!resolved.Take().ToBytes(out, FLUX_ADDRESS_SIZE))
+        return FLUX_ERR_INVALID_PARAM;
+    return FLUX_OK;
+FLUX_GUARD_END(FLUX_ERR_INTERNAL)
+}
+
+uint32_t FLUX_CALL flux_peer_address(FluxSocket* s, FluxPeer name, uint8_t* out)
+{
+    if (s == nullptr || out == nullptr) return 0;
+    flux::Address addr;
+    if (!PeerAddressOf(Box(s), name, addr)) return 0;
+    if (!addr.ToBytes(out, FLUX_ADDRESS_SIZE)) return 0;
+    return FLUX_ADDRESS_SIZE;
+}
+
+FluxPeer FLUX_CALL flux_peer_at(FluxSocket* s, const uint8_t* bytes)
+{
+    if (s == nullptr || bytes == nullptr) return FLUX_NONE;
+    SocketBox* box = Box(s);
+
+FLUX_GUARD_BEGIN
+    common::Result<flux::Address> parsed =
+        flux::Address::FromBytes(bytes, FLUX_ADDRESS_SIZE);
+    if (parsed.isErr()) return FLUX_NONE;
+    const flux::Address addr = parsed.Take();
+
+    // Same contract as Peer: registers if new, idempotent if not.
+    if (box->socket.Connect(addr) != common::Error::Ok) return FLUX_NONE;
+    return PeerNameOf(box, addr);
+FLUX_GUARD_END(FLUX_NONE)
+}
+
 uint32_t FLUX_CALL flux_max_payload(FluxSocket* s, FluxPeer name)
 {
     if (s == nullptr) return 0;
@@ -1452,6 +1492,10 @@ static const FluxApiV1 API_V1 = {
 
     flux_peer_resume_note,
     flux_peer_resuming,
+
+    flux_address_resolve,
+    flux_peer_address,
+    flux_peer_at,
 };
 extern "C" const void* FLUX_CALL flux_get_api(uint32_t version)
 {

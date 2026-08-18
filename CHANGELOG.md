@@ -70,7 +70,11 @@ security fix is allowed to change either.
   and `FLUX_RESUME_NOTE_BYTES` are checked against the C++ constants at build
   time, so the two cannot drift apart unnoticed. The `flux_c` target builds
   the whole library as one standalone shared file exporting only
-  `flux_get_api`, which is the file a binding loads.
+  `flux_get_api`, which is the file a binding loads. Addresses cross as
+  `FLUX_ADDRESS_SIZE` canonical bytes through `AddressResolve`,
+  `PeerAddress` and `PeerAt`, so a binding's address is data it can hold,
+  store and compare, and a stored one opens a session with nothing
+  resolved.
 
 ## [0.4.0] - 2026-08-11
 

@@ -158,6 +158,72 @@ namespace bcp::flux
             return addr.ss_family != 0;
         }
 
+        /** The size of an address in canonical form: 16 bytes of IPv6, 4 of
+            scope id and 2 of port. The form is platform-neutral where the
+            sockaddr inside this struct is not, so it is what an address
+            looks like whenever it crosses an ABI or lands on disk. */
+        static constexpr size_t CANONICAL_SIZE = 22;
+
+        /** Writes this address in canonical form. An IPv4 address travels
+            as its v4-mapped IPv6 form, the same shape ResolveAddress
+            produces, so both families fit one layout. Scope id and port are
+            little-endian by explicit shift. Returns false on a short buffer
+            or an address that is unset. */
+        bool ToBytes(uint8_t* out, size_t cap) const {
+            if (out == nullptr || cap < CANONICAL_SIZE) return false;
+
+            uint32_t scope = 0;
+            uint16_t port  = 0;
+            if (addr.ss_family == AF_INET) {
+                const auto* s = reinterpret_cast<const sockaddr_in*>(&addr);
+                std::memset(out, 0, 16);
+                out[10] = 0xFF;
+                out[11] = 0xFF;
+                std::memcpy(out + 12, &s->sin_addr, 4);
+                port = ntohs(s->sin_port);
+            } else if (addr.ss_family == AF_INET6) {
+                const auto* s = reinterpret_cast<const sockaddr_in6*>(&addr);
+                std::memcpy(out, s->sin6_addr.s6_addr, 16);
+                scope = s->sin6_scope_id;
+                port  = ntohs(s->sin6_port);
+            } else {
+                return false;
+            }
+
+            out[16] = static_cast<uint8_t>(scope >> 0);
+            out[17] = static_cast<uint8_t>(scope >> 8);
+            out[18] = static_cast<uint8_t>(scope >> 16);
+            out[19] = static_cast<uint8_t>(scope >> 24);
+            out[20] = static_cast<uint8_t>(port >> 0);
+            out[21] = static_cast<uint8_t>(port >> 8);
+            return true;
+        }
+
+        /** Rebuilds an address from canonical form. The result is always an
+            IPv6 sockaddr, matching ResolveAddress, so a v4 address
+            round-trips through its mapped form and compares equal to what
+            resolving the same host produced. */
+        [[nodiscard]] static common::Result<Address> FromBytes(const uint8_t* bytes, size_t len) {
+            if (bytes == nullptr || len < CANONICAL_SIZE) {
+                return common::Result<Address>::Fail(common::Error::InvalidParam);
+            }
+
+            const uint32_t scope = static_cast<uint32_t>(bytes[16])
+                                 | static_cast<uint32_t>(bytes[17]) << 8
+                                 | static_cast<uint32_t>(bytes[18]) << 16
+                                 | static_cast<uint32_t>(bytes[19]) << 24;
+            const uint16_t port  = static_cast<uint16_t>(bytes[20]
+                                 | bytes[21] << 8);
+
+            sockaddr_storage storage{};
+            auto* out = reinterpret_cast<sockaddr_in6*>(&storage);
+            out->sin6_family   = AF_INET6;
+            out->sin6_port     = htons(port);
+            out->sin6_scope_id = scope;
+            std::memcpy(out->sin6_addr.s6_addr, bytes, 16);
+            return common::Result<Address>::Success(Address(storage));
+        }
+
         void Print() const {
             char ip[INET6_ADDRSTRLEN] = {};
 

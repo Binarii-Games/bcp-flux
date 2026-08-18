@@ -18,6 +18,7 @@ static const char kCertIsAFixedSize[FLUX_CERT_SIZE];
 static const char kTagIsAFixedSize[FLUX_TAG_SIZE];
 static const char kNoteIsAFixedSize[FLUX_RESUME_NOTE_BYTES];
 static const char kSafePayloadIsPositive[FLUX_SAFE_PAYLOAD_BYTES];
+static const char kAddressIsAFixedSize[FLUX_ADDRESS_SIZE];
 
 /* Every struct a binding declares for itself, so a member that C cannot name
    fails here. Offsets are taken because that is what LayoutCheck is compared
@@ -72,6 +73,7 @@ static const FluxApiV1* TableShape(void)
     (void)kTagIsAFixedSize;
     (void)kNoteIsAFixedSize;
     (void)kSafePayloadIsPositive;
+    (void)kAddressIsAFixedSize;
     (void)kConfigOffsets;
     (void)kStructSizes;
     (void)kWatched;
