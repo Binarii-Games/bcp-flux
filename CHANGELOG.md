@@ -68,7 +68,9 @@ security fix is allowed to change either.
   reports the knock config block so a binding can still prove its own structs,
   and three event bits the enum was missing are there. `FLUX_SAFE_PAYLOAD_BYTES`
   and `FLUX_RESUME_NOTE_BYTES` are checked against the C++ constants at build
-  time, so the two cannot drift apart unnoticed.
+  time, so the two cannot drift apart unnoticed. The `flux_c` target builds
+  the whole library as one standalone shared file exporting only
+  `flux_get_api`, which is the file a binding loads.
 
 ## [0.4.0] - 2026-08-11
 

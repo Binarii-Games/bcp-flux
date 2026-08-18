@@ -786,9 +786,20 @@ typedef struct {
                                              const uint8_t note[FLUX_RESUME_NOTE_BYTES]);
 } FluxApiV1;
 
+/* Marks flux_get_api visible when this library is built as the shared
+   flux_c, which defines FLUX_C_BUILD. The static library and every consumer
+   see a plain declaration. */
+#if defined(FLUX_C_BUILD) && defined(_WIN32)
+#   define FLUX_EXPORT __declspec(dllexport)
+#elif defined(FLUX_C_BUILD)
+#   define FLUX_EXPORT __attribute__((visibility("default")))
+#else
+#   define FLUX_EXPORT
+#endif
+
 /* The one symbol anybody has to find. Cast what comes back to the struct for
-   the version asked for; null means this library has no such version. */
-const void* FLUX_CALL flux_get_api(uint32_t version);
+   the version asked for. Null means this library has no such version. */
+FLUX_EXPORT const void* FLUX_CALL flux_get_api(uint32_t version);
 
 #ifdef __cplusplus
 }

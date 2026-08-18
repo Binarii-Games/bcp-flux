@@ -165,6 +165,31 @@ if(WIN32)
 endif()
 
 # --------------------------------------------------------
+# flux_c: the C API as one standalone shared library, the file a binding
+# loads. A binding finds one symbol, flux_get_api, and reaches everything
+# through the table it returns, so this exports exactly that symbol. The glue
+# is compiled a second time with the export macro on, and the static archives
+# are absorbed, so nothing else has to travel with the file. Skipped on iOS,
+# where an app embeds the static library instead.
+# --------------------------------------------------------
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_library(flux_c SHARED flux/src/flux/c/flux_api.cpp)
+    target_compile_definitions(flux_c PRIVATE FLUX_C_BUILD)
+    target_include_directories(flux_c PRIVATE flux/include flux/src)
+    target_link_libraries(flux_c PRIVATE flux)
+    set_target_properties(flux common monocypher PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    set_target_properties(flux_c PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    if(APPLE)
+        target_link_options(flux_c PRIVATE "LINKER:-exported_symbol,_flux_get_api")
+    elseif(NOT MSVC)
+        target_link_options(flux_c PRIVATE "LINKER:--exclude-libs,ALL")
+    endif()
+endif()
+
+# --------------------------------------------------------
 # Examples: small runnable programs written against the public API only, so
 # they double as a check that the public surface is usable without reaching
 # into internals. Built by default so they cannot rot; -DBCP_EXAMPLES=OFF to
