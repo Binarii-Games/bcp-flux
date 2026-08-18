@@ -512,44 +512,57 @@ once, for a leaked key.
 
 ## C API
 
-Everything above is reachable from C through one header,
-[flux_api_v1.h](flux/include/flux/c/flux_api_v1.h). The surface is a single
-exported symbol: `flux_get_api(1)` returns a table of function pointers, and
-everything else is a 64-bit number, so a binding never holds a pointer into the
-library and a stale number gets a refusal, never a crash.
+The C API is one shared library, `flux_c.dll` on Windows, `libflux_c.dylib`
+on macOS, `libflux_c.so` on Linux, and one header,
+[flux_api_v1.h](flux/include/flux/c/flux_api_v1.h). The library exports a
+single function:
 
 ```c
-const FluxApiV1* api = flux_get_api(1);
-
-FluxConfig config;
-api->DefaultConfig(&config);
-config.port = 9500;
-
-FluxSocket* socket = api->CreateSocket();
-api->InitSocket(socket, &config);
-
-FluxPeer peer = api->Peer(socket, "::1", 9501);
-const uint8_t msg[] = "hello";
-
-FluxPacket packet = api->BuildPacket(socket);
-api->NoFlow(socket, packet);
-api->PutBytes(socket, packet, msg, sizeof msg - 1);
-api->Send(socket, packet, peer);
+const void* flux_get_api(uint32_t version);
 ```
 
-The `flux_c` target builds the whole library as one standalone shared file,
-`flux_c.dll`, `libflux_c.dylib` or `libflux_c.so`, exporting only
-`flux_get_api`. That file is what a binding in C#, Python, Rust or anything
-else with a C FFI loads:
+Call it with the version you were written against and cast the result to that
+version's table, a struct holding `version` and one function pointer per
+operation. Every flux call is an entry in that table, and everything a socket
+hands out, peers, flows, packets, is a plain 64-bit number, so a stale number
+gets an error code back and never touches freed memory.
 
-```sh
-cmake --build build --target flux_c
+Loading it from C#:
+
+```csharp
+[DllImport("flux_c")]
+static extern unsafe FluxApiV1* flux_get_api(uint version);
+
+[StructLayout(LayoutKind.Sequential)]
+unsafe struct FluxApiV1
+{
+    public uint version;
+    public delegate* unmanaged[Cdecl]<FluxLayout*, void> LayoutCheck;
+    public delegate* unmanaged[Cdecl]<FluxConfig*, void> DefaultConfig;
+    public delegate* unmanaged[Cdecl]<FluxSocket*> CreateSocket;
+    public delegate* unmanaged[Cdecl]<FluxSocket*, FluxConfig*, int> InitSocket;
+    // ... one field per entry, in the header's order
+}
 ```
 
-The header carries the full contract, including the threading rules and the
-lifetime of every number. A binding retypes the structs by hand, so it should
-call `LayoutCheck` once at startup and refuse to run on any disagreement,
-which turns a mis-marshalled struct from silent corruption into a message.
+```csharp
+unsafe
+{
+    FluxApiV1* api = flux_get_api(1);
+
+    FluxConfig config;
+    api->DefaultConfig(&config);
+    config.port = 9500;
+
+    FluxSocket* socket = api->CreateSocket();
+    api->InitSocket(socket, &config);
+}
+```
+
+The structs are retyped by hand, so call `LayoutCheck` once at startup and
+refuse to run on any disagreement. That turns a field out of place from
+silent corruption into a message. The header carries the full contract,
+including the threading rules and the lifetime of every number.
 
 ## Architecture
 
