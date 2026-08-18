@@ -43,8 +43,7 @@ vendored the same way. Both are Apache-2.0.
   holds its share beside BBR and leaves CUBIC the larger half almost without a
   drop.
 - **Drivable from other languages.** A numbers-based C API hands out 64-bit
-  handles, so a binding never holds a pointer. See
-  [flux/include/flux/c/](flux/include/flux/c/).
+  handles, so a binding never holds a pointer. See [C API](#c-api).
 
 ## Table of contents
 
@@ -54,6 +53,7 @@ vendored the same way. Both are Apache-2.0.
 - [Integrating](#integrating)
 - [Quick start](#quick-start)
 - [Usage](#usage)
+- [C API](#c-api)
 - [Architecture](#architecture)
 - [Benchmarks](#benchmarks)
 - [Testing](#testing)
@@ -509,6 +509,47 @@ behind still gets through. `PEER_STALE_IDENTITY` and `PEER_CERT_MISMATCH`
 report the two ends of that, and the mismatch is a sender's cue to fetch a
 fresh certificate. `ForgetPreviousIdentities` wipes the retained secrets at
 once, for a leaked key.
+
+## C API
+
+Everything above is reachable from C through one header,
+[flux_api_v1.h](flux/include/flux/c/flux_api_v1.h). The surface is a single
+exported symbol: `flux_get_api(1)` returns a table of function pointers, and
+everything else is a 64-bit number, so a binding never holds a pointer into the
+library and a stale number gets a refusal, never a crash.
+
+```c
+const FluxApiV1* api = flux_get_api(1);
+
+FluxConfig config;
+api->DefaultConfig(&config);
+config.port = 9500;
+
+FluxSocket* socket = api->CreateSocket();
+api->InitSocket(socket, &config);
+
+FluxPeer peer = api->Peer(socket, "::1", 9501);
+const uint8_t msg[] = "hello";
+
+FluxPacket packet = api->BuildPacket(socket);
+api->NoFlow(socket, packet);
+api->PutBytes(socket, packet, msg, sizeof msg - 1);
+api->Send(socket, packet, peer);
+```
+
+The `flux_c` target builds the whole library as one standalone shared file,
+`flux_c.dll`, `libflux_c.dylib` or `libflux_c.so`, exporting only
+`flux_get_api`. That file is what a binding in C#, Python, Rust or anything
+else with a C FFI loads:
+
+```sh
+cmake --build build --target flux_c
+```
+
+The header carries the full contract, including the threading rules and the
+lifetime of every number. A binding retypes the structs by hand, so it should
+call `LayoutCheck` once at startup and refuse to run on any disagreement,
+which turns a mis-marshalled struct from silent corruption into a message.
 
 ## Architecture
 
