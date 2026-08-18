@@ -558,6 +558,35 @@ unsafe
 
     FluxSocket* socket = api->CreateSocket();
     api->InitSocket(socket, &config);
+
+    // Send. Naming the peer starts the handshake, the message waits on it.
+    ulong peer;
+    fixed (byte* host = "::1\0"u8) peer = api->Peer(socket, host, 9501);
+
+    ulong packet = api->BuildPacket(socket);
+    api->NoFlow(socket, packet);
+    fixed (byte* msg = "hello"u8) api->PutBytes(socket, packet, msg, 5);
+    api->Send(socket, packet, peer);
+
+    // Drive the socket and read what arrives.
+    ulong* inbox = stackalloc ulong[8];
+    uint lane = 0;
+    for (;;)
+    {
+        api->Flush(socket);
+        api->Update(socket);
+
+        uint count = api->Poll(socket, &lane, inbox, 8);
+        for (uint i = 0; i < count; i++)
+        {
+            FluxMessage message = default;
+            FluxPacketInfo info = default;
+            api->Messages(socket, inbox[i], &message, 1, &info);
+            // message.bytes and message.length hold the payload
+            api->ReleasePacket(socket, inbox[i]);
+        }
+        api->EndPoll(socket, lane);
+    }
 }
 ```
 
