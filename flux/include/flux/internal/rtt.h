@@ -182,6 +182,39 @@ namespace bcp::flux::internal
             return true;
         }
 
+        /** Takes a round trip that came from a probe rather than from an
+            acknowledgement, as the opening average and nothing more.
+
+            Deliberately not Sample(). A probe is a short unsecured packet
+            answered where it is read, so it travels lighter than data does and
+            reads faster than the same path will ever read for a full one.
+            Letting that reach the windowed minimum would leave a floor no
+            acknowledged packet can get back down to, and QueueMicros() would
+            report queue that does not exist for as long as the bucket lives,
+            which is the failure the buckets were shaped to avoid.
+
+            So it seeds and then stands aside: only while nothing has been
+            measured, where the alternative is the caller's fallback guess, and
+            never over a figure acknowledgements have already established. Once
+            one arrives the ordinary fold carries the average away from this in
+            a handful of samples. The minimum, the latest sample, the peer's
+            hold and the silence stamp all stay with Sample(), which remains the
+            only place a measurement of the path proper enters.
+
+            @return false when a sample already exists, or when the figure did
+                    not come from the network, changing nothing either way. */
+        [[nodiscard]] bool SeedFromProbe(uint64_t roundTripMicros) noexcept
+        {
+            if (srttMicros != 0) return false;
+            if (roundTripMicros == 0 || roundTripMicros > RTT_SAMPLE_MAX_MICROS)
+                return false;
+
+            const uint32_t sample = static_cast<uint32_t>(roundTripMicros);
+            srttMicros   = sample;
+            rttvarMicros = sample / 2;
+            return true;
+        }
+
         /** One round trip, or the caller's stand-in when nothing has been
             measured yet. Everything that needs the duration of a round trip
             asks here, so what happens before the first sample is decided once

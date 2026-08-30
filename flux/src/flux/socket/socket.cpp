@@ -261,6 +261,16 @@ namespace bcp::flux
                              PeerRecvState[common::NextPowerOfTwo(config.maxPeers)]);
         if (!peerRecvStates_) return common::Error::NotInitialized;
 
+        // Outstanding probes. Sized once and never grown: the array bounds how
+        // many unanswered questions this socket can have in the air, which is
+        // the only thing a probe costs it, and refusing a new one is a better
+        // answer than letting an unauthenticated exchange decide how much
+        // memory to take.
+        probeCount_ = internal::PROBE_OUTSTANDING_DEFAULT;
+        probes_.reset(new (std::nothrow) ProbeSlot[probeCount_]);
+        if (!probes_) return common::Error::NotInitialized;
+        probeBudgetThisTick_ = internal::PROBE_BUDGET_PER_TICK_DEFAULT;
+
         // Hold-back may fill the receive pool down to the reserve and no
         // further. A pool at or under the reserve leaves nothing to buffer
         // with, which is correct rather than a misconfiguration: reception
@@ -1659,6 +1669,17 @@ namespace bcp::flux
             return;
         }
 
+        // The probe pair forks here for the same reason, and for one more: the
+        // cursor honours the batch bit, which anything may set on a cleartext
+        // packet, so reading a probe through it would let a stranger decide
+        // whether it parses. Fixed offsets take that away.
+        if (packet->dataSize > 1)
+        {
+            const SocketOpCode op = static_cast<SocketOpCode>(packet->data[1]);
+            if (op == SocketOpCode::PROBE)     { Probe_Respond(from, *packet);  return; }
+            if (op == SocketOpCode::PROBE_ACK) { Probe_Complete(from, *packet); return; }
+        }
+
         PacketSlotReader reader{pHandle};
         uint8_t opcode;
         if (!reader.TakeU8(opcode)) return;
@@ -1670,6 +1691,8 @@ namespace bcp::flux
             case SocketOpCode::HS_RES:    Handshake_Validate(from, reader); break;
             case SocketOpCode::HS_FINISH: Handshake_Complete(from, reader); break;
             case SocketOpCode::HS_KNOCK:  break;   // handled before the reader, below
+            case SocketOpCode::PROBE:     break;   // likewise, by fixed offsets
+            case SocketOpCode::PROBE_ACK: break;   // likewise
             default: break;   // unknown opcode from the network: drop
         }
     }
@@ -3555,6 +3578,13 @@ namespace bcp::flux
         // number of key agreements per tick and slows early opening rather
         // than the socket.
         knockBudgetThisTick_ = knockBudgetPerTick_;
+
+        // The same shape for probe answers, which are far cheaper but equally
+        // unauthenticated, so they are bounded rather than left open. Expiry
+        // runs beside it: a probe nobody answered has to become a result the
+        // caller can collect, or its slot would never come back.
+        probeBudgetThisTick_ = internal::PROBE_BUDGET_PER_TICK_DEFAULT;
+        ExpireProbes(common::MonotonicMicros());
 
         // No flow gate on the sweep: idle eviction is mandatory, so the per-peer
         // pass runs even on a socket with no flows. An empty peer table makes

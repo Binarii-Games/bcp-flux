@@ -201,9 +201,66 @@ static void a_peer_that_never_answered_is_not_silent()
     CHECK(rtt.SilentForMicros(2500000) == 500000);
 }
 
+// A probe seeds the average where there is none and is refused everywhere
+// else. The point of the refusal is the minimum: a probe is a lighter packet
+// than data, so letting one near the buckets would leave a floor no
+// acknowledged packet could reach and QueueMicros would report queue that does
+// not exist for as long as the bucket lived.
+static void a_probe_seeds_the_average_and_never_the_minimum()
+{
+    RttEstimate rtt = Fresh();
+
+    // Nothing measured: the probe is the opening average, and the deviation
+    // follows the same rule a first sample uses.
+    CHECK(rtt.SeedFromProbe(1000));
+    CHECK(rtt.srttMicros   == 1000);
+    CHECK(rtt.rttvarMicros == 500);
+
+    // The minimum is untouched, so there is no floor and no phantom queue.
+    CHECK(rtt.MinRttMicros() == 0);
+    CHECK(rtt.QueueMicros()  == 0);
+
+    // And no acknowledgement was implied by it: the peer is still silent.
+    CHECK(rtt.SilentForMicros(5000000) == 0);
+
+    // A second probe changes nothing, because an average now exists.
+    CHECK(!rtt.SeedFromProbe(4000));
+    CHECK(rtt.srttMicros == 1000);
+
+    // A real sample folds over the seed by the ordinary rule and brings the
+    // minimum with it, which is the only thing that ever fills the buckets.
+    CHECK(rtt.Sample(2000, 0, 0));
+    CHECK(rtt.srttMicros     == 1125);
+    CHECK(rtt.MinRttMicros() == 2000);
+
+    // Once acknowledgements have spoken a probe is refused for good.
+    CHECK(!rtt.SeedFromProbe(10));
+    CHECK(rtt.srttMicros == 1125);
+}
+
+// The same refusal Sample applies to a figure that did not come from the
+// network, so a subtraction of two things that were never timestamps cannot
+// become the opening average either.
+static void a_probe_that_is_not_a_measurement_is_refused()
+{
+    RttEstimate rtt = Fresh();
+
+    CHECK(!rtt.SeedFromProbe(0));
+    CHECK(rtt.srttMicros == 0);
+
+    CHECK(!rtt.SeedFromProbe(internal::RTT_SAMPLE_MAX_MICROS + 1));
+    CHECK(rtt.srttMicros == 0);
+
+    // The boundary itself is a measurement.
+    CHECK(rtt.SeedFromProbe(internal::RTT_SAMPLE_MAX_MICROS));
+    CHECK(rtt.srttMicros == internal::RTT_SAMPLE_MAX_MICROS);
+}
+
 int main()
 {
     folds_by_jacobson_karels();
+    a_probe_seeds_the_average_and_never_the_minimum();
+    a_probe_that_is_not_a_measurement_is_refused();
     refuses_a_sample_that_is_not_a_measurement();
     the_minimum_falls_within_a_bucket_and_rises_across_them();
     the_newest_sample_sees_the_queue_before_the_average();

@@ -459,9 +459,195 @@ static void rotating_a_session_key_reports_its_refusals()
     api->DestroySocket(server);
 }
 
+// The probe, driven the way a binding drives it: an address as bytes goes in,
+// a measurement comes back out, and no flux object is held at any point. What
+// makes this worth a case of its own is that a binding cannot see the peer
+// table, so the promise that nothing was registered has to be observable from
+// out here - PeerAt is the only way to ask, and it would have to CREATE the
+// peer to answer, so the question is put to the answering socket instead:
+// nothing it was never told about may have appeared.
+static void a_probe_crosses_as_bytes_and_registers_nothing()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    FluxConfig proberConfig;
+    api->DefaultConfig(&proberConfig);
+    proberConfig.port = 9971;
+    proberConfig.maxPeers = 8;
+    proberConfig.pendingPacketCount = 16;
+    FluxSocket* prober = api->CreateSocket();
+    CHECK(api->InitSocket(prober, &proberConfig) == FLUX_OK);
+
+    FluxConfig answerConfig;
+    api->DefaultConfig(&answerConfig);
+    answerConfig.port = 9972;
+    answerConfig.maxPeers = 8;
+    answerConfig.pendingPacketCount = 16;
+    FluxSocket* answerer = api->CreateSocket();
+    CHECK(api->InitSocket(answerer, &answerConfig) == FLUX_OK);
+
+    // The address crosses as the canonical bytes, resolved through the table
+    // like any other address a binding holds.
+    uint8_t addr[FLUX_ADDRESS_SIZE];
+    CHECK(api->AddressResolve("::1", 9972, addr) == FLUX_OK);
+
+    CHECK(api->ProbeAddress(prober, addr) == FLUX_OK);
+
+    // Nothing to collect before the answer has had a chance to arrive.
+    FluxProbeResult results[4];
+    std::memset(results, 0, sizeof(results));
+
+    uint32_t got = 0;
+    for (int round = 0; round < 200 && got == 0; ++round)
+    {
+        api->Update(prober);
+        api->Update(answerer);
+        got = api->PollProbes(prober, results, 4);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    CHECK(got == 1);
+    if (got == 1)
+    {
+        // The address comes back as the bytes that went in, so a binding can
+        // match a result to the candidate it asked about.
+        CHECK(std::memcmp(results[0].address, addr, FLUX_ADDRESS_SIZE) == 0);
+
+        // A measurement, not the figure a timeout carries.
+        CHECK(results[0].rttMicros != 0);
+    }
+
+    // Collected once and only once: the slot went back rather than reporting
+    // itself forever.
+    CHECK(api->PollProbes(prober, results, 4) == 0);
+
+    // The asking socket can go on asking: the slot came back, so a caller
+    // weighing a list of candidates is not spending one per question forever.
+    CHECK(api->ProbeAddress(prober, addr) == FLUX_OK);
+
+    // That neither side REGISTERED anything is not observable from out here -
+    // the only way to ask the table about an address is PeerAt, which would
+    // create the entry to answer. tests/integration/probe.cpp proves it from
+    // inside, where GetPeer can ask without creating.
+
+    api->DestroySocket(prober);
+    api->DestroySocket(answerer);
+}
+
+// The refusals a binding has to be able to see, and the one field that answers
+// before anything has been measured.
+static void path_stats_report_what_has_been_measured_and_refuse_the_rest()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    FluxConfig config;
+    api->DefaultConfig(&config);
+    config.port = 9973;
+    config.maxPeers = 8;
+    config.pendingPacketCount = 16;
+    FluxSocket* socket = api->CreateSocket();
+    CHECK(api->InitSocket(socket, &config) == FLUX_OK);
+
+    FluxPathStats stats;
+    std::memset(&stats, 0xAB, sizeof(stats));
+
+    // A peer that does not exist reports nothing rather than guessing, and
+    // zeroes the caller's struct on the way out so a binding that ignores the
+    // return value still reads zeros rather than the garbage it passed in.
+    CHECK(api->PeerPathStats(socket, FLUX_NONE, &stats) != FLUX_OK);
+    CHECK(stats.srttMicros == 0);
+    CHECK(stats.minRttMicros == 0);
+
+    // A null out-parameter is refused rather than crossing into a write.
+    CHECK(api->PeerPathStats(socket, FLUX_NONE, nullptr) == FLUX_ERR_INVALID_PARAM);
+
+    // A real peer with nothing measured answers zeros, which is what lets a
+    // binding tell "no sample yet" from a fast path without a second call.
+    uint8_t addr[FLUX_ADDRESS_SIZE];
+    CHECK(api->AddressResolve("::1", 9974, addr) == FLUX_OK);
+    const FluxPeer peer = api->PeerAt(socket, addr);
+    CHECK(peer != FLUX_NONE);
+
+    std::memset(&stats, 0xAB, sizeof(stats));
+    CHECK(api->PeerPathStats(socket, peer, &stats) == FLUX_OK);
+    CHECK(stats.srttMicros   == 0);
+    CHECK(stats.minRttMicros == 0);
+    CHECK(stats.queueMicros  == 0);
+
+    api->DestroySocket(socket);
+}
+
+// A probe seeds the average of a peer that already exists, and the C API is
+// where a binding can watch it happen: zeros before, a figure after, and the
+// remembered minimum still empty because no acknowledged packet was timed.
+static void a_probe_seeds_the_stats_a_binding_reads()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    FluxConfig aConfig;
+    api->DefaultConfig(&aConfig);
+    aConfig.port = 9975;
+    aConfig.maxPeers = 8;
+    aConfig.pendingPacketCount = 16;
+    FluxSocket* a = api->CreateSocket();
+    CHECK(api->InitSocket(a, &aConfig) == FLUX_OK);
+
+    FluxConfig bConfig;
+    api->DefaultConfig(&bConfig);
+    bConfig.port = 9976;
+    bConfig.maxPeers = 8;
+    bConfig.pendingPacketCount = 16;
+    FluxSocket* b = api->CreateSocket();
+    CHECK(api->InitSocket(b, &bConfig) == FLUX_OK);
+
+    uint8_t addrB[FLUX_ADDRESS_SIZE];
+    CHECK(api->AddressResolve("::1", 9976, addrB) == FLUX_OK);
+
+    // PeerAt registers the peer without measuring anything.
+    const FluxPeer peer = api->PeerAt(a, addrB);
+    CHECK(peer != FLUX_NONE);
+
+    FluxPathStats before;
+    CHECK(api->PeerPathStats(a, peer, &before) == FLUX_OK);
+    CHECK(before.srttMicros == 0);
+
+    CHECK(api->ProbeAddress(a, addrB) == FLUX_OK);
+
+    FluxProbeResult results[2];
+    uint32_t got = 0;
+    for (int round = 0; round < 200 && got == 0; ++round)
+    {
+        api->Update(a);
+        api->Update(b);
+        got = api->PollProbes(a, results, 2);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(got == 1);
+
+    FluxPathStats after;
+    CHECK(api->PeerPathStats(a, peer, &after) == FLUX_OK);
+
+    // Seeded, so a binding choosing between peers has a figure to compare.
+    CHECK(after.srttMicros != 0);
+
+    // But the minimum a queue is measured against stays empty, because a probe
+    // is a lighter packet than data and must never set that floor.
+    CHECK(after.minRttMicros == 0);
+    CHECK(after.queueMicros  == 0);
+
+    api->DestroySocket(a);
+    api->DestroySocket(b);
+}
+
 int main()
 {
     the_layout_a_binding_hand_writes_agrees_with_the_library();
+    a_probe_crosses_as_bytes_and_registers_nothing();
+    path_stats_report_what_has_been_measured_and_refuse_the_rest();
+    a_probe_seeds_the_stats_a_binding_reads();
     identities_and_certificates_cross_as_plain_bytes();
     every_identity_entry_calls_what_it_says();
     the_opener_reports_its_own_limits();

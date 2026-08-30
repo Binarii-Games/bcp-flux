@@ -353,6 +353,8 @@ void FLUX_CALL flux_layout_check(FluxLayout* out)
     out->offsetofConfigPort     = static_cast<uint32_t>(offsetof(FluxConfig, port));
     out->sizeofKnockConfig      = static_cast<uint32_t>(sizeof(FluxKnockConfig));
     out->offsetofConfigKnock    = static_cast<uint32_t>(offsetof(FluxConfig, knock));
+    out->sizeofPathStats        = static_cast<uint32_t>(sizeof(FluxPathStats));
+    out->sizeofProbeResult      = static_cast<uint32_t>(sizeof(FluxProbeResult));
 }
 
 void FLUX_CALL flux_default_config(FluxConfig* out)
@@ -1385,6 +1387,81 @@ FLUX_GUARD_BEGIN
 FLUX_GUARD_END(FLUX_NONE)
 }
 
+// --- Path timing -----------------------------------------------------------
+
+FluxError FLUX_CALL flux_peer_path_stats(FluxSocket* s, FluxPeer name, FluxPathStats* out)
+{
+    if (s == nullptr || out == nullptr) return FLUX_ERR_INVALID_PARAM;
+    std::memset(out, 0, sizeof(*out));
+
+FLUX_GUARD_BEGIN
+    uint32_t slot = 0, generation = 0;
+    if (!UnpackName(KIND_PEER, name, slot, generation)) return FLUX_ERR_INVALID_PARAM;
+
+    flux::PeerHandle handle = Box(s)->socket.GetPeerBySlot(slot, generation);
+    if (handle.Failed()) return FLUX_ERR_NOT_FOUND;
+    const flux::Peer* peer = handle.Read();
+    if (peer == nullptr) return FLUX_ERR_NOT_FOUND;
+
+    // Read under the handle's lock, all of it from the one estimate, so the
+    // figures a caller compares are the same measurement rather than two
+    // moments of it.
+    const bcp::flux::internal::RttEstimate& rtt = peer->rtt;
+    out->srttMicros      = rtt.srttMicros;
+    out->rttvarMicros    = rtt.rttvarMicros;
+    out->latestMicros    = rtt.latestMicros;
+    out->minRttMicros    = rtt.MinRttMicros();
+    out->queueMicros     = rtt.QueueMicros();
+    const uint64_t silent = rtt.SilentForMicros(common::MonotonicMicros());
+    out->silentForMicros = silent > UINT32_MAX
+        ? UINT32_MAX : static_cast<uint32_t>(silent);
+    return FLUX_OK;
+FLUX_GUARD_END(FLUX_ERR_INTERNAL)
+}
+
+FluxError FLUX_CALL flux_probe_address(FluxSocket* s, const uint8_t* bytes)
+{
+    if (s == nullptr || bytes == nullptr) return FLUX_ERR_INVALID_PARAM;
+
+FLUX_GUARD_BEGIN
+    common::Result<flux::Address> parsed =
+        flux::Address::FromBytes(bytes, FLUX_ADDRESS_SIZE);
+    if (parsed.isErr()) return FLUX_ERR_INVALID_PARAM;
+
+    return Err(Box(s)->socket.ProbeAddress(parsed.Take()));
+FLUX_GUARD_END(FLUX_ERR_INTERNAL)
+}
+
+uint32_t FLUX_CALL flux_poll_probes(FluxSocket* s, FluxProbeResult* out, uint32_t max)
+{
+    if (s == nullptr || out == nullptr || max == 0) return 0;
+
+FLUX_GUARD_BEGIN
+    // Collected into the C++ shape first, then copied field by field: the two
+    // structs are not the same layout and never should be, since the crossing
+    // one owes the ABI a fixed width that the internal one owes nobody.
+    constexpr uint32_t BATCH = 32;
+    flux::Socket::ProbeResult scratch[BATCH];
+
+    uint32_t filled = 0;
+    while (filled < max)
+    {
+        const uint32_t want = (max - filled) < BATCH ? (max - filled) : BATCH;
+        const uint32_t got  = Box(s)->socket.PollProbes(scratch, want);
+        if (got == 0) break;
+
+        for (uint32_t i = 0; i < got; ++i)
+        {
+            std::memset(&out[filled], 0, sizeof(out[filled]));
+            (void)scratch[i].address.ToBytes(out[filled].address, FLUX_ADDRESS_SIZE);
+            out[filled].rttMicros = scratch[i].rttMicros;
+            ++filled;
+        }
+    }
+    return filled;
+FLUX_GUARD_END(0)
+}
+
 uint32_t FLUX_CALL flux_max_payload(FluxSocket* s, FluxPeer name)
 {
     if (s == nullptr) return 0;
@@ -1496,6 +1573,10 @@ static const FluxApiV1 API_V1 = {
     flux_address_resolve,
     flux_peer_address,
     flux_peer_at,
+
+    flux_peer_path_stats,
+    flux_probe_address,
+    flux_poll_probes,
 };
 extern "C" const void* FLUX_CALL flux_get_api(uint32_t version)
 {

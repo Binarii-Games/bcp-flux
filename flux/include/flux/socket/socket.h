@@ -90,10 +90,18 @@ namespace bcp::flux
 
     constexpr uint8_t ToByte(Controls c) noexcept { return static_cast<uint8_t>(c); }
 
-    /** Opcodes of unsecured internal packets, handshake only, the sole cleartext
-        opcodes. Secure control (path validation, flow control) is not an opcode:
-        it rides the encrypted in-band channel byte, indistinguishable from
-        data. */
+    /** Opcodes of unsecured internal packets, the sole cleartext opcodes.
+        Secure control (path validation, flow control) is not an opcode: it
+        rides the encrypted in-band channel byte, indistinguishable from data.
+
+        Two things live here, and what separates them is what they leave
+        behind. The handshake opcodes are the opening of a relationship: they
+        reach the peer table, they create state, and everything after them is
+        authenticated. The probe pair is the opposite by design - it measures
+        how far away an address is and registers nothing, so that a caller can
+        weigh several strangers before choosing which one to actually talk to.
+        Anything reading the wire should treat a probe as what it is: two
+        packets that prove nothing about either end. */
     enum class SocketOpCode : uint8_t
     {
         HS_INIT   = 0x00,
@@ -101,6 +109,8 @@ namespace bcp::flux
         HS_RES    = 0x02,
         HS_FINISH = 0x03,
         HS_KNOCK  = 0x04,   ///< HS_INIT that carries data under an interim key
+        PROBE     = 0x05,   ///< sessionless path measurement, answered by PROBE_ACK
+        PROBE_ACK = 0x06,   ///< the token echoed back, with the hold subtracted out
     };
 
     /** The lane a thread last drained, handed back to Poll so it returns to the
@@ -668,6 +678,49 @@ namespace bcp::flux
             this call and the next. */
         [[nodiscard]] uint32_t PeerGenerationOf(uint32_t slot) const;
 
+        /** What one measured probe reports back, as PollProbes hands it over.
+            rttMicros is 0 when the probe expired without an answer, which is
+            the only way a probe fails: nothing is retried and nothing is
+            escalated, because the caller is the one who knows whether a second
+            attempt is worth a packet. */
+        struct ProbeResult
+        {
+            Address  address{};
+            uint32_t rttMicros = 0;
+        };
+
+        /** Measures the path to an address without opening a session.
+
+            Nothing is registered: no peer entry, no slot in the peer table, no
+            liveness, no certificate, no handshake. Two unsecured packets go out
+            and back carrying a token, and the difference is the answer. That is
+            the whole point - a caller weighing several strangers should not
+            have to open a relationship with each of them to learn which is
+            closest, and should not leave a mark on any of them by asking.
+
+            The measurement reaches the caller through PollProbes. It also seeds
+            the smoothed round trip of a peer at that address if one happens to
+            exist and has never been measured, because a probe figure beats the
+            configured guess; it never touches the windowed minimum, the peer's
+            liveness, or anything a congestion decision reads once
+            acknowledgements have started arriving. See
+            RttEstimate::SeedFromProbe.
+
+            Best effort in both directions. A probe that is lost is simply never
+            answered, and its slot is reclaimed as a timeout.
+
+            @return LimitReached when every outstanding-probe slot is in use. */
+        [[nodiscard]] common::Error ProbeAddress(const Address& addr);
+
+        /** Collects probes that have finished, answered or expired, and frees
+            their slots. Fills at most `max` and returns how many.
+
+            Shaped like the transfer poll rather than an event, because a probe
+            answers a question the caller asked rather than reporting something
+            that happened to it, and because there is no peer for an event to
+            name. */
+        [[nodiscard]] uint32_t PollProbes(ProbeResult* out, uint32_t max);
+
         /** Starts a session now with no data attached, so the app can pay the
             handshake at a moment it chooses. Ok when started, already under way,
             or complete. Progress is observable via GetPeer. */
@@ -934,6 +987,35 @@ namespace bcp::flux
         uint32_t                       knockTtlWindowSeconds_ = 0;
         std::atomic<uint32_t>          unprovenPeers_{0};
         uint32_t                       knockBudgetThisTick_ = 0;   ///< refilled by the tick
+
+        /** Probe: one slot per question this socket is waiting on an answer to.
+
+            A fixed array rather than a table, because there is nothing to look
+            an entry up by until the answer names it, and the answer names it by
+            the slot itself. The token IS the slot's handle - generation over
+            index, the same number scheme peers and packets use - so a reply
+            that arrives after its slot was reclaimed and handed to another
+            probe fails the generation check instead of being credited to the
+            wrong address. That is what makes the outstanding set safe to reuse
+            without remembering anything about the addresses that went quiet.
+
+            state is what a slot is doing, and the only field the two sides
+            race on: the caller claims a free slot, fills the rest, and
+            publishes by storing OUTSTANDING with release, which is what makes
+            the fields visible to the receive path that acquires it. Everything
+            else is written once by whoever owns the slot at that moment. */
+        enum class ProbeState : uint32_t { FREE = 0, CLAIMING = 1, OUTSTANDING = 2, DONE = 3 };
+        struct ProbeSlot
+        {
+            std::atomic<uint32_t> state{static_cast<uint32_t>(ProbeState::FREE)};
+            std::atomic<uint32_t> generation{0};
+            Address               addr{};
+            uint64_t              sentAtMicros = 0;
+            uint32_t              rttMicros    = 0;   ///< 0 on the timeout path
+        };
+        std::unique_ptr<ProbeSlot[]>   probes_;
+        uint32_t                       probeCount_ = 0;
+        uint32_t                       probeBudgetThisTick_ = 0;   ///< refilled by the tick
 
         // Peers, replay, and the pending-behind-handshake pool.
         PeerTable                      peers_;
@@ -1344,6 +1426,26 @@ namespace bcp::flux
         [[nodiscard]] bool TryMigrate(PacketSlotHandle& pHandle, uint32_t& migrateBudget);
         void PathChallenge_Respond(const Address& from, const uint8_t* payload, size_t len);
         void PathChallenge_Complete(const Address& from, const uint8_t* payload, size_t len);
+
+        // --- Probe ---
+        //   prober                        answering socket
+        //   ProbeAddress  --PROBE----->    Probe_Respond (stateless: the token
+        //                 <-PROBE_ACK--     comes back with the hold beside it)
+        //   Probe_Complete (match the token, fold, publish)
+        //
+        // The answering half keeps nothing, so a flood costs it a bounded
+        // number of replies per tick and no memory at all. The asking half
+        // keeps one slot per outstanding probe, reclaimed by answer or by
+        // timeout, and that slot is the only state the whole exchange has.
+        void SendProbe(const Address& addr, uint64_t token);
+        void Probe_Respond(const Address& from, const PacketSlot& packet);
+        void Probe_Complete(const Address& from, const PacketSlot& packet);
+        /** Folds a probe's figure into a peer at that address if one exists and
+            has never been measured. Never creates one. */
+        void SeedPeerFromProbe(const Address& addr, uint64_t rttMicros);
+        /** Reclaims slots whose answer never came, publishing each as a
+            timeout. Runs on the tick beside the other socket-wide sweeps. */
+        void ExpireProbes(uint64_t nowMicros);
 
         // --- Handshake ---
         //   initiator                     responder

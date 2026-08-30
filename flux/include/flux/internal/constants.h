@@ -255,6 +255,50 @@ namespace bcp::flux::internal
         ejected unbuffered until its cookie echo lands. */
     static constexpr uint32_t KNOCK_UNPROVEN_PACKET_LIMIT_DEFAULT = 256;
 
+    // --- Probe: measuring a path without opening a session ---
+
+    /** A probe carries a token and its answer echoes that token back beside
+        the time the answering socket held it. The hold is what separates the
+        path from the far side's tick: a probe answered on the next pass
+        rather than this one would otherwise read as a slow path. */
+    static constexpr size_t   PROBE_TOKEN_SIZE     = 8;
+    static constexpr size_t   PROBE_HELD_SIZE      = 4;
+
+    /** What each side weighs on the wire, controller and opcode included. */
+    static constexpr size_t   PROBE_ACK_WIRE_SIZE  =
+        WIRE_CONTROLLER_SIZE + 1 + PROBE_TOKEN_SIZE + PROBE_HELD_SIZE;
+    static constexpr size_t   PROBE_BODY_WIRE_SIZE =
+        WIRE_CONTROLLER_SIZE + 1 + PROBE_TOKEN_SIZE;
+
+    /** Padding a probe carries, and the floor it is judged against.
+
+        An answer must never outweigh the question that provoked it. A probe is
+        unauthenticated by construction - that is the whole point, it measures
+        a path to somebody this socket has never spoken to - so anyone may name
+        a source that is not theirs and collect the reply on a stranger's
+        behalf. Making the question the heavier half is what leaves nothing to
+        collect: a reflector that shrinks its traffic is not a reflector.
+
+        A probe below the floor is dropped rather than answered, so the rule
+        holds against a sender who simply declines to pad. */
+    static constexpr size_t   PROBE_PAD_SIZE       =
+        PROBE_ACK_WIRE_SIZE - PROBE_BODY_WIRE_SIZE;
+    static constexpr size_t   PROBE_MIN_WIRE_SIZE  = PROBE_ACK_WIRE_SIZE;
+
+    static_assert(PROBE_ACK_WIRE_SIZE >= PROBE_BODY_WIRE_SIZE,
+                  "a probe must be padded to at least the weight of its answer");
+
+    /** Probes one tick answers. Answering costs a token copied into a fixed
+        reply, which is cheap, but it is cheap for a flood as well, so it is
+        budgeted the way knock validation is rather than left open. */
+    static constexpr uint32_t PROBE_BUDGET_PER_TICK_DEFAULT = 64;
+
+    /** Probes this socket may have outstanding at once, and how long one waits
+        before its slot is reclaimed and reported as a timeout. An address that
+        never answers costs exactly one slot for exactly this long. */
+    static constexpr uint32_t PROBE_OUTSTANDING_DEFAULT     = 64;
+    static constexpr uint64_t PROBE_TIMEOUT_MICROS_DEFAULT  = 2000000;
+
     // --- Flow ---
     static constexpr uint16_t INVALID_FLOW_ID               = 0xFFFF;
 

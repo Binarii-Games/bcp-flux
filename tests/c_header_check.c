@@ -43,6 +43,7 @@ static const size_t kStructSizes[] = {
     sizeof(FluxLivenessConfig), sizeof(FluxEventsConfig), sizeof(FluxKnockConfig),
     sizeof(FluxLayout),      sizeof(FluxMessage),      sizeof(FluxPacketInfo),
     sizeof(FluxTransferView), sizeof(FluxApiV1),
+    sizeof(FluxPathStats),   sizeof(FluxProbeResult),
 };
 
 /* The handle and error typedefs, and the bit macros, used as C would use them. */

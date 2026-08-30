@@ -454,6 +454,35 @@ typedef struct {
     uint8_t     reserved[1];
 } FluxConfig;
 
+/* What the path to one peer costs, as PeerPathStats reports it. Microseconds
+   throughout, and 0 wherever nothing has been measured yet.
+
+   srtt is the smoothed average every deadline is built from. minRtt is the
+   lowest round trip still remembered, which is the path with nothing queued in
+   front of it: that is the figure to compare two peers by, because srtt carries
+   whatever queue happened to be there when it was measured. queue is the
+   difference between them, how much of the current round trip is waiting rather
+   than travelling. silentFor is how long since this peer last acknowledged
+   anything, which separates a slow path from a gone one. */
+typedef struct {
+    uint32_t srttMicros;
+    uint32_t rttvarMicros;
+    uint32_t latestMicros;
+    uint32_t minRttMicros;
+    uint32_t queueMicros;
+    uint32_t silentForMicros;
+} FluxPathStats;
+
+/* One finished probe, as PollProbes reports it. rttMicros is 0 when the probe
+   expired without an answer, which is the only way a probe fails: nothing is
+   retried, because whether a second question is worth a packet is the caller's
+   judgement and not this library's. */
+typedef struct {
+    uint8_t  address[FLUX_ADDRESS_SIZE];
+    uint16_t reserved;
+    uint32_t rttMicros;
+} FluxProbeResult;
+
 /* What LayoutCheck fills in, so a binding can prove its hand-written structs
    agree with the ones this library was compiled against. Every field is a byte
    count from the library's own point of view. */
@@ -472,7 +501,8 @@ typedef struct {
     uint32_t offsetofConfigPort;
     uint32_t sizeofKnockConfig;
     uint32_t offsetofConfigKnock;
-    uint32_t reserved[2];
+    uint32_t sizeofPathStats;
+    uint32_t sizeofProbeResult;
 } FluxLayout;
 
 /* The table. One struct per version, frozen when it ships; a later version is
@@ -806,6 +836,39 @@ typedef struct {
     uint32_t  (FLUX_CALL *PeerAddress)   (FluxSocket*, FluxPeer,
                                           uint8_t out[FLUX_ADDRESS_SIZE]);
     FluxPeer  (FLUX_CALL *PeerAt)        (FluxSocket*, const uint8_t addr[FLUX_ADDRESS_SIZE]);
+
+    /* Path timing.
+
+       PeerPathStats reports what a session has learned about the path to one
+       peer. It costs nothing to ask: the figures are a by-product of the
+       acknowledgements a flow was already sending, so a caller that runs flows
+       has them for free. A caller that only sends outside a flow has none of
+       them, because nothing acknowledges unflowed traffic and nothing therefore
+       measures it - that is what the probe below is for.
+
+       ProbeAddress measures the path to an address this socket has never spoken
+       to. Nothing is registered by it: no peer entry, no handshake, no keys, no
+       liveness, nothing that has to be aged out afterwards. Two unsecured
+       packets carry a token out and back, and the difference is the answer.
+       That is what lets a caller weigh several candidates and open a session
+       with only the one it picks.
+
+       The measurement comes back through PollProbes, not through an event,
+       because a probe answers a question the caller asked and because there is
+       no peer for an event to name. It also seeds the smoothed round trip of a
+       peer at that address where one exists and nothing has been measured yet,
+       so a session opened just after a probe starts with a figure instead of a
+       guess; it never touches the remembered minimum, which describes the path
+       as acknowledged data experiences it, and never the liveness stamp,
+       because answering a question is not evidence of a conversation.
+
+       Probes are budgeted per tick on the answering side and bounded in number
+       on the asking side, and a probe is padded to weigh at least what its
+       answer does, so the exchange is no use to anyone naming a source that is
+       not theirs. LimitReached when every outstanding slot is in use. */
+    FluxError (FLUX_CALL *PeerPathStats) (FluxSocket*, FluxPeer, FluxPathStats* out);
+    FluxError (FLUX_CALL *ProbeAddress)  (FluxSocket*, const uint8_t addr[FLUX_ADDRESS_SIZE]);
+    uint32_t  (FLUX_CALL *PollProbes)    (FluxSocket*, FluxProbeResult* out, uint32_t max);
 } FluxApiV1;
 
 /* Marks flux_get_api visible when this library is built as the shared
