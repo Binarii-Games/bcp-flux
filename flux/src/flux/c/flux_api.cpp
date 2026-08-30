@@ -397,6 +397,7 @@ void FLUX_CALL flux_default_config(FluxConfig* out)
     out->liveness.refreshGrainMicros        = d.liveness.refreshGrainMicros;
     out->liveness.flowStallTimeoutMicros    = d.liveness.flowStallTimeoutMicros;
     out->liveness.acceptUnsecureFromUnknown = d.liveness.acceptUnsecureFromUnknown ? 1u : 0u;
+    out->liveness.acceptInboundHandshakes   = d.liveness.acceptInboundHandshakes ? 1u : 0u;
 
     out->timers.ackDelayMicros      = d.timers.ackDelayMicros;
     out->timers.retryIntervalMicros = d.timers.retryIntervalMicros;
@@ -496,6 +497,7 @@ FLUX_GUARD_BEGIN
     cfg.liveness.refreshGrainMicros        = in->liveness.refreshGrainMicros;
     cfg.liveness.flowStallTimeoutMicros    = in->liveness.flowStallTimeoutMicros;
     cfg.liveness.acceptUnsecureFromUnknown = in->liveness.acceptUnsecureFromUnknown != 0;
+    cfg.liveness.acceptInboundHandshakes   = in->liveness.acceptInboundHandshakes != 0;
 
     box->hook    = in->events.hook;
     box->context = in->events.context;

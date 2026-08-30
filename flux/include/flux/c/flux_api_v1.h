@@ -371,7 +371,11 @@ typedef struct {
     uint64_t refreshGrainMicros;     /* how stale a peer's last-seen stamp may grow */
     uint32_t flowStallTimeoutMicros; /* gap age before a jammed flow is reclaimed; 0 takes the default */
     uint8_t  acceptUnsecureFromUnknown;  /* plaintext from addresses with no peer entry */
-    uint8_t  reserved[3];
+    uint8_t  acceptInboundHandshakes;    /* 0 is the client posture: strangers cannot open
+                                            sessions or 0-RTT in; this side's own connects,
+                                            knocks and probes are untouched. DefaultConfig
+                                            sets 1. */
+    uint8_t  reserved[2];
 } FluxLivenessConfig;
 
 typedef struct {

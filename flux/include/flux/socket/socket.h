@@ -471,6 +471,25 @@ namespace bcp::flux
                     dropped. Known source stays forgeable (no tag, no AEAD); the
                     gate is hygiene, not authentication. */
                 bool     acceptUnsecureFromUnknown = false;
+                /** Accept handshakes this socket did not start. On by default,
+                    which is what a socket that serves anything needs. Off is
+                    the client posture: sessions exist only where this side
+                    dialed, so a stranger cannot occupy a peer slot, and the
+                    peer table protects exactly the relationships the
+                    application chose.
+
+                    Off refuses the whole responder side: openers included, so
+                    nobody 0-RTTs in - a knock is an inbound handshake carrying
+                    data, not an exemption from being one. Refusal is a silent
+                    drop rather than a challenge, because a socket in this
+                    posture has nothing to say to a stranger, and answering
+                    would advertise it.
+
+                    Everything this side initiates is untouched: its own
+                    connects, knocks toward others, migration and resumption of
+                    the sessions it opened, and the sessionless probe, which
+                    registers nothing and is budgeted on its own terms. */
+                bool     acceptInboundHandshakes = true;
                 /** A receiving ordered flow holding a gap whose cursor has not
                     advanced for this long is jammed: it is pinning recv slots
                     for a gap the sender is not filling, so the tick reclaims it.
@@ -1093,6 +1112,7 @@ namespace bcp::flux
         uint32_t                       evictAfterStamp_ = 0;   ///< idleTimeout + grain, in SeenStamp units; never zero once Init succeeds
         uint32_t                       seenGrainStamp_  = 0;
         bool                           acceptUnsecureFromUnknown_ = false;
+        bool                           acceptInboundHandshakes_ = true;
 
         // --- Lifecycle / Init ---
         // Init is a thin sequence over these; each returns an Error.

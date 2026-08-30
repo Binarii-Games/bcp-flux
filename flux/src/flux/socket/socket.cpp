@@ -399,6 +399,7 @@ namespace bcp::flux
         idleTimeoutMicros_ = idleMicros;
 
         acceptUnsecureFromUnknown_ = config.liveness.acceptUnsecureFromUnknown;
+        acceptInboundHandshakes_   = config.liveness.acceptInboundHandshakes;
         return common::Error::Ok;
     }
 
@@ -1659,6 +1660,25 @@ namespace bcp::flux
         const PacketSlot* packet = pHandle.Read();
         if (!packet) return;
         const Address from = packet->address;
+
+        // The inbound gate, before anything is parsed. Only the opcodes a
+        // RESPONDER receives are refused: HS_INIT and HS_KNOCK open sessions
+        // toward this socket, and HS_RES only exists as the echo of a
+        // challenge this gate never let out. HS_CHLG and HS_FINISH stay,
+        // because they answer handshakes THIS side started, and dropping
+        // them would break the socket's own connects. The drop is silent: a
+        // socket in this posture has nothing to say to a stranger.
+        if (!acceptInboundHandshakes_ && packet->dataSize > 1)
+        {
+            switch (static_cast<SocketOpCode>(packet->data[1]))
+            {
+                case SocketOpCode::HS_INIT:
+                case SocketOpCode::HS_RES:
+                case SocketOpCode::HS_KNOCK:
+                    return;
+                default: break;
+            }
+        }
 
         // The knock is read by its own fixed offsets, not by a message cursor,
         // so it forks before the reader is built.
