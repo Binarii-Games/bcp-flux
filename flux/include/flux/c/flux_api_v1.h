@@ -278,12 +278,20 @@ typedef struct {
 /* What one packet says about itself, filled by the same Messages call so a
    packet costs one lock however much is asked about it. peer is the sender.
    flowId is 0xFFFF for traffic outside any flow. part places the packet in a
-   message spanning several of them. */
+   message spanning several of them.
+
+   mode is the flow's FluxFlowMode, which rides every flow packet rather than
+   only the one that opened the flow, so a receiver reads the guarantees of
+   traffic it never opened anything for. It is 0 when flowId says there is no
+   flow, which RELIABLE_ORDERED also encodes as, so read flowId to tell absent
+   from a mode. A packet naming a mode that does not exist is refused before
+   delivery, so what arrives here is always one of the four. */
 typedef struct {
     FluxPeer     peer;
     FluxFlowPart part;
     uint16_t     flowId;
-    uint16_t     reserved;
+    uint8_t      mode;
+    uint8_t      reserved;
 } FluxPacketInfo;
 
 /* A finished transfer, as PollTransfers reports it. Incoming, bytes is the

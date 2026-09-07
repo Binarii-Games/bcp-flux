@@ -642,9 +642,135 @@ static void a_probe_seeds_the_stats_a_binding_reads()
     api->DestroySocket(b);
 }
 
+// A receiver never opened the flow its traffic arrives on, so the only way it
+// can honour the sender's guarantees - a relay forwarding on, say - is if the
+// packet says what they are. The mode rides every flow packet for exactly
+// that, and this is the entry that hands it up.
+static void an_arriving_packet_names_the_mode_of_the_flow_it_rode()
+{
+    const FluxApiV1* api = Api();
+    if (api == nullptr) return;
+
+    // Association pools are opt-in, so a socket that never sends flows pays
+    // nothing for them. Both sides need them here: one to open, one to admit.
+    FluxConfig config;
+    api->DefaultConfig(&config);
+    config.port = 9971;
+    config.maxPeers = 8;
+    config.pendingPacketCount = 16;
+    config.flows.outCount      = 8;
+    config.flows.inCount       = 8;
+    config.flows.maxOutPerPeer = 4;
+    config.flows.maxInPerPeer  = 4;
+    FluxSocket* sender = api->CreateSocket();
+    CHECK(api->InitSocket(sender, &config) == FLUX_OK);
+
+    config.port = 9972;
+    FluxSocket* receiver = api->CreateSocket();
+    CHECK(api->InitSocket(receiver, &config) == FLUX_OK);
+
+    const FluxPeer peer = api->Peer(sender, "::1", 9972);
+    CHECK(peer != FLUX_NONE);
+
+    // Two modes, so what arrives is read off the packet rather than assumed.
+    const FluxFlow ordered =
+        api->OpenFlow(sender, 11, FLUX_FLOW_RELIABLE_ORDERED);
+    const FluxFlow unreliable =
+        api->OpenFlow(sender, 12, FLUX_FLOW_UNRELIABLE);
+    CHECK(ordered != FLUX_NONE);
+    CHECK(unreliable != FLUX_NONE);
+
+    const FluxFlow flows[2] = { ordered, unreliable };
+    const uint16_t ids[2]   = { 11, 12 };
+    const uint8_t  modes[2] = { FLUX_FLOW_RELIABLE_ORDERED, FLUX_FLOW_UNRELIABLE };
+
+    for (int which = 0; which < 2; ++which)
+    {
+        FluxPacket packet = api->BuildPacket(sender);
+        CHECK(packet != FLUX_NONE);
+        CHECK(api->WithFlow(sender, packet, flows[which], FLUX_PART_WHOLE) == FLUX_OK);
+        CHECK(api->PutU32(sender, packet, 900u + which) == FLUX_OK);
+        CHECK(api->Send(sender, packet, peer) == FLUX_OK);
+
+        bool seen = false;
+        for (int round = 0; round < 300 && !seen; ++round)
+        {
+            api->Flush(sender);
+            api->Update(sender);
+            api->Update(receiver);
+
+            uint32_t lane = 0;
+            FluxPacket packets[8];
+            const uint32_t got = api->Poll(receiver, &lane, packets, 8);
+            for (uint32_t i = 0; i < got; ++i)
+            {
+                FluxMessage messages[8];
+                FluxPacketInfo info;
+                std::memset(&info, 0xEE, sizeof(info));
+                const uint32_t count =
+                    api->Messages(receiver, packets[i], messages, 8, &info);
+                if (count > 0 && info.flowId == ids[which])
+                {
+                    CHECK(info.mode == modes[which]);
+                    CHECK(info.part == FLUX_PART_WHOLE);
+                    CHECK(info.reserved == 0);
+                    seen = true;
+                }
+                (void)api->ReleasePacket(receiver, packets[i]);
+            }
+            api->EndPoll(receiver, lane);
+            if (!seen) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(seen);
+    }
+
+    // Outside a flow there is no mode to name, and the sentinel id is what
+    // says so - zero would otherwise read as RELIABLE_ORDERED.
+    FluxPacket plain = api->BuildPacket(sender);
+    CHECK(plain != FLUX_NONE);
+    CHECK(api->NoFlow(sender, plain) == FLUX_OK);
+    CHECK(api->PutU32(sender, plain, 999u) == FLUX_OK);
+    CHECK(api->Send(sender, plain, peer) == FLUX_OK);
+
+    bool sawPlain = false;
+    for (int round = 0; round < 300 && !sawPlain; ++round)
+    {
+        api->Flush(sender);
+        api->Update(sender);
+        api->Update(receiver);
+
+        uint32_t lane = 0;
+        FluxPacket packets[8];
+        const uint32_t got = api->Poll(receiver, &lane, packets, 8);
+        for (uint32_t i = 0; i < got; ++i)
+        {
+            FluxMessage messages[8];
+            FluxPacketInfo info;
+            std::memset(&info, 0xEE, sizeof(info));
+            const uint32_t count =
+                api->Messages(receiver, packets[i], messages, 8, &info);
+            if (count > 0 && info.flowId == 0xFFFF)
+            {
+                CHECK(info.mode == 0);
+                sawPlain = true;
+            }
+            (void)api->ReleasePacket(receiver, packets[i]);
+        }
+        api->EndPoll(receiver, lane);
+        if (!sawPlain) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(sawPlain);
+
+    CHECK(api->CloseFlow(sender, ordered) == FLUX_OK);
+    CHECK(api->CloseFlow(sender, unreliable) == FLUX_OK);
+    api->DestroySocket(sender);
+    api->DestroySocket(receiver);
+}
+
 int main()
 {
     the_layout_a_binding_hand_writes_agrees_with_the_library();
+    an_arriving_packet_names_the_mode_of_the_flow_it_rode();
     a_probe_crosses_as_bytes_and_registers_nothing();
     path_stats_report_what_has_been_measured_and_refuse_the_rest();
     a_probe_seeds_the_stats_a_binding_reads();

@@ -756,9 +756,11 @@ uint32_t FLUX_CALL flux_messages(FluxSocket* s, FluxPacket name,
 
     if (info != nullptr)
     {
+        const bool hasFlow = packet->HasFlow();
         info->peer     = PeerNameOf(box, packet->address);
         info->part     = static_cast<FluxFlowPart>(packet->Part());
-        info->flowId   = packet->HasFlow() ? packet->FlowId() : UINT16_MAX;
+        info->flowId   = hasFlow ? packet->FlowId() : UINT16_MAX;
+        info->mode     = hasFlow ? flux::FlowDataMode(packet->FlowData()) : 0;
         info->reserved = 0;
     }
 

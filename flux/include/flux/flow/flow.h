@@ -190,6 +190,16 @@ namespace bcp::flux
         return static_cast<uint8_t>((data >> 3) & FLOW_EPOCH_MASK);
     }
 
+    /** The mode bits out of a flow data byte, without the rest of the decode.
+        Still bits rather than a FlowMode: a byte off the wire can name a
+        reserved mode, and only DecodeFlowData is entitled to refuse one. Read
+        it as a mode on a byte that decode already accepted, which is every
+        delivered flow packet. */
+    [[nodiscard]] inline uint8_t FlowDataMode(uint8_t data) noexcept
+    {
+        return static_cast<uint8_t>(data & 0x07u);
+    }
+
     /** Reads a flow data byte off the wire. Refuses reserved modes, and refuses
         framing bits on a mode that cannot carry them: this input is
         attacker-chosen, and a receiver that ignored a bit it does not
@@ -198,7 +208,7 @@ namespace bcp::flux
     [[nodiscard]] inline bool DecodeFlowData(uint8_t data, FlowMode& outMode,
                                              uint8_t& outEpoch, FlowPart& outPart) noexcept
     {
-        const uint8_t modeBits = data & 0x07u;
+        const uint8_t modeBits = FlowDataMode(data);
         if (modeBits >= FLOW_MODE_COUNT)
             return false;
 
